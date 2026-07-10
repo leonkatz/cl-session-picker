@@ -1,0 +1,381 @@
+#!/usr/bin/env bash
+# claude-session — interactive picker for resuming named Claude Code sessions.
+#
+# Bound to `cl`. Auto-discovers every session you've /renamed (no registry to
+# maintain — name a session and it shows up), marks which are live in tmux, and
+# on select cd's into that session's dir and attaches/launches it in a persistent
+# tmux session with --dangerously-skip-permissions. A "new claude here" entry
+# starts a fresh session in the current directory.
+#
+# Usage:
+#   claude-session            # picker (fzf if available, numbered menu otherwise)
+#   claude-session <name>     # launch that named session directly
+#   claude-session --list     # print discovered sessions
+#   claude-session stop       # snapshot live sessions to JSON, then kill them
+#                             #   (asks before killing any that look mid-task;
+#                             #    those are left running — re-run stop later)
+#   claude-session start      # relaunch every session from the last stop
+#                             #   (reattach if live, else resume by session id)
+#   claude-session restore    # restore state.json from the newest history
+#                             #   snapshot (add --list to pick; then run start)
+
+PROJECTS="$HOME/.claude/projects"
+STATE="$HOME/.config/claude-session/state.json"
+# Rotating history of past state files — a safety net against a failed `cl start`
+# (which deletes STATE) or a corrupted write. Newest STATE_HISTORY_KEEP kept.
+STATE_HISTORY_DIR="$HOME/.config/claude-session/history"
+STATE_HISTORY_KEEP=10
+
+# name<TAB>sid<TAB>cwd<TAB>epoch  — newest transcript per *current* name
+discover() {
+  # custom-title is the record /rename writes; it covers every named session.
+  # (The older agent-name record exists only for a subset, so grepping it
+  # silently dropped half the sessions — including the most-used ones.)
+  grep -rl '"customTitle"' "$PROJECTS"/*/*.jsonl 2>/dev/null \
+    | xargs ls -t 2>/dev/null \
+    | while IFS= read -r f; do
+        name=$(grep -oE '"customTitle":"[^"]+"' "$f" 2>/dev/null | tail -1 | sed 's/.*"customTitle":"//; s/"$//')
+        [ -n "$name" ] || continue
+        sid=$(basename "$f" .jsonl)
+        cwd=$(grep -m1 -oE '"cwd":"[^"]*"' "$f" 2>/dev/null | sed 's/.*"cwd":"//; s/"$//')
+        [ -d "$cwd" ] || continue   # drop sessions whose working dir no longer exists
+        epoch=$(stat -f %m "$f" 2>/dev/null || echo 0)
+        printf '%s\t%s\t%s\t%s\n' "$name" "$sid" "$cwd" "$epoch"
+      done \
+    | awk -F'\t' '!seen[$1]++'
+}
+
+reltime() {
+  local now diff; now=$(date +%s); diff=$(( now - ${1:-0} ))
+  if   [ "$diff" -lt 3600 ];  then echo "$((diff/60))m ago"
+  elif [ "$diff" -lt 86400 ]; then echo "$((diff/3600))h ago"
+  else echo "$((diff/86400))d ago"; fi
+}
+
+tmux_name() { printf '%s' "$1" | tr ' .:/' '____'; }
+
+# Make the terminal title track the tmux session name (#S) for every session.
+# Set as global server options so it applies regardless of ~/.tmux.conf; called
+# before each new-session since exec replaces this process and can't run after.
+tmux_titles() {
+  command -v tmux >/dev/null 2>&1 || return 0
+  tmux start-server 2>/dev/null
+  tmux set -g set-titles on 2>/dev/null
+  tmux set -g set-titles-string "#S" 2>/dev/null
+}
+
+launch_session() { # name sid cwd
+  local name="$1" sid="$2" cwd="$3" t
+  t=$(tmux_name "$name"); [ -d "$cwd" ] || cwd="$HOME"
+  if command -v tmux >/dev/null 2>&1; then
+    tmux_titles
+    exec tmux new-session -A -s "$t" -c "$cwd" "claude --resume $sid --dangerously-skip-permissions"
+  else
+    cd "$cwd" || exit 1; exec claude --resume "$sid" --dangerously-skip-permissions
+  fi
+}
+
+launch_new() { # cwd
+  local cwd="$1" t; [ -d "$cwd" ] || cwd="$PWD"
+  t="claude-$(basename "$cwd")"
+  if command -v tmux >/dev/null 2>&1; then
+    tmux_titles
+    exec tmux new-session -A -s "$t" -c "$cwd" "claude --dangerously-skip-permissions"
+  else
+    cd "$cwd" || exit 1; exec claude --dangerously-skip-permissions
+  fi
+}
+
+# --- start/stop support -----------------------------------------------------
+# These mirror the picker's style ([ ] tests, exec-to-tmux) on purpose so the
+# script reads as one piece. session_busy uses the `caffeinate` wake-lock that
+# `claude` spawns while working: claude's TUI uses the alternate screen buffer,
+# so `tmux capture-pane` returns nothing and process state is the only reliable
+# external signal. The signal is conservative — caffeinate's timeout lingers a
+# few minutes after work ends — so stop errs toward asking, never silent-killing.
+
+# session_busy <tmux_session_name>: 0 (true) if a claude in that session looks
+# mid-task — a caffeinate child under the pane, or claude CPU over ~15%.
+session_busy() {
+  local t="$1" ppid kid cmd cpu
+  ppid=$(tmux list-panes -t "=${t}" -F '#{pane_pid}' 2>/dev/null | head -1)
+  [ -n "$ppid" ] || return 1
+  for kid in $(pgrep -P "$ppid" 2>/dev/null); do
+    cmd=$(ps -o command= -p "$kid" 2>/dev/null)
+    case "$cmd" in *caffeinate*) return 0 ;; esac
+  done
+  cpu=$(ps -o %cpu= -p "$ppid" 2>/dev/null | tr -d ' ')
+  # Integer compare on the whole-number part; >=15% CPU counts as working.
+  [ "${cpu%%.*}" -ge 15 ] 2>/dev/null && return 0
+  return 1
+}
+
+# archive_state: bank a copy of the current STATE into STATE_HISTORY_DIR under a
+# timestamped name, then prune to the newest STATE_HISTORY_KEEP. Only well-formed
+# JSON is archived, so the history stays a set of known-good snapshots to restore
+# from if the live STATE is lost (failed start) or corrupted. Best-effort: any
+# failure here must never break stop/start, so it always returns 0.
+archive_state() {
+  [ -r "$STATE" ] || return 0
+  command -v jq >/dev/null 2>&1 && ! jq empty "$STATE" 2>/dev/null && return 0
+  mkdir -p "$STATE_HISTORY_DIR" 2>/dev/null || return 0
+  local stamp dest n=1
+  stamp=$(date +%Y%m%d-%H%M%S)
+  dest="$STATE_HISTORY_DIR/state-$stamp.json"
+  # Same-second archives (e.g. rapid stop/start) must not clobber each other.
+  while [ -e "$dest" ]; do dest="$STATE_HISTORY_DIR/state-$stamp-$n.json"; n=$((n+1)); done
+  cp "$STATE" "$dest" 2>/dev/null || return 0
+  # Prune oldest beyond the keep count (newest-first, drop the tail).
+  ls -1t "$STATE_HISTORY_DIR"/state-*.json 2>/dev/null \
+    | tail -n +$((STATE_HISTORY_KEEP + 1)) \
+    | while IFS= read -r old; do rm -f "$old"; done
+  return 0
+}
+
+# save_state: record the currently-live sessions into STATE as JSON, UNIONed
+# with whatever STATE already held (keyed by name; the fresh entry wins on a
+# collision so session ids stay current). Union — not overwrite — because
+# `cl stop` is meant to be re-run to catch sessions left running mid-task: by
+# the second run those killed earlier are no longer live, and an overwrite
+# would drop them from the saved set. `cl start` clears STATE once consumed,
+# so a clean stop→start cycle never accumulates stale entries.
+save_state() {
+  mkdir -p "$(dirname "$STATE")" || { echo "claude-session: cannot create state dir" >&2; return 1; }
+
+  # Build a JSON array of the sessions live in tmux right now.
+  local live first=1
+  live="$(
+    printf '['
+    discover | while IFS=$'\t' read -r name sid cwd epoch; do
+      tmux has-session -t "$(tmux_name "$name")" 2>/dev/null || continue
+      [ "$first" -eq 1 ] && first=0 || printf ','
+      jq -nc --arg name "$name" --arg sid "$sid" --arg cwd "$cwd" \
+        '{name:$name, sid:$sid, cwd:$cwd}'
+    done
+    printf ']'
+  )"
+
+  # Union with any prior STATE: concat, group by name, keep the last (fresh)
+  # entry per name. Prior file is treated as empty if missing/unparseable.
+  local prior="[]"
+  [ -r "$STATE" ] && prior="$(jq -c '.' "$STATE" 2>/dev/null || printf '[]')"
+  local tmp="$STATE.tmp.$$"
+  if printf '%s\n%s\n' "$prior" "$live" \
+      | jq -s 'add | group_by(.name) | map(.[-1])' > "$tmp" 2>/dev/null; then
+    mv "$tmp" "$STATE"
+    archive_state   # bank this known-good snapshot into the rotating history
+  else
+    rm -f "$tmp"
+    echo "claude-session: failed to write state" >&2
+    return 1
+  fi
+}
+
+# do_stop: snapshot live sessions, then kill them — but ask before killing any
+# that look mid-task, and leave those running. Re-run `cl stop` to catch them
+# once they go idle.
+do_stop() {
+  command -v jq >/dev/null 2>&1 || { echo "claude-session: stop needs jq (brew install jq)" >&2; exit 1; }
+  if ! tmux list-sessions >/dev/null 2>&1; then
+    echo "claude-session: no tmux server running — nothing to stop" >&2
+    exit 0
+  fi
+
+  save_state || exit 1
+  local count; count=$(jq 'length' "$STATE" 2>/dev/null || echo 0)
+  printf 'saved %s session(s) to %s\n\n' "$count" "$STATE"
+
+  local name t ans
+  discover | while IFS=$'\t' read -r name sid cwd epoch; do
+    t=$(tmux_name "$name")
+    tmux has-session -t "=${t}" 2>/dev/null || continue
+    if session_busy "$t"; then
+      printf '⏳ "%s" looks mid-task. Kill it anyway? [y/N] ' "$name" >&2
+      read -r ans </dev/tty
+      case "$ans" in
+        y|Y)  tmux kill-session -t "=${t}" 2>/dev/null && printf '   killed %s\n' "$name" >&2 ;;
+        *)    printf '   left %s running — re-run cl stop later to close it\n' "$name" >&2 ;;
+      esac
+    else
+      tmux kill-session -t "=${t}" 2>/dev/null && printf '✓ killed %s\n' "$name" >&2
+    fi
+  done
+  printf '\nstate saved. Run cl start to bring these back.\n' >&2
+}
+
+# open_iterm_tab <name>: open one real iTerm tab running `cl <name>`, which
+# attaches that session's tmux (created below). Mirrors the manual flow —
+# ⌘T, `cl`, pick the session — one tab per saved session. Returns non-zero if
+# the AppleScript fails (not in iTerm, automation denied) so the caller can
+# fall back to printing commands.
+open_iterm_tab() {
+  local name="$1"
+  # Escape backslashes then double-quotes for embedding in the AppleScript string.
+  local esc="${name//\\/\\\\}"; esc="${esc//\"/\\\"}"
+  osascript >/dev/null 2>&1 <<OSA
+tell application "iTerm"
+  tell current window
+    create tab with default profile
+    tell current session to write text "cl \"${esc}\""
+  end tell
+end tell
+OSA
+}
+
+# do_start: bring back every session in STATE the way they were launched by
+# hand — one real iTerm tab each, tmux-backed via `cl <name>`. First it ensures
+# each session's tmux exists (detached), then opens a tab per session. Falls
+# back to printing the `cl <name>` commands when not in iTerm or osascript fails.
+do_start() {
+  command -v jq >/dev/null 2>&1 || { echo "claude-session: start needs jq (brew install jq)" >&2; exit 1; }
+  [ -r "$STATE" ] || { echo "claude-session: no saved state ($STATE) — run 'cl stop' first" >&2; exit 1; }
+
+  local n; n=$(jq 'length' "$STATE" 2>/dev/null || echo 0)
+  [ "$n" -gt 0 ] || { echo "claude-session: saved state is empty" >&2; exit 1; }
+
+  # 1. Ensure each session's tmux exists (detached). `cl <name>` in each tab
+  #    then attaches it. Creating here (not relying on the tab) means a failed
+  #    tab still leaves a recoverable session. launch_session execs, so we
+  #    replicate its create-detached form (incl. tmux_titles).
+  command -v tmux >/dev/null 2>&1 && tmux_titles
+  local name sid cwd t i=0
+  while IFS=$'\t' read -r name sid cwd; do
+    t=$(tmux_name "$name")
+    [ -d "$cwd" ] || cwd="$HOME"
+    if tmux has-session -t "=${t}" 2>/dev/null; then
+      printf '● %s already live\n' "$name"
+    else
+      tmux new-session -d -s "$t" -c "$cwd" "claude --resume $sid --dangerously-skip-permissions" \
+        && printf '✓ prepared %s  (%s)\n' "$name" "$cwd"
+    fi
+    i=$((i+1))
+  done < <(jq -r '.[] | [.name, .sid, .cwd] | @tsv' "$STATE")
+
+  # 2. Open a real iTerm tab per session (or fall back to printing commands).
+  #    Read names into an array first so the STATE file can be cleared safely.
+  local -a names=()
+  while IFS= read -r name; do names+=("$name"); done < <(jq -r '.[].name' "$STATE")
+
+  # Snapshot consumed: archive a copy first (so a failed relaunch never loses the
+  # list — restore from STATE_HISTORY_DIR), then clear for the next clean cycle.
+  archive_state
+  rm -f "$STATE"
+
+  # Detect iTerm robustly. Env vars are unreliable here: TERM_PROGRAM is
+  # clobbered to "tmux" inside a tmux client, and LC_TERMINAL may not propagate.
+  # Instead ask the OS whether iTerm is actually running — true whenever
+  # `cl start` is invoked from an iTerm tab (even nested in tmux).
+  local have_iterm=0
+  if command -v osascript >/dev/null 2>&1 \
+     && osascript -e 'tell application "System Events" to (name of processes) contains "iTerm2"' 2>/dev/null | grep -q true; then
+    have_iterm=1
+  fi
+  if [ "$have_iterm" = "1" ]; then
+    local opened=0 failed=0
+    for name in "${names[@]}"; do
+      if open_iterm_tab "$name"; then opened=$((opened+1)); else failed=$((failed+1)); fi
+    done
+    printf '\nopened %s iTerm tab(s).\n' "$opened"
+    if [ "$failed" -gt 0 ]; then
+      printf '%s tab(s) failed to open — run these manually:\n' "$failed" >&2
+      for name in "${names[@]}"; do printf '  cl "%s"\n' "$name" >&2; done
+    fi
+  else
+    printf '\n%s session(s) prepared. Not in iTerm (or no osascript) — open a tab and run:\n' "$i"
+    for name in "${names[@]}"; do printf '  cl "%s"\n' "$name"; done
+  fi
+}
+
+# do_restore: copy a snapshot from STATE_HISTORY_DIR back to STATE so the next
+# `cl start` can bring the sessions back. No argument → newest snapshot; --list →
+# print available snapshots (newest first) with session count + age; a path or
+# bare filename → that specific snapshot. Any existing STATE is archived first, so
+# restore is itself lossless. Corrupt snapshots are refused.
+do_restore() {
+  command -v jq >/dev/null 2>&1 || { echo "claude-session: restore needs jq (brew install jq)" >&2; exit 1; }
+
+  if [ "${1:-}" = "--list" ]; then
+    local any=0 f n age
+    while IFS= read -r f; do
+      any=1
+      n=$(jq 'length' "$f" 2>/dev/null || echo '?')
+      age=$(reltime "$(stat -f %m "$f" 2>/dev/null || echo 0)")
+      printf '%-8s %3s session(s)   %s\n' "$age" "$n" "$f"
+    done < <(ls -1t "$STATE_HISTORY_DIR"/state-*.json 2>/dev/null)
+    [ "$any" = "1" ] || echo "claude-session: no snapshots in $STATE_HISTORY_DIR" >&2
+    return 0
+  fi
+
+  # Choose the snapshot: explicit arg (full path or bare filename) or the newest.
+  local snap
+  if [ -n "${1:-}" ]; then
+    if   [ -r "$1" ];                        then snap="$1"
+    elif [ -r "$STATE_HISTORY_DIR/$1" ];     then snap="$STATE_HISTORY_DIR/$1"
+    else echo "claude-session: no such snapshot '$1' (try: cl restore --list)" >&2; exit 1; fi
+  else
+    snap=$(ls -1t "$STATE_HISTORY_DIR"/state-*.json 2>/dev/null | head -1)
+    [ -n "$snap" ] || { echo "claude-session: no snapshots to restore in $STATE_HISTORY_DIR" >&2; exit 1; }
+  fi
+
+  jq empty "$snap" 2>/dev/null || { echo "claude-session: snapshot is not valid JSON: $snap" >&2; exit 1; }
+
+  archive_state   # preserve any current STATE before overwriting — restore is lossless
+  mkdir -p "$(dirname "$STATE")" || { echo "claude-session: cannot create state dir" >&2; exit 1; }
+  cp "$snap" "$STATE" || { echo "claude-session: failed to write $STATE" >&2; exit 1; }
+
+  local count; count=$(jq 'length' "$STATE" 2>/dev/null || echo '?')
+  printf 'restored %s session(s) from %s\n' "$count" "$snap"
+  printf 'run cl start to bring them back.\n'
+}
+
+# fzf rows: "<display>\tNAME\tSID\tCWD"  (display shown; rest carried for the action)
+rows() {
+  printf '＋ new claude here  ·  %s\tNEW\t\t%s\n' "$PWD" "$PWD"
+  discover | while IFS=$'\t' read -r name sid cwd epoch; do
+    if tmux has-session -t "$(tmux_name "$name")" 2>/dev/null; then dot="●"; else dot="○"; fi
+    printf '%s %-22s %-8s %s\t%s\t%s\t%s\n' "$dot" "$name" "$(reltime "$epoch")" "$cwd" "$name" "$sid" "$cwd"
+  done
+}
+
+case "${1:-}" in
+  stop)    do_stop;  exit 0 ;;
+  start)   do_start; exit 0 ;;
+  restore) do_restore "${2:-}"; exit 0 ;;
+  --list)
+    printf '%-2s %-22s %-8s %s\n' '' NAME 'ACTIVE' DIR
+    discover | while IFS=$'\t' read -r name sid cwd epoch; do
+      if tmux has-session -t "$(tmux_name "$name")" 2>/dev/null; then dot='●'; else dot='○'; fi
+      printf '%-2s %-22s %-8s %s\n' "$dot" "$name" "$(reltime "$epoch")" "$cwd"
+    done
+    exit 0 ;;
+  -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+  '') : ;;  # fall through to picker
+  *)
+    # direct launch by name
+    match=$(discover | awk -F'\t' -v n="$1" '$1==n{print; exit}')
+    [ -n "$match" ] || { echo "claude-session: no session named '$1' (try --list)" >&2; exit 1; }
+    IFS=$'\t' read -r name sid cwd _ <<EOF
+$match
+EOF
+    launch_session "$name" "$sid" "$cwd" ;;
+esac
+
+# ---- picker ----
+if command -v fzf >/dev/null 2>&1; then
+  picked=$(rows | fzf --ansi --delimiter='\t' --with-nth=1 --height=45% --reverse \
+            --prompt='claude session ❯ ' \
+            --header='● live in tmux   ○ resume      enter: open') || exit 0
+  [ -n "$picked" ] || exit 0
+else
+  echo "Pick a session:" >&2
+  IFS=$'\n'; i=0; menu=$(rows)
+  for line in $menu; do i=$((i+1)); printf '%2d) %s\n' "$i" "${line%%$'\t'*}" >&2; done
+  printf 'number ❯ ' >&2; read -r choice
+  picked=$(printf '%s\n' $menu | sed -n "${choice}p")
+  [ -n "$picked" ] || exit 0
+fi
+
+name=$(printf '%s' "$picked" | cut -f2)
+sid=$(printf '%s' "$picked" | cut -f3)
+cwd=$(printf '%s' "$picked" | cut -f4)
+if [ "$name" = "NEW" ]; then launch_new "$cwd"; else launch_session "$name" "$sid" "$cwd"; fi
