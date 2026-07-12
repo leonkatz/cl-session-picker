@@ -46,6 +46,28 @@ All edits are sentinel-guarded and back up the prior file, so reruns are no-ops.
 - `--no-tmux-conf` — skip `~/.tmux.conf` edits
 - `--bin-dir P` — install to `P` instead of `~/.local/bin`
 
+## Uninstall
+
+Reverses the install — removes the binary and the sentinel-guarded blocks it
+added to `~/.zshrc` and `~/.tmux.conf` (backing each file up first):
+
+```
+./uninstall.sh
+```
+
+By default it **leaves your session state** (`~/.config/claude-session/`, i.e.
+saved lists + history) and the Homebrew deps (`tmux`/`fzf`/`jq`) in place — those
+are your data and general-purpose tools. Pass `--purge-state` to also delete the
+session state. Open a new terminal afterward so the `cl` alias stops resolving.
+
+### Uninstall flags
+
+- `--dry-run` — print actions without executing them
+- `--no-shellrc` — leave `~/.zshrc` untouched
+- `--no-tmux-conf` — leave `~/.tmux.conf` untouched
+- `--purge-state` — also delete `~/.config/claude-session` (state + history)
+- `--bin-dir P` — look for the binary in `P` instead of `~/.local/bin`
+
 ## Usage
 
 - `cl` — open the picker
