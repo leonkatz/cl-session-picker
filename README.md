@@ -73,7 +73,7 @@ session state. Open a new terminal afterward so the `cl` alias stops resolving.
 - `cl` — open the picker
 - `cl <name>` — launch that named session directly
 - `cl --list` — print discovered sessions
-- `cl stop` — snapshot live sessions to JSON, then kill them
+- `cl stop` — snapshot live sessions, kill them, and close their iTerm tabs (`--keep-tabs` to leave tabs open)
 - `cl start` — relaunch every session from the last `stop`
 - `cl restore` — restore `state.json` from the newest history snapshot (then `cl start`)
 
@@ -88,6 +88,13 @@ it launched with; only a fresh launch upgrades).
   killing a session that looks **mid-task**, it asks `Kill it anyway? [y/N]`;
   answer no and that session is left running while the rest are killed. Re-run
   `cl stop` once it's idle to catch it. Needs `jq`.
+  - **Closes the iTerm tab too.** Each tab `cl` opens is tagged with an iTerm
+    user variable (`user.clSession`, via an OSC 1337 escape), so `stop` can find
+    and close the exact tab of every session it kills — leaving no empty
+    "[Process completed]" tabs behind. It never closes the tab you ran `cl stop`
+    from, and never touches a session it left running. iTerm-only (other
+    terminals can't be scripted this way) and best-effort; pass `--keep-tabs`
+    to leave all tabs open.
 - **`cl start`** reads the state file and, for each session, reattaches if it's
   already live, else creates the tmux session and resumes the pinned
   conversation by id. Then attach with `tmux attach` (or `tmux -CC attach` in
