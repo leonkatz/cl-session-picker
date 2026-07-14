@@ -264,22 +264,29 @@ do_stop() {
   printf '\nstate saved. Run cl start to bring these back.\n' >&2
 }
 
-# open_iterm_tab <name>: open one real iTerm tab running `cl <name>`, which
-# attaches that session's tmux (created below). Mirrors the manual flow —
-# ⌘T, `cl`, pick the session — one tab per saved session. Returns non-zero if
-# the AppleScript fails (not in iTerm, automation denied) so the caller can
-# fall back to printing commands.
-open_iterm_tab() {
-  local name="$1"
-  # Escape backslashes then double-quotes for embedding in the AppleScript string.
-  local esc="${name//\\/\\\\}"; esc="${esc//\"/\\\"}"
-  osascript >/dev/null 2>&1 <<OSA
-tell application "iTerm"
+# open_iterm_tabs <name>...: open one real iTerm tab per name, each running
+# `cl <name>` (which attaches that session's tmux). Mirrors the manual flow —
+# ⌘T, `cl`, pick the session — but creates ALL tabs in a SINGLE osascript
+# invocation (one AppleScript session for the whole set) instead of one process
+# per tab, which is markedly faster for a large working set. Returns non-zero if
+# the AppleScript fails (not in iTerm, automation denied) so the caller can fall
+# back to printing commands.
+open_iterm_tabs() {
+  local name esc script
+  script='tell application "iTerm"
   tell current window
-    create tab with default profile
-    tell current session to write text "cl \"${esc}\""
-  end tell
-end tell
+'
+  for name in "$@"; do
+    # Escape backslashes then double-quotes for embedding in the AppleScript string.
+    esc="${name//\\/\\\\}"; esc="${esc//\"/\\\"}"
+    script+='    create tab with default profile
+    tell current session to write text "cl \"'"$esc"'\""
+'
+  done
+  script+='  end tell
+end tell'
+  osascript >/dev/null 2>&1 <<OSA
+$script
 OSA
 }
 
@@ -326,18 +333,14 @@ do_start() {
   # "tmux" inside a client — so iterm_running asks the OS instead).
   local have_iterm=0
   iterm_running && have_iterm=1
-  if [ "$have_iterm" = "1" ]; then
-    local opened=0 failed=0
-    for name in "${names[@]}"; do
-      if open_iterm_tab "$name"; then opened=$((opened+1)); else failed=$((failed+1)); fi
-    done
-    printf '\nopened %s iTerm tab(s).\n' "$opened"
-    if [ "$failed" -gt 0 ]; then
-      printf '%s tab(s) failed to open — run these manually:\n' "$failed" >&2
-      for name in "${names[@]}"; do printf '  cl "%s"\n' "$name" >&2; done
-    fi
+  if [ "$have_iterm" = "1" ] && open_iterm_tabs "${names[@]}"; then
+    printf '\nopened %s iTerm tab(s).\n' "${#names[@]}"
   else
-    printf '\n%s session(s) prepared. Not in iTerm (or no osascript) — open a tab and run:\n' "$i"
+    if [ "$have_iterm" = "1" ]; then
+      printf '\n%s session(s) prepared, but the iTerm tab-open failed — run these manually:\n' "$i" >&2
+    else
+      printf '\n%s session(s) prepared. Not in iTerm (or no osascript) — open a tab and run:\n' "$i"
+    fi
     for name in "${names[@]}"; do printf '  cl "%s"\n' "$name"; done
   fi
 }
