@@ -11,9 +11,9 @@
 #   claude-session            # picker (fzf if available, numbered menu otherwise)
 #   claude-session <name>     # launch that named session directly
 #   claude-session --list     # print discovered sessions
-#   claude-session stop       # snapshot live sessions to JSON, then kill them
-#                             #   (asks before killing any that look mid-task;
-#                             #    those are left running — re-run stop later)
+#   claude-session stop       # snapshot live sessions, kill them, and close their
+#                             #   iTerm tabs (--keep-tabs to leave tabs open; asks
+#                             #   before killing any mid-task, leaving those open)
 #   claude-session start      # relaunch every session from the last stop
 #                             #   (reattach if live, else resume by session id)
 #   claude-session restore    # restore state.json from the newest history
@@ -64,10 +64,63 @@ tmux_titles() {
   tmux set -g set-titles-string "#S" 2>/dev/null
 }
 
+# iterm_running: true when iTerm2 is actually running. Env vars are unreliable
+# (TERM_PROGRAM is clobbered to "tmux" inside a client), so ask the OS instead.
+iterm_running() {
+  command -v osascript >/dev/null 2>&1 || return 1
+  osascript -e 'tell application "System Events" to (name of processes) contains "iTerm2"' \
+    2>/dev/null | grep -q true
+}
+
+# tag_iterm_session <tmux_name>: mark the CURRENT iTerm session with a user
+# variable (user.clSession) via the OSC 1337 SetUserVar escape, so `cl stop` can
+# later find and close this exact tab. Emitted before tmux takes over the tty.
+# Harmless in non-iTerm terminals — they ignore the unknown escape sequence.
+tag_iterm_session() {
+  local b64; b64=$(printf '%s' "$1" | base64 | tr -d '\n')
+  printf '\033]1337;SetUserVar=clSession=%s\007' "$b64"
+}
+
+# close_iterm_tab <tmux_name>: close the iTerm tab tagged with
+# user.clSession == <tmux_name>. Skips the session running this command so
+# `cl stop` never yanks closed its own terminal. Best-effort; no-op if the tab
+# isn't found or iTerm can't be scripted. Collects matches first, then closes,
+# to avoid mutating the tab collection mid-iteration.
+close_iterm_tab() {
+  local esc="$1"
+  esc="${esc//\\/\\\\}"; esc="${esc//\"/\\\"}"
+  osascript >/dev/null 2>&1 <<OSA
+tell application "iTerm"
+  set curId to -1
+  try
+    set curId to id of current session of current tab of current window
+  end try
+  set toClose to {}
+  repeat with w in windows
+    repeat with tb in tabs of w
+      repeat with s in sessions of tb
+        try
+          set varVal to ""
+          tell s to set varVal to (variable named "user.clSession")
+          if varVal is "${esc}" and (id of s) is not curId then set end of toClose to s
+        end try
+      end repeat
+    end repeat
+  end repeat
+  repeat with s in toClose
+    try
+      close s
+    end try
+  end repeat
+end tell
+OSA
+}
+
 launch_session() { # name sid cwd
   local name="$1" sid="$2" cwd="$3" t
   t=$(tmux_name "$name"); [ -d "$cwd" ] || cwd="$HOME"
   if command -v tmux >/dev/null 2>&1; then
+    tag_iterm_session "$t"   # so `cl stop` can close this tab later
     tmux_titles
     exec tmux new-session -A -s "$t" -c "$cwd" "claude --resume $sid --dangerously-skip-permissions"
   else
@@ -176,10 +229,16 @@ save_state() {
 # once they go idle.
 do_stop() {
   command -v jq >/dev/null 2>&1 || { echo "claude-session: stop needs jq (brew install jq)" >&2; exit 1; }
+  local keep_tabs=0
+  [ "${1:-}" = "--keep-tabs" ] && keep_tabs=1
   if ! tmux list-sessions >/dev/null 2>&1; then
     echo "claude-session: no tmux server running — nothing to stop" >&2
     exit 0
   fi
+
+  # Also close each killed session's iTerm tab, unless opted out or not in iTerm.
+  local close_tabs=0
+  [ "$keep_tabs" = "0" ] && iterm_running && close_tabs=1
 
   save_state || exit 1
   local count; count=$(jq 'length' "$STATE" 2>/dev/null || echo 0)
@@ -193,11 +252,13 @@ do_stop() {
       printf '⏳ "%s" looks mid-task. Kill it anyway? [y/N] ' "$name" >&2
       read -r ans </dev/tty
       case "$ans" in
-        y|Y)  tmux kill-session -t "=${t}" 2>/dev/null && printf '   killed %s\n' "$name" >&2 ;;
+        y|Y)  tmux kill-session -t "=${t}" 2>/dev/null \
+                && { printf '   killed %s\n' "$name" >&2; [ "$close_tabs" = "1" ] && close_iterm_tab "$t"; } ;;
         *)    printf '   left %s running — re-run cl stop later to close it\n' "$name" >&2 ;;
       esac
     else
-      tmux kill-session -t "=${t}" 2>/dev/null && printf '✓ killed %s\n' "$name" >&2
+      tmux kill-session -t "=${t}" 2>/dev/null \
+        && { printf '✓ killed %s\n' "$name" >&2; [ "$close_tabs" = "1" ] && close_iterm_tab "$t"; }
     fi
   done
   printf '\nstate saved. Run cl start to bring these back.\n' >&2
@@ -261,15 +322,10 @@ do_start() {
   archive_state
   rm -f "$STATE"
 
-  # Detect iTerm robustly. Env vars are unreliable here: TERM_PROGRAM is
-  # clobbered to "tmux" inside a tmux client, and LC_TERMINAL may not propagate.
-  # Instead ask the OS whether iTerm is actually running — true whenever
-  # `cl start` is invoked from an iTerm tab (even nested in tmux).
+  # Detect iTerm robustly (env vars are unreliable — TERM_PROGRAM is clobbered to
+  # "tmux" inside a client — so iterm_running asks the OS instead).
   local have_iterm=0
-  if command -v osascript >/dev/null 2>&1 \
-     && osascript -e 'tell application "System Events" to (name of processes) contains "iTerm2"' 2>/dev/null | grep -q true; then
-    have_iterm=1
-  fi
+  iterm_running && have_iterm=1
   if [ "$have_iterm" = "1" ]; then
     local opened=0 failed=0
     for name in "${names[@]}"; do
@@ -338,7 +394,7 @@ rows() {
 }
 
 case "${1:-}" in
-  stop)    do_stop;  exit 0 ;;
+  stop)    do_stop "${2:-}"; exit 0 ;;
   start)   do_start; exit 0 ;;
   restore) do_restore "${2:-}"; exit 0 ;;
   --list)
