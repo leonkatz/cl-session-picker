@@ -141,6 +141,22 @@ launch_new() { # cwd
   fi
 }
 
+# launch_named <name> <cwd>: create + attach a fully-named session via
+# `claude --name` (sets the title at launch). The interactive create path shared
+# by `cl new` and the picker's "new" entry.
+launch_named() { # name cwd
+  local name="$1" cwd="$2" t qname
+  [ -d "$cwd" ] || cwd="$HOME"
+  t=$(tmux_name "$name"); qname=$(printf '%q' "$name")
+  if command -v tmux >/dev/null 2>&1; then
+    tag_iterm_session "$t"
+    tmux_titles
+    exec tmux new-session -A -s "$t" -c "$cwd" "claude --name $qname --dangerously-skip-permissions"
+  else
+    cd "$cwd" || exit 1; exec claude --name "$name" --dangerously-skip-permissions
+  fi
+}
+
 # do_new: create a NEW, fully-named session in one step — no /rename → exit →
 # re-pick dance. `claude --name` sets the session's customTitle AT LAUNCH, so
 # discover(), the picker, and `cl start` all find it immediately.
@@ -173,9 +189,7 @@ do_new() {
 
   if [ -t 1 ] && [ -t 0 ]; then
     # interactive: create + attach, like the picker
-    tag_iterm_session "$t"
-    tmux_titles
-    exec tmux new-session -A -s "$t" -c "$cwd" "claude --name $qname --dangerously-skip-permissions"
+    launch_named "$name" "$cwd"
   else
     # no TTY (script / Claude Bash call): create detached so the caller isn't
     # blocked on an attach — attach later with `cl "<name>"`.
@@ -497,4 +511,10 @@ fi
 name=$(printf '%s' "$picked" | cut -f2)
 sid=$(printf '%s' "$picked" | cut -f3)
 cwd=$(printf '%s' "$picked" | cut -f4)
-if [ "$name" = "NEW" ]; then launch_new "$cwd"; else launch_session "$name" "$sid" "$cwd"; fi
+if [ "$name" = "NEW" ]; then
+  printf 'name for the new session (blank = unnamed) ❯ ' >&2
+  read -r newname </dev/tty
+  if [ -n "$newname" ]; then launch_named "$newname" "$cwd"; else launch_new "$cwd"; fi
+else
+  launch_session "$name" "$sid" "$cwd"
+fi
