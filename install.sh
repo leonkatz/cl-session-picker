@@ -171,8 +171,8 @@ if [[ "$DO_SHELLRC" == "1" ]]; then
       say "backing up ${ZSHRC} → ${ZSHRC}.bak-${TS}"
       run "cp '${ZSHRC}' '${ZSHRC}.bak-${TS}'"
     fi
-    say "adding PATH entry and 'cl' alias to ${ZSHRC}"
-    run "printf '\n%s\nexport PATH=\"%s:\$PATH\"\nalias cl=%s\n# <<< claude-tools <<<\n' '${ZSH_SENTINEL}' '${BIN_DIR}' '${SCRIPT_NAME}' >> '${ZSHRC}'"
+    say "adding PATH entry, 'cl' alias, and CL_DEFAULT_DIR hint to ${ZSHRC}"
+    run "printf '\n%s\nexport PATH=\"%s:\$PATH\"\nalias cl=%s\n# export CL_DEFAULT_DIR=\"\$HOME/your-repo\"  # uncomment: dir for  cl new \"Name\" -d\n# <<< claude-tools <<<\n' '${ZSH_SENTINEL}' '${BIN_DIR}' '${SCRIPT_NAME}' >> '${ZSHRC}'"
   fi
 else
   say "skipping ~/.zshrc edits (--no-shellrc)"

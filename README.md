@@ -71,11 +71,45 @@ session state. Open a new terminal afterward so the `cl` alias stops resolving.
 ## Usage
 
 - `cl` — open the picker
-- `cl <name>` — launch that named session directly
+- `cl <name>` — launch that named session directly (attaches it if already live)
+- `cl new "Name" [dir|-d]` — create a **fully-named** session in one step (no `/rename`)
 - `cl --list` — print discovered sessions
 - `cl stop` — snapshot live sessions, kill them, and close their iTerm tabs (`--keep-tabs` to leave tabs open)
 - `cl start` — relaunch every session from the last `stop`
 - `cl restore` — restore `state.json` from the newest history snapshot (then `cl start`)
+
+## Creating a new session — `cl new`
+
+`cl new "Session Name"` launches a session that's **named from the first
+keystroke** — no `cl` → "new claude here" → `/rename` → exit → re-pick dance. It
+passes `claude --name`, which sets the session's title so it shows up correctly in
+the terminal, in Claude's own `/resume` picker, and (after its first message) in
+`cl`/`cl --list`/`cl start`.
+
+Where it launches:
+
+| Command | Directory |
+|---|---|
+| `cl new "Name"` | current dir (`$PWD`) — launch where you're standing |
+| `cl new "Name" -d` | `$CL_DEFAULT_DIR` (your main repo) |
+| `cl new "Name" ~/some/repo` | that explicit dir |
+
+If you run most sessions from one repo, set it once so `-d` lands there from
+anywhere:
+
+```
+export CL_DEFAULT_DIR="$HOME/path/to/your-repo"   # in ~/.zshrc
+```
+
+Run interactively, `cl new` creates **and attaches** the session. Run without a
+TTY (from a script, or a Claude Bash call — "spin me up a session called X"), it
+creates the session **detached** and prints `attach with: cl "X"`.
+
+> Note: `claude --name` writes the session's title into its transcript on its
+> **first message**, so a brand-new, untouched session isn't in `cl --list` yet —
+> but `cl "X"` attaches it immediately (it falls back to the live tmux session by
+> name), and the title is already correct everywhere else. Send one message and it
+> appears in the picker too.
 
 ## start / stop
 
