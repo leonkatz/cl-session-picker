@@ -10,6 +10,8 @@
 # Usage:
 #   claude-session            # picker (fzf if available, numbered menu otherwise)
 #   claude-session <name>     # launch that named session directly
+#   claude-session new "Name" [dir|-d]  # create a fully-named session in one step
+#                             #   (no /rename); dir = $PWD, -d uses $CL_DEFAULT_DIR
 #   claude-session --list     # print discovered sessions
 #   claude-session stop       # snapshot live sessions, kill them, and close their
 #                             #   iTerm tabs (--keep-tabs to leave tabs open; asks
@@ -136,6 +138,54 @@ launch_new() { # cwd
     exec tmux new-session -A -s "$t" -c "$cwd" "claude --dangerously-skip-permissions"
   else
     cd "$cwd" || exit 1; exec claude --dangerously-skip-permissions
+  fi
+}
+
+# do_new: create a NEW, fully-named session in one step — no /rename → exit →
+# re-pick dance. `claude --name` sets the session's customTitle AT LAUNCH, so
+# discover(), the picker, and `cl start` all find it immediately.
+#   cl new "Session Name"        → launch in $PWD (default: where you are)
+#   cl new "Session Name" -d      → launch in $CL_DEFAULT_DIR (your main repo)
+#   cl new "Session Name" <dir>   → launch in that explicit dir
+# Interactive → create + attach. No TTY (script / a Claude Bash call) → create
+# detached and print how to attach, so the caller isn't left hanging.
+do_new() {
+  local name="${1:-}" arg="${2:-}" cwd
+  [ -n "$name" ] || { echo 'usage: cl new "Session Name" [dir | -d]' >&2; exit 1; }
+  case "$arg" in
+    -d|--default)
+      cwd="${CL_DEFAULT_DIR:-}"
+      [ -n "$cwd" ] || { echo "claude-session: -d given but CL_DEFAULT_DIR is not set (export it in your shell rc)" >&2; exit 1; }
+      ;;
+    "")  cwd="$PWD" ;;
+    *)   cwd="$arg" ;;
+  esac
+  [ -d "$cwd" ] || { echo "claude-session: no such directory: $cwd" >&2; exit 1; }
+
+  local t qname
+  t=$(tmux_name "$name")
+  qname=$(printf '%q' "$name")   # safe to embed in the tmux command string
+
+  if ! command -v tmux >/dev/null 2>&1; then
+    cd "$cwd" || exit 1
+    exec claude --name "$name" --dangerously-skip-permissions
+  fi
+
+  if [ -t 1 ] && [ -t 0 ]; then
+    # interactive: create + attach, like the picker
+    tag_iterm_session "$t"
+    tmux_titles
+    exec tmux new-session -A -s "$t" -c "$cwd" "claude --name $qname --dangerously-skip-permissions"
+  else
+    # no TTY (script / Claude Bash call): create detached so the caller isn't
+    # blocked on an attach — attach later with `cl "<name>"`.
+    tmux_titles
+    if tmux has-session -t "=${t}" 2>/dev/null; then
+      echo "session '$name' already exists — attach with: cl \"$name\""
+    else
+      tmux new-session -d -s "$t" -c "$cwd" "claude --name $qname --dangerously-skip-permissions" \
+        && echo "created '$name' in $cwd — attach with: cl \"$name\""
+    fi
   fi
 }
 
@@ -397,6 +447,7 @@ rows() {
 }
 
 case "${1:-}" in
+  new)     shift; do_new "$@"; exit 0 ;;
   stop)    do_stop "${2:-}"; exit 0 ;;
   start)   do_start; exit 0 ;;
   restore) do_restore "${2:-}"; exit 0 ;;
@@ -407,16 +458,25 @@ case "${1:-}" in
       printf '%-2s %-22s %-8s %s\n' "$dot" "$name" "$(reltime "$epoch")" "$cwd"
     done
     exit 0 ;;
-  -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+  -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
   '') : ;;  # fall through to picker
   *)
     # direct launch by name
     match=$(discover | awk -F'\t' -v n="$1" '$1==n{print; exit}')
-    [ -n "$match" ] || { echo "claude-session: no session named '$1' (try --list)" >&2; exit 1; }
-    IFS=$'\t' read -r name sid cwd _ <<EOF
+    if [ -n "$match" ]; then
+      IFS=$'\t' read -r name sid cwd _ <<EOF
 $match
 EOF
-    launch_session "$name" "$sid" "$cwd" ;;
+      launch_session "$name" "$sid" "$cwd"
+    elif command -v tmux >/dev/null 2>&1 && tmux has-session -t "=$(tmux_name "$1")" 2>/dev/null; then
+      # Live tmux session exists but its customTitle isn't in the transcript yet
+      # (e.g. a fresh `cl new` before its first message) — attach it directly.
+      t=$(tmux_name "$1"); tag_iterm_session "$t"; tmux_titles
+      exec tmux new-session -A -s "$t"
+    else
+      echo "claude-session: no session named '$1' (try --list)" >&2; exit 1
+    fi
+    ;;
 esac
 
 # ---- picker ----
