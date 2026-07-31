@@ -56,14 +56,37 @@ reltime() {
 
 tmux_name() { printf '%s' "$1" | tr ' .:/' '____'; }
 
-# Make the terminal title track the tmux session name (#S) for every session.
-# Set as global server options so it applies regardless of ~/.tmux.conf; called
-# before each new-session since exec replaces this process and can't run after.
-tmux_titles() {
+# in_cmux: this shell is hosted by a cmux pane (cmux exports surface/workspace
+# ids into every terminal it spawns). In cmux mode cl skips tmux entirely —
+# cmux's Claude integration owns persistence/restore (quit cmux = save; relaunch
+# = resume by session id), so wrapping claude in tmux would only hide it from
+# cmux's lifecycle badges, Feed, and restore.
+in_cmux() { [ -n "${CMUX_SURFACE_ID:-}" ] || [ -n "${CMUX_WORKSPACE_ID:-}" ]; }
+
+# in_iterm: this shell is hosted by iTerm2 itself. Distinct from iterm_running:
+# "iTerm is open somewhere" is the wrong gate for OPENING tabs — with cmux in
+# the picture it would open tabs in a terminal the user isn't looking at.
+# (iterm_running stays correct for CLOSING previously-tagged iTerm tabs.)
+in_iterm() { ! in_cmux && [ "${TERM_PROGRAM:-}" = "iTerm.app" ]; }
+
+# session_pid <sid>: pid of a live claude already running this session, if any.
+# Guards cmux mode against double --resume of one session (two processes on the
+# same transcript) — the hazard tmux's attach-don't-duplicate used to prevent.
+session_pid() { pgrep -f "(-resume|-session-id) $1" 2>/dev/null | head -1; }
+
+# Server-global tmux setup applied idempotently before each launch (exec
+# replaces this process, so it can't run after): terminal titles track the
+# session name, and Ctrl-Z is swallowed unless the pane runs a shell. Claude
+# Code can't disable its Ctrl-Z suspend, and a suspended claude in a cl pane
+# has no parent shell to `fg` from (recovery requires kill -CONT). Shells still
+# get Ctrl-Z so job control works in normal panes. Applied here rather than
+# ~/.tmux.conf so cl is self-contained on any machine.
+tmux_setup() {
   command -v tmux >/dev/null 2>&1 || return 0
   tmux start-server 2>/dev/null
   tmux set -g set-titles on 2>/dev/null
   tmux set -g set-titles-string "#S" 2>/dev/null
+  tmux bind-key -n C-z if-shell -F '#{m:*sh,#{pane_current_command}}' 'send-keys C-z' '' 2>/dev/null
 }
 
 # iterm_running: true when iTerm2 is actually running. Env vars are unreliable
@@ -119,11 +142,20 @@ OSA
 }
 
 launch_session() { # name sid cwd
-  local name="$1" sid="$2" cwd="$3" t
+  local name="$1" sid="$2" cwd="$3" t pid
   t=$(tmux_name "$name"); [ -d "$cwd" ] || cwd="$HOME"
+  if in_cmux; then
+    pid=$(session_pid "$sid")
+    if [ -n "$pid" ]; then
+      echo "\"$name\" is already running (pid $pid) — switch to its tab instead of resuming it twice." >&2
+      exit 1
+    fi
+    cmux rename-tab "$name" >/dev/null 2>&1
+    cd "$cwd" || exit 1; exec claude --resume "$sid" --dangerously-skip-permissions
+  fi
   if command -v tmux >/dev/null 2>&1; then
-    tag_iterm_session "$t"   # so `cl stop` can close this tab later
-    tmux_titles
+    in_iterm && tag_iterm_session "$t"   # so `cl stop` can close this tab later
+    tmux_setup
     exec tmux new-session -A -s "$t" -c "$cwd" "claude --resume $sid --dangerously-skip-permissions"
   else
     cd "$cwd" || exit 1; exec claude --resume "$sid" --dangerously-skip-permissions
@@ -132,9 +164,12 @@ launch_session() { # name sid cwd
 
 launch_new() { # cwd
   local cwd="$1" t; [ -d "$cwd" ] || cwd="$PWD"
+  if in_cmux; then
+    cd "$cwd" || exit 1; exec claude --dangerously-skip-permissions
+  fi
   t="claude-$(basename "$cwd")"
   if command -v tmux >/dev/null 2>&1; then
-    tmux_titles
+    tmux_setup
     exec tmux new-session -A -s "$t" -c "$cwd" "claude --dangerously-skip-permissions"
   else
     cd "$cwd" || exit 1; exec claude --dangerously-skip-permissions
@@ -147,10 +182,14 @@ launch_new() { # cwd
 launch_named() { # name cwd
   local name="$1" cwd="$2" t qname
   [ -d "$cwd" ] || cwd="$HOME"
+  if in_cmux; then
+    cmux rename-tab "$name" >/dev/null 2>&1
+    cd "$cwd" || exit 1; exec claude --name "$name" --dangerously-skip-permissions
+  fi
   t=$(tmux_name "$name"); qname=$(printf '%q' "$name")
   if command -v tmux >/dev/null 2>&1; then
-    tag_iterm_session "$t"
-    tmux_titles
+    in_iterm && tag_iterm_session "$t"
+    tmux_setup
     exec tmux new-session -A -s "$t" -c "$cwd" "claude --name $qname --dangerously-skip-permissions"
   else
     cd "$cwd" || exit 1; exec claude --name "$name" --dangerously-skip-permissions
@@ -182,6 +221,19 @@ do_new() {
   t=$(tmux_name "$name")
   qname=$(printf '%q' "$name")   # safe to embed in the tmux command string
 
+  if in_cmux; then
+    if [ -t 1 ] && [ -t 0 ]; then
+      launch_named "$name" "$cwd"
+    else
+      # no TTY (script / Claude Bash call): open a fresh cmux workspace so the
+      # caller isn't blocked, mirroring the detached-tmux path below.
+      cmux new-workspace --name "$name" --cwd "$cwd" \
+          --command "claude --name $qname --dangerously-skip-permissions" >/dev/null \
+        && echo "created cmux workspace '$name' in $cwd"
+    fi
+    exit 0
+  fi
+
   if ! command -v tmux >/dev/null 2>&1; then
     cd "$cwd" || exit 1
     exec claude --name "$name" --dangerously-skip-permissions
@@ -193,7 +245,7 @@ do_new() {
   else
     # no TTY (script / Claude Bash call): create detached so the caller isn't
     # blocked on an attach — attach later with `cl "<name>"`.
-    tmux_titles
+    tmux_setup
     if tmux has-session -t "=${t}" 2>/dev/null; then
       echo "session '$name' already exists — attach with: cl \"$name\""
     else
@@ -295,6 +347,7 @@ do_stop() {
   command -v jq >/dev/null 2>&1 || { echo "claude-session: stop needs jq (brew install jq)" >&2; exit 1; }
   local keep_tabs=0
   [ "${1:-}" = "--keep-tabs" ] && keep_tabs=1
+  in_cmux && echo "note: cl stop manages tmux-backed sessions only — cmux-native claude sessions are saved/restored by cmux itself (quit cmux)." >&2
   if ! tmux list-sessions >/dev/null 2>&1; then
     echo "claude-session: no tmux server running — nothing to stop" >&2
     exit 0
@@ -368,8 +421,8 @@ do_start() {
   # 1. Ensure each session's tmux exists (detached). `cl <name>` in each tab
   #    then attaches it. Creating here (not relying on the tab) means a failed
   #    tab still leaves a recoverable session. launch_session execs, so we
-  #    replicate its create-detached form (incl. tmux_titles).
-  command -v tmux >/dev/null 2>&1 && tmux_titles
+  #    replicate its create-detached form (incl. tmux_setup).
+  command -v tmux >/dev/null 2>&1 && tmux_setup
   local name sid cwd t i=0
   while IFS=$'\t' read -r name sid cwd; do
     t=$(tmux_name "$name")
@@ -393,10 +446,11 @@ do_start() {
   archive_state
   rm -f "$STATE"
 
-  # Detect iTerm robustly (env vars are unreliable — TERM_PROGRAM is clobbered to
-  # "tmux" inside a client — so iterm_running asks the OS instead).
+  # Open tabs only when THIS shell is iTerm-hosted (in_iterm). Inside a tmux
+  # pane TERM_PROGRAM reads "tmux", so in_iterm is false there — cl start then
+  # degrades to printing the commands instead of guessing a terminal to target.
   local have_iterm=0
-  iterm_running && have_iterm=1
+  in_iterm && have_iterm=1
   if [ "$have_iterm" = "1" ] && open_iterm_tabs "${names[@]}"; then
     printf '\nopened %s iTerm tab(s).\n' "${#names[@]}"
   else
@@ -455,7 +509,7 @@ do_restore() {
 rows() {
   printf '＋ new claude here  ·  %s\tNEW\t\t%s\n' "$PWD" "$PWD"
   discover | while IFS=$'\t' read -r name sid cwd epoch; do
-    if tmux has-session -t "$(tmux_name "$name")" 2>/dev/null; then dot="●"; else dot="○"; fi
+    if tmux has-session -t "$(tmux_name "$name")" 2>/dev/null || [ -n "$(session_pid "$sid")" ]; then dot="●"; else dot="○"; fi
     printf '%s %-22s %-8s %s\t%s\t%s\t%s\n' "$dot" "$name" "$(reltime "$epoch")" "$cwd" "$name" "$sid" "$cwd"
   done
 }
@@ -468,7 +522,7 @@ case "${1:-}" in
   --list)
     printf '%-2s %-22s %-8s %s\n' '' NAME 'ACTIVE' DIR
     discover | while IFS=$'\t' read -r name sid cwd epoch; do
-      if tmux has-session -t "$(tmux_name "$name")" 2>/dev/null; then dot='●'; else dot='○'; fi
+      if tmux has-session -t "$(tmux_name "$name")" 2>/dev/null || [ -n "$(session_pid "$sid")" ]; then dot='●'; else dot='○'; fi
       printf '%-2s %-22s %-8s %s\n' "$dot" "$name" "$(reltime "$epoch")" "$cwd"
     done
     exit 0 ;;
@@ -485,7 +539,7 @@ EOF
     elif command -v tmux >/dev/null 2>&1 && tmux has-session -t "=$(tmux_name "$1")" 2>/dev/null; then
       # Live tmux session exists but its customTitle isn't in the transcript yet
       # (e.g. a fresh `cl new` before its first message) — attach it directly.
-      t=$(tmux_name "$1"); tag_iterm_session "$t"; tmux_titles
+      t=$(tmux_name "$1"); in_iterm && tag_iterm_session "$t"; tmux_setup
       exec tmux new-session -A -s "$t"
     else
       echo "claude-session: no session named '$1' (try --list)" >&2; exit 1
