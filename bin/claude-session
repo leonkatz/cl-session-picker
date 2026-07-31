@@ -15,9 +15,12 @@
 #   claude-session --list     # print discovered sessions
 #   claude-session stop       # snapshot live sessions, kill them, and close their
 #                             #   iTerm tabs (--keep-tabs to leave tabs open; asks
-#                             #   before killing any mid-task, leaving those open)
+#                             #   before killing any mid-task, leaving those open).
+#                             #   Covers cmux-native sessions too: their claude
+#                             #   processes are killed and surfaces closed.
 #   claude-session start      # relaunch every session from the last stop
-#                             #   (reattach if live, else resume by session id)
+#                             #   (reattach if live, else resume by session id).
+#                             #   In cmux: opens one workspace per session.
 #   claude-session restore    # restore state.json from the newest history
 #                             #   snapshot (add --list to pick; then run start)
 
@@ -263,20 +266,41 @@ do_new() {
 # external signal. The signal is conservative — caffeinate's timeout lingers a
 # few minutes after work ends — so stop errs toward asking, never silent-killing.
 
-# session_busy <tmux_session_name>: 0 (true) if a claude in that session looks
-# mid-task — a caffeinate child under the pane, or claude CPU over ~15%.
-session_busy() {
-  local t="$1" ppid kid cmd cpu
-  ppid=$(tmux list-panes -t "=${t}" -F '#{pane_pid}' 2>/dev/null | head -1)
-  [ -n "$ppid" ] || return 1
-  for kid in $(pgrep -P "$ppid" 2>/dev/null); do
+# claude_busy <pid>: 0 (true) if that claude process looks mid-task — a
+# caffeinate child, or CPU over ~15%. Works on any claude pid (tmux pane or
+# cmux pane); the terminal doesn't matter, only the process tree does.
+claude_busy() {
+  local pid="$1" kid cmd cpu
+  [ -n "$pid" ] || return 1
+  for kid in $(pgrep -P "$pid" 2>/dev/null); do
     cmd=$(ps -o command= -p "$kid" 2>/dev/null)
     case "$cmd" in *caffeinate*) return 0 ;; esac
   done
-  cpu=$(ps -o %cpu= -p "$ppid" 2>/dev/null | tr -d ' ')
+  cpu=$(ps -o %cpu= -p "$pid" 2>/dev/null | tr -d ' ')
   # Integer compare on the whole-number part; >=15% CPU counts as working.
   [ "${cpu%%.*}" -ge 15 ] 2>/dev/null && return 0
   return 1
+}
+
+# session_busy <tmux_session_name>: tmux flavor of claude_busy — the pane's
+# root process IS the claude (tmux runs it as the pane command).
+session_busy() {
+  local ppid
+  ppid=$(tmux list-panes -t "=${1}" -F '#{pane_pid}' 2>/dev/null | head -1)
+  claude_busy "$ppid"
+}
+
+# close_cmux_surface <sid>: best-effort close of the cmux surface hosting this
+# session, looked up in cmux's own session store. Only meaningful (and only
+# authorized on the socket) when running inside cmux; silently a no-op
+# otherwise. Called after the claude is dead, so the surface holds a bare shell.
+close_cmux_surface() {
+  in_cmux || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  local sfc
+  sfc=$(jq -r --arg sid "$1" '.sessions[$sid].surfaceId // empty'         "$HOME/.cmuxterm/claude-hook-sessions.json" 2>/dev/null)
+  [ -n "$sfc" ] && cmux close-surface --surface "$sfc" >/dev/null 2>&1
+  return 0
 }
 
 # archive_state: bank a copy of the current STATE into STATE_HISTORY_DIR under a
@@ -316,7 +340,7 @@ save_state() {
   live="$(
     printf '['
     discover | while IFS=$'\t' read -r name sid cwd epoch; do
-      tmux has-session -t "$(tmux_name "$name")" 2>/dev/null || continue
+      tmux has-session -t "$(tmux_name "$name")" 2>/dev/null || [ -n "$(session_pid "$sid")" ] || continue
       [ "$first" -eq 1 ] && first=0 || printf ','
       jq -nc --arg name "$name" --arg sid "$sid" --arg cwd "$cwd" \
         '{name:$name, sid:$sid, cwd:$cwd}'
@@ -347,8 +371,7 @@ do_stop() {
   command -v jq >/dev/null 2>&1 || { echo "claude-session: stop needs jq (brew install jq)" >&2; exit 1; }
   local keep_tabs=0
   [ "${1:-}" = "--keep-tabs" ] && keep_tabs=1
-  in_cmux && echo "note: cl stop manages tmux-backed sessions only — cmux-native claude sessions are saved/restored by cmux itself (quit cmux)." >&2
-  if ! tmux list-sessions >/dev/null 2>&1; then
+  if ! tmux list-sessions >/dev/null 2>&1 && ! in_cmux; then
     echo "claude-session: no tmux server running — nothing to stop" >&2
     exit 0
   fi
@@ -361,21 +384,47 @@ do_stop() {
   local count; count=$(jq 'length' "$STATE" 2>/dev/null || echo 0)
   printf 'saved %s session(s) to %s\n\n' "$count" "$STATE"
 
-  local name t ans
+  local name t ans pid
   discover | while IFS=$'\t' read -r name sid cwd epoch; do
     t=$(tmux_name "$name")
-    tmux has-session -t "=${t}" 2>/dev/null || continue
-    if session_busy "$t"; then
-      printf '⏳ "%s" looks mid-task. Kill it anyway? [y/N] ' "$name" >&2
+    if tmux has-session -t "=${t}" 2>/dev/null; then
+      if session_busy "$t"; then
+        printf '⏳ "%s" looks mid-task. Kill it anyway? [y/N] ' "$name" >&2
+        read -r ans </dev/tty
+        case "$ans" in
+          y|Y)  tmux kill-session -t "=${t}" 2>/dev/null \
+                  && { printf '   killed %s\n' "$name" >&2; [ "$close_tabs" = "1" ] && close_iterm_tab "$t"; } ;;
+          *)    printf '   left %s running — re-run cl stop later to close it\n' "$name" >&2 ;;
+        esac
+      else
+        tmux kill-session -t "=${t}" 2>/dev/null \
+          && { printf '✓ killed %s\n' "$name" >&2; [ "$close_tabs" = "1" ] && close_iterm_tab "$t"; }
+      fi
+      continue
+    fi
+    # No tmux session — a cmux-native (or bare) claude: kill the process
+    # itself. SIGTERM is a clean shutdown (SessionEnd hooks fire), then the
+    # hosting surface (now a bare shell) is closed best-effort.
+    pid=$(session_pid "$sid"); [ -n "$pid" ] || continue
+    # Safety: a claude whose PARENT is a tmux server belongs to tmux — if we
+    # can't see that server (different socket/user context), it is not ours
+    # to process-kill. This branch only ever touches cmux/bare claudes.
+    # (Learned the hard way 2026-07-31: a hidden tmux server let this branch
+    # sweep 10 live tmux-hosted sessions.)
+    case "$(ps -o command= -p "$(ps -o ppid= -p "$pid" | tr -d ' ')" 2>/dev/null)" in
+      *tmux*) printf '⚠ skipping %s — owned by a tmux server not visible here\n' "$name" >&2; continue ;;
+    esac
+    if claude_busy "$pid"; then
+      printf '⏳ "%s" looks mid-task (pid %s). Kill it anyway? [y/N] ' "$name" "$pid" >&2
       read -r ans </dev/tty
       case "$ans" in
-        y|Y)  tmux kill-session -t "=${t}" 2>/dev/null \
-                && { printf '   killed %s\n' "$name" >&2; [ "$close_tabs" = "1" ] && close_iterm_tab "$t"; } ;;
+        y|Y)  kill "$pid" 2>/dev/null \
+                && { printf '   killed %s\n' "$name" >&2; close_cmux_surface "$sid"; } ;;
         *)    printf '   left %s running — re-run cl stop later to close it\n' "$name" >&2 ;;
       esac
     else
-      tmux kill-session -t "=${t}" 2>/dev/null \
-        && { printf '✓ killed %s\n' "$name" >&2; [ "$close_tabs" = "1" ] && close_iterm_tab "$t"; }
+      kill "$pid" 2>/dev/null \
+        && { printf '✓ killed %s\n' "$name" >&2; close_cmux_surface "$sid"; }
     fi
   done
   printf '\nstate saved. Run cl start to bring these back.\n' >&2
@@ -417,6 +466,28 @@ do_start() {
 
   local n; n=$(jq 'length' "$STATE" 2>/dev/null || echo 0)
   [ "$n" -gt 0 ] || { echo "claude-session: saved state is empty" >&2; exit 1; }
+
+  if in_cmux; then
+    # cmux mode: one workspace per saved session, claude resumed tmux-free so
+    # cmux's integration owns it. --focus false so eight restores don't fight
+    # over focus. Live sessions (either kind) are left alone.
+    local name sid cwd i=0
+    while IFS=$'\t' read -r name sid cwd; do
+      if [ -n "$(session_pid "$sid")" ] \
+         || { command -v tmux >/dev/null 2>&1 && tmux has-session -t "=$(tmux_name "$name")" 2>/dev/null; }; then
+        printf '● %s already live\n' "$name"
+      else
+        [ -d "$cwd" ] || cwd="$HOME"
+        cmux new-workspace --name "$name" --cwd "$cwd" --focus false \
+            --command "claude --resume $sid --dangerously-skip-permissions" >/dev/null \
+          && { printf '✓ opened %s  (%s)\n' "$name" "$cwd"; i=$((i+1)); }
+      fi
+    done < <(jq -r '.[] | [.name, .sid, .cwd] | @tsv' "$STATE")
+    archive_state
+    rm -f "$STATE"
+    printf '\nopened %s cmux workspace(s).\n' "$i"
+    exit 0
+  fi
 
   # 1. Ensure each session's tmux exists (detached). `cl <name>` in each tab
   #    then attaches it. Creating here (not relying on the tab) means a failed
