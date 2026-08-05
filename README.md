@@ -174,6 +174,14 @@ title per session, skips any whose recorded working directory no longer exists,
 and dedupes by name. (An older `agent-name` record exists only for a subset of
 sessions, so it is deliberately **not** used — it would hide most named sessions.)
 
+## cmux sidebar
+
+If you use [cmux](https://cmux.com), `cmux/sidebars/sessions.swift` is a custom
+sidebar that groups your sessions by real activity (Active / Recent / Idle /
+Cold, with live ago-times and last-message previews) instead of cmux's built-in
+idle-timer "Needs input" label. See [cmux/sidebars/README.md](cmux/sidebars/README.md)
+for install and caveats.
+
 ## Requirements
 
 - macOS — the script uses BSD `stat -f %m` for transcript mtimes, and the
