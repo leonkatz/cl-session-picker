@@ -15,6 +15,7 @@
 #   --no-deps        skip Homebrew dependency install (tmux, fzf)
 #   --no-shellrc     skip ~/.zshrc edits (PATH + `cl` alias)
 #   --no-tmux-conf   skip ~/.tmux.conf edits (set-titles options)
+#   --no-sidebars    skip installing cmux sidebars into ~/.config/cmux/sidebars
 #   --bin-dir P      override default install dir (default: ~/.local/bin)
 #
 # Per Bash standard: [[ ]] for conditionals, printf over echo -e, local for
@@ -37,6 +38,7 @@ DRY_RUN=0
 DO_DEPS=1
 DO_SHELLRC=1
 DO_TMUX_CONF=1
+DO_SIDEBARS=1
 BIN_DIR="$BIN_DIR_DEFAULT"
 
 # Timestamp for backup filenames — one value for the whole run.
@@ -67,6 +69,7 @@ while [[ $# -gt 0 ]]; do
     --no-deps)      DO_DEPS=0;       shift ;;
     --no-shellrc)   DO_SHELLRC=0;    shift ;;
     --no-tmux-conf) DO_TMUX_CONF=0;  shift ;;
+    --no-sidebars)  DO_SIDEBARS=0;   shift ;;
     --bin-dir)      BIN_DIR="$2";    shift 2 ;;
     -h|--help)      sed -n '2,21p' "$0"; exit 0 ;;
     *)
@@ -125,6 +128,34 @@ fi
 say "installing ${SCRIPT_NAME} → ${DST}"
 run "cp '${SRC}' '${DST}'"
 run "chmod +x '${DST}'"
+
+# =============================================================================
+# Step 2b — cmux custom sidebars (only when cmux is installed)
+# =============================================================================
+# cmux reads sidebars from ~/.config/cmux/sidebars. These complement cl (the
+# 'sessions' sidebar groups workspaces by real Claude activity), so install them
+# alongside it rather than leaving a manual copy step. Skipped entirely when cmux
+# isn't present — cl works fine without it. --no-sidebars opts out.
+
+if [[ "$DO_SIDEBARS" == "1" ]] && command -v cmux >/dev/null 2>&1; then
+  SIDEBAR_SRC_DIR="${COMPONENT_DIR}/cmux/sidebars"
+  SIDEBAR_DST_DIR="${HOME}/.config/cmux/sidebars"
+  if [[ -d "$SIDEBAR_SRC_DIR" ]]; then
+    run "mkdir -p '${SIDEBAR_DST_DIR}'"
+    for _sb in "$SIDEBAR_SRC_DIR"/*.swift; do
+      [[ -e "$_sb" ]] || continue
+      _sb_name="$(basename "$_sb")"
+      say "installing cmux sidebar ${_sb_name} → ${SIDEBAR_DST_DIR}/"
+      run "cp '${_sb}' '${SIDEBAR_DST_DIR}/${_sb_name}'"
+    done
+    unset _sb _sb_name
+    say "  open it with: cmux sidebar open sessions"
+  fi
+elif [[ "$DO_SIDEBARS" == "1" ]]; then
+  say "cmux not found — skipping cmux sidebars (cl works fine without them)"
+else
+  say "skipping cmux sidebars (--no-sidebars)"
+fi
 
 # =============================================================================
 # Step 3 — tmux settings in ~/.tmux.conf
