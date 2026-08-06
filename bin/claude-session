@@ -23,6 +23,10 @@
 #                             #   In cmux: opens one workspace per session.
 #   claude-session restore    # restore state.json from the newest history
 #                             #   snapshot (add --list to pick; then run start)
+#
+# In cmux panes, sessions launch via `cmux claude-teams` so Agent Teams
+# teammates appear as native cmux splits. Set CL_TEAMS=0 to launch plain
+# `claude` instead. (Outside cmux this is always plain `claude`.)
 
 PROJECTS="$HOME/.claude/projects"
 STATE="$HOME/.config/claude-session/state.json"
@@ -71,6 +75,21 @@ in_cmux() { [ -n "${CMUX_SURFACE_ID:-}" ] || [ -n "${CMUX_WORKSPACE_ID:-}" ]; }
 # the picture it would open tabs in a terminal the user isn't looking at.
 # (iterm_running stays correct for CLOSING previously-tagged iTerm tabs.)
 in_iterm() { ! in_cmux && [ "${TERM_PROGRAM:-}" = "iTerm.app" ]; }
+
+# claude_cmd: the command used to start claude in a cmux pane. Defaults to
+# `cmux claude-teams`, which deploys cmux's fake-tmux shim so Agent Teams
+# teammates render as native cmux splits — the teams *feature* comes from
+# CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS in ~/.claude/settings.json; without the
+# shim teammates run headless. CL_TEAMS=0 opts out (e.g. a cmux build without
+# the claude-teams subcommand). Outside cmux this is always plain `claude`:
+# the shim must not be nested inside real tmux, where teams uses real panes.
+claude_cmd() {
+  if in_cmux && [ "${CL_TEAMS:-1}" != "0" ] && command -v cmux >/dev/null 2>&1; then
+    printf 'cmux claude-teams'
+  else
+    printf 'claude'
+  fi
+}
 
 # session_pid <sid>: pid of a live claude already running this session, if any.
 # Guards cmux mode against double --resume of one session (two processes on the
@@ -154,7 +173,8 @@ launch_session() { # name sid cwd
       exit 1
     fi
     cmux rename-tab "$name" >/dev/null 2>&1
-    cd "$cwd" || exit 1; exec claude --resume "$sid" --dangerously-skip-permissions
+    # shellcheck disable=SC2046  # claude_cmd may expand to two words
+    cd "$cwd" || exit 1; exec $(claude_cmd) --resume "$sid" --dangerously-skip-permissions
   fi
   if command -v tmux >/dev/null 2>&1; then
     in_iterm && tag_iterm_session "$t"   # so `cl stop` can close this tab later
@@ -168,7 +188,8 @@ launch_session() { # name sid cwd
 launch_new() { # cwd
   local cwd="$1" t; [ -d "$cwd" ] || cwd="$PWD"
   if in_cmux; then
-    cd "$cwd" || exit 1; exec claude --dangerously-skip-permissions
+    # shellcheck disable=SC2046
+    cd "$cwd" || exit 1; exec $(claude_cmd) --dangerously-skip-permissions
   fi
   t="claude-$(basename "$cwd")"
   if command -v tmux >/dev/null 2>&1; then
@@ -187,7 +208,8 @@ launch_named() { # name cwd
   [ -d "$cwd" ] || cwd="$HOME"
   if in_cmux; then
     cmux rename-tab "$name" >/dev/null 2>&1
-    cd "$cwd" || exit 1; exec claude --name "$name" --dangerously-skip-permissions
+    # shellcheck disable=SC2046
+    cd "$cwd" || exit 1; exec $(claude_cmd) --name "$name" --dangerously-skip-permissions
   fi
   t=$(tmux_name "$name"); qname=$(printf '%q' "$name")
   if command -v tmux >/dev/null 2>&1; then
@@ -231,7 +253,7 @@ do_new() {
       # no TTY (script / Claude Bash call): open a fresh cmux workspace so the
       # caller isn't blocked, mirroring the detached-tmux path below.
       cmux new-workspace --name "$name" --cwd "$cwd" \
-          --command "claude --name $qname --dangerously-skip-permissions" >/dev/null \
+          --command "$(claude_cmd) --name $qname --dangerously-skip-permissions" >/dev/null \
         && echo "created cmux workspace '$name' in $cwd"
     fi
     exit 0
@@ -479,7 +501,7 @@ do_start() {
       else
         [ -d "$cwd" ] || cwd="$HOME"
         cmux new-workspace --name "$name" --cwd "$cwd" --focus false \
-            --command "claude --resume $sid --dangerously-skip-permissions" >/dev/null \
+            --command "$(claude_cmd) --resume $sid --dangerously-skip-permissions" >/dev/null \
           && { printf '✓ opened %s  (%s)\n' "$name" "$cwd"; i=$((i+1)); }
       fi
     done < <(jq -r '.[] | [.name, .sid, .cwd] | @tsv' "$STATE")
