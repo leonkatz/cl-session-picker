@@ -312,16 +312,32 @@ session_busy() {
   claude_busy "$ppid"
 }
 
-# close_cmux_surface <sid>: best-effort close of the cmux surface hosting this
-# session, looked up in cmux's own session store. Only meaningful (and only
-# authorized on the socket) when running inside cmux; silently a no-op
-# otherwise. Called after the claude is dead, so the surface holds a bare shell.
+# close_cmux_surface <sid> [display_name]: best-effort close of the cmux surface
+# hosting this session, looked up in cmux's own session store. Called after the
+# claude is dead, so the surface holds nothing but a bare shell.
+#
+# The gate is "is cmux installed", NOT in_cmux. `cl stop` is routinely run from
+# iTerm or a plain terminal while cmux surfaces are alive elsewhere, and gating
+# on in_cmux made this a no-op exactly then — leaving every cmux workspace
+# holding an orphaned shell. Whether a surface exists is already answered by the
+# session store, not by where the operator happens to be typing.
 close_cmux_surface() {
-  in_cmux || return 0
-  command -v jq >/dev/null 2>&1 || return 0
-  local sfc
-  sfc=$(jq -r --arg sid "$1" '.sessions[$sid].surfaceId // empty'         "$HOME/.cmuxterm/claude-hook-sessions.json" 2>/dev/null)
-  [ -n "$sfc" ] && cmux close-surface --surface "$sfc" >/dev/null 2>&1
+  local sid="$1" name="${2:-$1}" sfc
+  local store="$HOME/.cmuxterm/claude-hook-sessions.json"
+  command -v cmux >/dev/null 2>&1 || return 0
+  [ -r "$store" ] || return 0
+  if ! command -v jq >/dev/null 2>&1; then
+    printf '⚠ left cmux workspace for "%s" open — jq is needed to read the surface id\n' "$name" >&2
+    return 0
+  fi
+  sfc=$(jq -r --arg sid "$sid" '.sessions[$sid].surfaceId // empty' "$store" 2>/dev/null)
+  # No recorded surface means cmux never hosted this session: there is nothing to
+  # close, and `--surface ""` would close the operator's OWN pane. Stay silent —
+  # warning here would fire on every plain tmux session.
+  [ -n "$sfc" ] || return 0
+  if ! cmux close-surface --surface "$sfc" >/dev/null 2>&1; then
+    printf '⚠ left cmux workspace for "%s" open — cmux close-surface %s failed\n' "$name" "$sfc" >&2
+  fi
   return 0
 }
 
@@ -413,14 +429,18 @@ do_stop() {
       if session_busy "$t"; then
         printf '⏳ "%s" looks mid-task. Kill it anyway? [y/N] ' "$name" >&2
         read -r ans </dev/tty
+        # A tmux-hosted session can ALSO be sitting in a cmux surface (a cmux
+        # pane running tmux): killing the tmux session leaves that surface
+        # holding a bare shell, so close it here too. Sessions cmux never hosted
+        # have no recorded surface, and then this is a silent no-op.
         case "$ans" in
           y|Y)  tmux kill-session -t "=${t}" 2>/dev/null \
-                  && { printf '   killed %s\n' "$name" >&2; [ "$close_tabs" = "1" ] && close_iterm_tab "$t"; } ;;
+                  && { printf '   killed %s\n' "$name" >&2; [ "$close_tabs" = "1" ] && close_iterm_tab "$t"; close_cmux_surface "$sid" "$name"; } ;;
           *)    printf '   left %s running — re-run cl stop later to close it\n' "$name" >&2 ;;
         esac
       else
         tmux kill-session -t "=${t}" 2>/dev/null \
-          && { printf '✓ killed %s\n' "$name" >&2; [ "$close_tabs" = "1" ] && close_iterm_tab "$t"; }
+          && { printf '✓ killed %s\n' "$name" >&2; [ "$close_tabs" = "1" ] && close_iterm_tab "$t"; close_cmux_surface "$sid" "$name"; }
       fi
       continue
     fi
@@ -441,12 +461,12 @@ do_stop() {
       read -r ans </dev/tty
       case "$ans" in
         y|Y)  kill "$pid" 2>/dev/null \
-                && { printf '   killed %s\n' "$name" >&2; close_cmux_surface "$sid"; } ;;
+                && { printf '   killed %s\n' "$name" >&2; close_cmux_surface "$sid" "$name"; } ;;
         *)    printf '   left %s running — re-run cl stop later to close it\n' "$name" >&2 ;;
       esac
     else
       kill "$pid" 2>/dev/null \
-        && { printf '✓ killed %s\n' "$name" >&2; close_cmux_surface "$sid"; }
+        && { printf '✓ killed %s\n' "$name" >&2; close_cmux_surface "$sid" "$name"; }
     fi
   done
   printf '\nstate saved. Run cl start to bring these back.\n' >&2
