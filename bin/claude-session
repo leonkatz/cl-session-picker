@@ -1,18 +1,23 @@
 #!/usr/bin/env bash
-# claude-session — interactive picker for resuming named Claude Code sessions.
+# claude-session — interactive picker for resuming named Claude Code and
+# Codex CLI sessions.
 #
 # Bound to `cl`. Auto-discovers every session you've /renamed (no registry to
 # maintain — name a session and it shows up), marks which are live in tmux, and
 # on select cd's into that session's dir and attaches/launches it in a persistent
-# tmux session with --dangerously-skip-permissions. A "new claude here" entry
-# starts a fresh session in the current directory.
+# tmux session. A "new … here" entry starts a fresh session in the current
+# directory. Claude launches with --dangerously-skip-permissions; Codex launches
+# with its own configured defaults (add flags via CL_CODEX_ARGS).
 #
 # Usage:
 #   claude-session            # picker (fzf if available, numbered menu otherwise)
 #   claude-session <name>     # launch that named session directly
+#   claude-session --codex <name>   # same, when a name exists for both agents
 #   claude-session new "Name" [dir|-d]  # create a fully-named session in one step
 #                             #   (no /rename); dir = $PWD, -d uses $CL_DEFAULT_DIR
-#   claude-session --list     # print discovered sessions
+#   claude-session new --codex "Name" [dir|-d]  # fresh codex; the name labels
+#                             #   the tab only until you /rename inside codex
+#   claude-session --list     # print discovered sessions (--codex/--claude to filter)
 #   claude-session stop       # snapshot live sessions, kill them, and close their
 #                             #   iTerm tabs (--keep-tabs to leave tabs open; asks
 #                             #   before killing any mid-task, leaving those open).
@@ -29,14 +34,23 @@
 # `claude` instead. (Outside cmux this is always plain `claude`.)
 
 PROJECTS="$HOME/.claude/projects"
+# Codex CLI storage. Both files are private implementation details of the Codex
+# CLI (observed at 0.150.0), not a supported API — discover_codex() is the one
+# place that knows their shape, so a layout change breaks exactly one function.
+CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+CODEX_INDEX="$CODEX_HOME/session_index.jsonl"
+CODEX_SESSIONS="$CODEX_HOME/sessions"
 STATE="$HOME/.config/claude-session/state.json"
 # Rotating history of past state files — a safety net against a failed `cl start`
 # (which deletes STATE) or a corrupted write. Newest STATE_HISTORY_KEEP kept.
 STATE_HISTORY_DIR="$HOME/.config/claude-session/history"
 STATE_HISTORY_KEEP=10
 
-# name<TAB>sid<TAB>cwd<TAB>epoch  — newest transcript per *current* name
-discover() {
+# Every discover* function emits:  name<TAB>sid<TAB>cwd<TAB>epoch<TAB>agent
+# agent is "claude" or "codex". Consumers must read all five fields.
+
+# discover_claude — newest transcript per *current* name
+discover_claude() {
   # custom-title is the record /rename writes; it covers every named session.
   # (The older agent-name record exists only for a subset, so grepping it
   # silently dropped half the sessions — including the most-used ones.)
@@ -49,9 +63,56 @@ discover() {
         cwd=$(grep -m1 -oE '"cwd":"[^"]*"' "$f" 2>/dev/null | sed 's/.*"cwd":"//; s/"$//')
         [ -d "$cwd" ] || continue   # drop sessions whose working dir no longer exists
         epoch=$(stat -f %m "$f" 2>/dev/null || echo 0)
-        printf '%s\t%s\t%s\t%s\n' "$name" "$sid" "$cwd" "$epoch"
+        printf '%s\t%s\t%s\t%s\tclaude\n' "$name" "$sid" "$cwd" "$epoch"
       done \
     | awk -F'\t' '!seen[$1]++'
+}
+
+# discover_codex — named Codex CLI sessions (`/rename` inside codex).
+#
+# Codex has no registry of names either. Its rename index is an append-only
+# JSONL of {id, thread_name, updated_at}; the LAST line per id is the current
+# name (a session renamed three times has three lines). The working dir lives
+# in the rollout transcript's first line (session_meta.cwd), and the rollout's
+# mtime is the recency signal. Rollouts are searched ONLY under sessions/ —
+# never all of CODEX_HOME — so `codex archive`d sessions (moved to
+# archived_sessions/) drop out of the picker instead of resurfacing.
+#
+# Fails soft: a malformed index line is skipped, an index entry with no active
+# rollout is skipped (archived or deleted — not an error). Only a layout we
+# don't recognise at all gets a diagnostic, so an empty list is never silent
+# when Codex is clearly installed but its storage has moved on.
+discover_codex() {
+  [ -r "$CODEX_INDEX" ] || return 0
+  if [ ! -d "$CODEX_SESSIONS" ]; then
+    echo "claude-session: $CODEX_INDEX exists but $CODEX_SESSIONS does not — unsupported Codex storage layout, skipping Codex sessions" >&2
+    return 0
+  fi
+  awk '
+    match($0, /"id":"[^"]+"/) {
+      id = substr($0, RSTART + 6, RLENGTH - 7)
+      if (match($0, /"thread_name":"[^"]*"/)) {
+        nm = substr($0, RSTART + 15, RLENGTH - 16)
+        if (nm != "") name[id] = nm
+      }
+    }
+    END { for (id in name) printf "%s\t%s\n", id, name[id] }
+  ' "$CODEX_INDEX" 2>/dev/null \
+    | while IFS=$'\t' read -r sid name; do
+        f=$(find "$CODEX_SESSIONS" -type f -name "rollout-*-${sid}.jsonl" 2>/dev/null | head -1)
+        [ -n "$f" ] || continue   # no active rollout: archived or deleted
+        cwd=$(head -1 "$f" 2>/dev/null | grep -oE '"cwd":"[^"]*"' | head -1 | sed 's/.*"cwd":"//; s/"$//')
+        [ -d "$cwd" ] || continue
+        epoch=$(stat -f %m "$f" 2>/dev/null || echo 0)
+        printf '%s\t%s\t%s\t%s\tcodex\n' "$name" "$sid" "$cwd" "$epoch"
+      done
+}
+
+# discover — both agents, newest first. Names are unique per agent (each
+# source dedupes its own), but the SAME name may exist in both; that is left
+# in so the direct-launch path can refuse it explicitly rather than pick one.
+discover() {
+  { discover_claude; discover_codex; } | sort -t "$(printf '\t')" -k4,4nr
 }
 
 reltime() {
@@ -61,7 +122,14 @@ reltime() {
   else echo "$((diff/86400))d ago"; fi
 }
 
-tmux_name() { printf '%s' "$1" | tr ' .:/' '____'; }
+# tmux_name <name> [agent]: the tmux/cmux session identity. Codex sessions are
+# prefixed so a Claude and a Codex session sharing a display name never share
+# a tmux session — `tmux new-session -A` would otherwise silently attach to
+# whichever agent got there first and drop the launch command on the floor.
+tmux_name() {
+  local base; base=$(printf '%s' "$1" | tr ' .:/' '____')
+  case "${2:-claude}" in codex) printf 'codex_%s' "$base" ;; *) printf '%s' "$base" ;; esac
+}
 
 # in_cmux: this shell is hosted by a cmux pane (cmux exports surface/workspace
 # ids into every terminal it spawns). In cmux mode cl skips tmux entirely —
@@ -91,10 +159,57 @@ claude_cmd() {
   fi
 }
 
-# session_pid <sid>: pid of a live claude already running this session, if any.
-# Guards cmux mode against double --resume of one session (two processes on the
-# same transcript) — the hazard tmux's attach-don't-duplicate used to prevent.
-session_pid() { pgrep -f "(-resume|-session-id) $1" 2>/dev/null | head -1; }
+# codex_cmd: the command used to start codex in a cmux pane. `cmux codex-teams`
+# is cmux's Codex analog of claude-teams; it is probed (not assumed) because
+# cmux builds differ. CL_TEAMS=0 opts out, same switch as for claude. Outside
+# cmux, plain `codex`.
+codex_cmd() {
+  if in_cmux && [ "${CL_TEAMS:-1}" != "0" ] && command -v cmux >/dev/null 2>&1 \
+     && cmux --help 2>/dev/null | grep -q 'codex-teams'; then
+    printf 'cmux codex-teams'
+  else
+    printf 'codex'
+  fi
+}
+
+# Codex launch policy. cl adds NO approval/sandbox flag of its own: codex's
+# configured defaults apply, exactly as if the user had typed `codex resume`.
+# CL_CODEX_ARGS is purely additive and is TRUSTED SHELL SYNTAX — it is spliced
+# into the tmux/cmux command string verbatim, so quote it as you would on a
+# command line (e.g. CL_CODEX_ARGS='-m gpt-5 --approve-for-me'). `--remote` is
+# unsupported here: discovery reads local storage, so resuming a locally found
+# id on a remote app server is meaningless.
+# (Claude's path keeps --dangerously-skip-permissions: that predates this
+# design and is documented in DECISIONS.md rather than silently changed.)
+codex_args() { printf '%s' "${CL_CODEX_ARGS:-}"; }
+
+# resume_cmd <agent> <sid>: the shell command string that resumes a session.
+# Used verbatim as a tmux/cmux pane command; for exec paths the same words
+# are re-split by the caller.
+resume_cmd() {
+  case "$1" in
+    codex) printf '%s resume %s %s' "$(codex_cmd)" "$2" "$(codex_args)" ;;
+    *)     printf '%s --resume %s --dangerously-skip-permissions' "$(claude_cmd)" "$2" ;;
+  esac
+}
+
+# session_pid <sid> [agent]: pid of a local process that resumed this session,
+# if any. Guards cmux mode against double --resume of one session (two
+# processes on the same transcript) — the hazard tmux's attach-don't-duplicate
+# used to prevent.
+#
+# For codex this is a "matching local resume process" marker, NOT proof the
+# thread is live or idle: Codex also runs threads through a shared app-server
+# daemon, the Desktop app, and --remote clients, none of which show a `resume
+# <sid>` argv here — and the npm launcher is a node wrapper plus a native
+# child that BOTH match. So: a hit is a conservative reason to refuse a second
+# launch; a miss proves nothing; and the pid must never be used as a kill target.
+session_pid() {
+  case "${2:-claude}" in
+    codex) pgrep -f "codex.* resume $1( |\$)" 2>/dev/null | head -1 ;;
+    *)     pgrep -f "(-resume|-session-id) $1" 2>/dev/null | head -1 ;;
+  esac
+}
 
 # Server-global tmux setup applied idempotently before each launch (exec
 # replaces this process, so it can't run after): terminal titles track the
@@ -163,61 +278,76 @@ end tell
 OSA
 }
 
-launch_session() { # name sid cwd
-  local name="$1" sid="$2" cwd="$3" t pid
-  t=$(tmux_name "$name"); [ -d "$cwd" ] || cwd="$HOME"
+launch_session() { # name sid cwd [agent]
+  local name="$1" sid="$2" cwd="$3" agent="${4:-claude}" t pid cmd
+  t=$(tmux_name "$name" "$agent"); [ -d "$cwd" ] || cwd="$HOME"
+  cmd=$(resume_cmd "$agent" "$sid")
   if in_cmux; then
-    pid=$(session_pid "$sid")
+    pid=$(session_pid "$sid" "$agent")
     if [ -n "$pid" ]; then
-      echo "\"$name\" is already running (pid $pid) — switch to its tab instead of resuming it twice." >&2
+      echo "\"$name\" already has a local process resuming it (pid $pid) — switch to its tab instead of resuming it twice." >&2
       exit 1
     fi
     cmux rename-tab "$name" >/dev/null 2>&1
-    # shellcheck disable=SC2046  # claude_cmd may expand to two words
-    cd "$cwd" || exit 1; exec $(claude_cmd) --resume "$sid" --dangerously-skip-permissions
+    cd "$cwd" || exit 1; eval "exec $cmd"
   fi
   if command -v tmux >/dev/null 2>&1; then
     in_iterm && tag_iterm_session "$t"   # so `cl stop` can close this tab later
     tmux_setup
-    exec tmux new-session -A -s "$t" -c "$cwd" "claude --resume $sid --dangerously-skip-permissions"
+    exec tmux new-session -A -s "$t" -c "$cwd" "$cmd"
   else
-    cd "$cwd" || exit 1; exec claude --resume "$sid" --dangerously-skip-permissions
+    cd "$cwd" || exit 1; eval "exec $cmd"
   fi
 }
 
-launch_new() { # cwd
-  local cwd="$1" t; [ -d "$cwd" ] || cwd="$PWD"
+launch_new() { # cwd [agent]
+  local cwd="$1" agent="${2:-claude}" t cmd; [ -d "$cwd" ] || cwd="$PWD"
+  case "$agent" in
+    codex) cmd="$(codex_cmd) $(codex_args)" ;;
+    *)     cmd="$(claude_cmd) --dangerously-skip-permissions" ;;
+  esac
   if in_cmux; then
-    # shellcheck disable=SC2046
-    cd "$cwd" || exit 1; exec $(claude_cmd) --dangerously-skip-permissions
+    cd "$cwd" || exit 1; eval "exec $cmd"
   fi
-  t="claude-$(basename "$cwd")"
+  t="$agent-$(basename "$cwd")"
   if command -v tmux >/dev/null 2>&1; then
     tmux_setup
-    exec tmux new-session -A -s "$t" -c "$cwd" "claude --dangerously-skip-permissions"
+    exec tmux new-session -A -s "$t" -c "$cwd" "$cmd"
   else
-    cd "$cwd" || exit 1; exec claude --dangerously-skip-permissions
+    cd "$cwd" || exit 1; eval "exec $cmd"
   fi
 }
 
-# launch_named <name> <cwd>: create + attach a fully-named session via
-# `claude --name` (sets the title at launch). The interactive create path shared
-# by `cl new` and the picker's "new" entry.
-launch_named() { # name cwd
-  local name="$1" cwd="$2" t qname
+# launch_named <name> <cwd> [agent]: create + attach a fully-named session.
+# The interactive create path shared by `cl new` and the picker's "new" entry.
+#   claude: `claude --name` sets the title at launch, so discovery finds it
+#           immediately.
+#   codex:  there is NO launch-time name flag. The name labels the tmux
+#           session / cmux tab only; the thread is unnamed (and invisible to
+#           `cl --list`) until the user runs /rename inside codex. Said so
+#           on screen rather than pretended.
+launch_named() { # name cwd [agent]
+  local name="$1" cwd="$2" agent="${3:-claude}" t qname cmd
   [ -d "$cwd" ] || cwd="$HOME"
+  qname=$(printf '%q' "$name")
+  case "$agent" in
+    codex)
+      cmd="$(codex_cmd) $(codex_args)"
+      printf 'note: codex cannot be named at launch — run /rename %s inside codex so cl can find it.\n' "$qname" >&2
+      ;;
+    *) cmd="$(claude_cmd) --name $qname --dangerously-skip-permissions" ;;
+  esac
   if in_cmux; then
     cmux rename-tab "$name" >/dev/null 2>&1
-    # shellcheck disable=SC2046
-    cd "$cwd" || exit 1; exec $(claude_cmd) --name "$name" --dangerously-skip-permissions
+    cd "$cwd" || exit 1; eval "exec $cmd"
   fi
-  t=$(tmux_name "$name"); qname=$(printf '%q' "$name")
+  t=$(tmux_name "$name" "$agent")
   if command -v tmux >/dev/null 2>&1; then
     in_iterm && tag_iterm_session "$t"
     tmux_setup
-    exec tmux new-session -A -s "$t" -c "$cwd" "claude --name $qname --dangerously-skip-permissions"
+    exec tmux new-session -A -s "$t" -c "$cwd" "$cmd"
   else
-    cd "$cwd" || exit 1; exec claude --name "$name" --dangerously-skip-permissions
+    cd "$cwd" || exit 1; eval "exec $cmd"
   fi
 }
 
@@ -230,8 +360,13 @@ launch_named() { # name cwd
 # Interactive → create + attach. No TTY (script / a Claude Bash call) → create
 # detached and print how to attach, so the caller isn't left hanging.
 do_new() {
+  local agent="claude"
+  case "${1:-}" in
+    --codex)  agent="codex";  shift ;;
+    --claude) agent="claude"; shift ;;
+  esac
   local name="${1:-}" arg="${2:-}" cwd
-  [ -n "$name" ] || { echo 'usage: cl new "Session Name" [dir | -d]' >&2; exit 1; }
+  [ -n "$name" ] || { echo 'usage: cl new [--codex] "Session Name" [dir | -d]' >&2; exit 1; }
   case "$arg" in
     -d|--default)
       cwd="${CL_DEFAULT_DIR:-}"
@@ -242,31 +377,34 @@ do_new() {
   esac
   [ -d "$cwd" ] || { echo "claude-session: no such directory: $cwd" >&2; exit 1; }
 
-  local t qname
-  t=$(tmux_name "$name")
+  local t qname cmd
+  t=$(tmux_name "$name" "$agent")
   qname=$(printf '%q' "$name")   # safe to embed in the tmux command string
+  case "$agent" in
+    codex) cmd="$(codex_cmd) $(codex_args)"
+           echo "note: codex cannot be named at launch — run /rename $qname inside codex so cl can find it." >&2 ;;
+    *)     cmd="$(claude_cmd) --name $qname --dangerously-skip-permissions" ;;
+  esac
 
   if in_cmux; then
     if [ -t 1 ] && [ -t 0 ]; then
-      launch_named "$name" "$cwd"
+      launch_named "$name" "$cwd" "$agent"
     else
       # no TTY (script / Claude Bash call): open a fresh cmux workspace so the
       # caller isn't blocked, mirroring the detached-tmux path below.
-      cmux new-workspace --name "$name" --cwd "$cwd" \
-          --command "$(claude_cmd) --name $qname --dangerously-skip-permissions" >/dev/null \
+      cmux new-workspace --name "$name" --cwd "$cwd" --command "$cmd" >/dev/null \
         && echo "created cmux workspace '$name' in $cwd"
     fi
     exit 0
   fi
 
   if ! command -v tmux >/dev/null 2>&1; then
-    cd "$cwd" || exit 1
-    exec claude --name "$name" --dangerously-skip-permissions
+    launch_named "$name" "$cwd" "$agent"
   fi
 
   if [ -t 1 ] && [ -t 0 ]; then
     # interactive: create + attach, like the picker
-    launch_named "$name" "$cwd"
+    launch_named "$name" "$cwd" "$agent"
   else
     # no TTY (script / Claude Bash call): create detached so the caller isn't
     # blocked on an attach — attach later with `cl "<name>"`.
@@ -274,7 +412,7 @@ do_new() {
     if tmux has-session -t "=${t}" 2>/dev/null; then
       echo "session '$name' already exists — attach with: cl \"$name\""
     else
-      tmux new-session -d -s "$t" -c "$cwd" "claude --name $qname --dangerously-skip-permissions" \
+      tmux new-session -d -s "$t" -c "$cwd" "$cmd" \
         && echo "created '$name' in $cwd — attach with: cl \"$name\""
     fi
   fi
@@ -361,11 +499,15 @@ save_state() {
   local live first=1
   live="$(
     printf '['
-    discover | while IFS=$'\t' read -r name sid cwd epoch; do
+    # Claude only: the stop/start kill and relaunch logic is Claude-shaped, and a
+    # codex "live" marker is not a kill-safe signal (see session_pid). The
+    # agent field is recorded so a later reader can tell the two apart.
+    discover | while IFS=$'\t' read -r name sid cwd epoch agent; do
+      [ "$agent" = "claude" ] || continue
       tmux has-session -t "$(tmux_name "$name")" 2>/dev/null || [ -n "$(session_pid "$sid")" ] || continue
       [ "$first" -eq 1 ] && first=0 || printf ','
-      jq -nc --arg name "$name" --arg sid "$sid" --arg cwd "$cwd" \
-        '{name:$name, sid:$sid, cwd:$cwd}'
+      jq -nc --arg name "$name" --arg sid "$sid" --arg cwd "$cwd" --arg agent "$agent" \
+        '{name:$name, sid:$sid, cwd:$cwd, agent:$agent}'
     done
     printf ']'
   )"
@@ -407,7 +549,8 @@ do_stop() {
   printf 'saved %s session(s) to %s\n\n' "$count" "$STATE"
 
   local name t ans pid
-  discover | while IFS=$'\t' read -r name sid cwd epoch; do
+  discover | while IFS=$'\t' read -r name sid cwd epoch agent; do
+    [ "$agent" = "claude" ] || continue   # codex lifecycle is out of scope here
     t=$(tmux_name "$name")
     if tmux has-session -t "=${t}" 2>/dev/null; then
       if session_busy "$t"; then
@@ -598,41 +741,67 @@ do_restore() {
   printf 'run cl start to bring them back.\n'
 }
 
-# fzf rows: "<display>\tNAME\tSID\tCWD"  (display shown; rest carried for the action)
+# live_dot <name> <sid> <agent>: ● when a tmux session or a matching local
+# process exists, ○ otherwise. For codex ● means "a local resume process
+# matches", nothing stronger (see session_pid).
+live_dot() {
+  if tmux has-session -t "$(tmux_name "$1" "$3")" 2>/dev/null || [ -n "$(session_pid "$2" "$3")" ]; then printf '●'; else printf '○'; fi
+}
+
+# agent_tag <agent>: short marker shown beside non-default agents.
+agent_tag() { [ "$1" = "claude" ] && printf '%-6s' '' || printf '%-6s' "$1"; }
+
+# fzf rows: "<display>\tNAME\tSID\tCWD\tAGENT"  (display shown; rest carried for the action)
 rows() {
-  printf '＋ new claude here  ·  %s\tNEW\t\t%s\n' "$PWD" "$PWD"
-  discover | while IFS=$'\t' read -r name sid cwd epoch; do
-    if tmux has-session -t "$(tmux_name "$name")" 2>/dev/null || [ -n "$(session_pid "$sid")" ]; then dot="●"; else dot="○"; fi
-    printf '%s %-22s %-8s %s\t%s\t%s\t%s\n' "$dot" "$name" "$(reltime "$epoch")" "$cwd" "$name" "$sid" "$cwd"
+  printf '＋ new claude here  ·  %s\tNEW\t\t%s\tclaude\n' "$PWD" "$PWD"
+  if command -v codex >/dev/null 2>&1; then
+    printf '＋ new codex here   ·  %s\tNEW\t\t%s\tcodex\n' "$PWD" "$PWD"
+  fi
+  discover | while IFS=$'\t' read -r name sid cwd epoch agent; do
+    printf '%s %-22s %s %-8s %s\t%s\t%s\t%s\t%s\n' "$(live_dot "$name" "$sid" "$agent")" "$name" "$(agent_tag "$agent")" "$(reltime "$epoch")" "$cwd" "$name" "$sid" "$cwd" "$agent"
   done
 }
+
+# Optional agent filter for direct launch: `cl --codex <name>` / `cl --claude <name>`.
+AGENT_FILTER=""
+case "${1:-}" in
+  --codex)  AGENT_FILTER="codex";  shift ;;
+  --claude) AGENT_FILTER="claude"; shift ;;
+esac
 
 case "${1:-}" in
   new)     shift; do_new "$@"; exit 0 ;;
   stop)    do_stop "${2:-}"; exit 0 ;;
   start)   do_start; exit 0 ;;
   restore) do_restore "${2:-}"; exit 0 ;;
+  --discover)  # raw TSV (name sid cwd epoch agent) — for scripts and tests
+    discover; exit 0 ;;
   --list)
-    printf '%-2s %-22s %-8s %s\n' '' NAME 'ACTIVE' DIR
-    discover | while IFS=$'\t' read -r name sid cwd epoch; do
-      if tmux has-session -t "$(tmux_name "$name")" 2>/dev/null || [ -n "$(session_pid "$sid")" ]; then dot='●'; else dot='○'; fi
-      printf '%-2s %-22s %-8s %s\n' "$dot" "$name" "$(reltime "$epoch")" "$cwd"
+    printf '%-2s %-22s %-6s %-8s %s\n' '' NAME AGENT 'ACTIVE' DIR
+    discover | while IFS=$'\t' read -r name sid cwd epoch agent; do
+      [ -z "$AGENT_FILTER" ] || [ "$agent" = "$AGENT_FILTER" ] || continue
+      printf '%-2s %-22s %s %-8s %s\n' "$(live_dot "$name" "$sid" "$agent")" "$name" "$(agent_tag "$agent")" "$(reltime "$epoch")" "$cwd"
     done
     exit 0 ;;
-  -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
+  -h|--help) awk 'NR>1 && !/^#/{exit} NR>1{print}' "$0"; exit 0 ;;
   '') : ;;  # fall through to picker
   *)
-    # direct launch by name
-    match=$(discover | awk -F'\t' -v n="$1" '$1==n{print; exit}')
-    if [ -n "$match" ]; then
-      IFS=$'\t' read -r name sid cwd _ <<EOF
+    # direct launch by name. A name held by BOTH agents is refused unless
+    # --codex/--claude says which — never first-row-wins.
+    match=$(discover | awk -F'\t' -v n="$1" -v a="$AGENT_FILTER" '$1==n && (a=="" || $5==a)')
+    nmatch=$(printf '%s' "$match" | grep -c .)
+    if [ "$nmatch" -gt 1 ]; then
+      echo "claude-session: '$1' exists for more than one agent — say which: cl --claude \"$1\"  or  cl --codex \"$1\"" >&2
+      exit 1
+    elif [ -n "$match" ]; then
+      IFS=$'\t' read -r name sid cwd _ agent <<EOF
 $match
 EOF
-      launch_session "$name" "$sid" "$cwd"
-    elif command -v tmux >/dev/null 2>&1 && tmux has-session -t "=$(tmux_name "$1")" 2>/dev/null; then
+      launch_session "$name" "$sid" "$cwd" "$agent"
+    elif command -v tmux >/dev/null 2>&1 && tmux has-session -t "=$(tmux_name "$1" "${AGENT_FILTER:-claude}")" 2>/dev/null; then
       # Live tmux session exists but its customTitle isn't in the transcript yet
       # (e.g. a fresh `cl new` before its first message) — attach it directly.
-      t=$(tmux_name "$1"); in_iterm && tag_iterm_session "$t"; tmux_setup
+      t=$(tmux_name "$1" "${AGENT_FILTER:-claude}"); in_iterm && tag_iterm_session "$t"; tmux_setup
       exec tmux new-session -A -s "$t"
     else
       echo "claude-session: no session named '$1' (try --list)" >&2; exit 1
@@ -643,8 +812,8 @@ esac
 # ---- picker ----
 if command -v fzf >/dev/null 2>&1; then
   picked=$(rows | fzf --ansi --delimiter='\t' --with-nth=1 --height=45% --reverse \
-            --prompt='claude session ❯ ' \
-            --header='● live in tmux   ○ resume      enter: open') || exit 0
+            --prompt='session ❯ ' \
+            --header='● live   ○ resume      enter: open') || exit 0
   [ -n "$picked" ] || exit 0
 else
   echo "Pick a session:" >&2
@@ -658,10 +827,11 @@ fi
 name=$(printf '%s' "$picked" | cut -f2)
 sid=$(printf '%s' "$picked" | cut -f3)
 cwd=$(printf '%s' "$picked" | cut -f4)
+agent=$(printf '%s' "$picked" | cut -f5)
 if [ "$name" = "NEW" ]; then
   printf 'name for the new session (blank = unnamed) ❯ ' >&2
   read -r newname </dev/tty
-  if [ -n "$newname" ]; then launch_named "$newname" "$cwd"; else launch_new "$cwd"; fi
+  if [ -n "$newname" ]; then launch_named "$newname" "$cwd" "$agent"; else launch_new "$cwd" "$agent"; fi
 else
-  launch_session "$name" "$sid" "$cwd"
+  launch_session "$name" "$sid" "$cwd" "$agent"
 fi

@@ -1,6 +1,7 @@
 # cl-session-picker
 
 `claude-session` — an interactive picker for resuming named [Claude Code](https://claude.com/claude-code)
+and [Codex CLI](https://github.com/openai/codex)
 sessions, bound to the `cl` alias.
 
 Auto-discovers every session you've `/renamed` (no registry to maintain — name a
@@ -73,7 +74,9 @@ session state. Open a new terminal afterward so the `cl` alias stops resolving.
 - `cl` — open the picker
 - `cl <name>` — launch that named session directly (attaches it if already live)
 - `cl new "Name" [dir|-d]` — create a **fully-named** session in one step (no `/rename`)
-- `cl --list` — print discovered sessions
+- `cl new --codex "Name" [dir|-d]` — start a fresh Codex CLI session (see [Codex CLI sessions](#codex-cli-sessions))
+- `cl --list` — print discovered sessions (`--codex` / `--claude` first to filter)
+- `cl --codex "Name"` — resume a Codex session when the same name exists for both agents
 - `cl stop` — snapshot live sessions, kill them, and close their iTerm tabs (`--keep-tabs` to leave tabs open)
 - `cl start` — relaunch every session from the last `stop`
 - `cl restore` — restore `state.json` from the newest history snapshot (then `cl start`)
@@ -110,6 +113,53 @@ creates the session **detached** and prints `attach with: cl "X"`.
 > but `cl "X"` attaches it immediately (it falls back to the live tmux session by
 > name), and the title is already correct everywhere else. Send one message and it
 > appears in the picker too.
+
+## Codex CLI sessions
+
+If [Codex CLI](https://github.com/openai/codex) is installed, `cl` discovers its
+named sessions too — the ones you've `/rename`d inside `codex`, same
+no-registry rule as Claude. They appear in the picker and `cl --list` with a
+`codex` tag, and `cl <name>` resumes one via `codex resume <id>`.
+
+| Command | What it does |
+|---|---|
+| `cl --codex --list` / `cl --claude --list` | show only that agent's sessions |
+| `cl --codex "Name"` / `cl --claude "Name"` | pick the agent when one name exists for both (`cl "Name"` refuses to guess) |
+| `cl new --codex "Name" [dir\|-d]` | start a fresh `codex` in that dir |
+
+**Launch policy.** `cl` adds *no* approval or sandbox flag to Codex — it runs
+with whatever `codex` itself is configured to do. To add flags, set
+`CL_CODEX_ARGS`; it is appended verbatim to every Codex launch and is treated as
+shell syntax, so quote it as you would on the command line:
+
+```
+export CL_CODEX_ARGS='--approve-for-me'      # e.g. auto-review approvals
+export CL_CODEX_ARGS='-m gpt-5 -s workspace-write'
+```
+
+`--remote` isn't supported through `cl`: discovery reads Codex's local session
+storage, so the ids it finds only mean something to a local `codex`.
+
+**Naming.** Codex has no launch-time name flag, so `cl new --codex "Name"`
+names the tmux session / cmux tab only; the Codex thread itself is unnamed —
+and invisible to `cl --list` — until you run `/rename Name` inside it. `cl`
+prints that reminder when it launches.
+
+**Live marker.** For Codex, ● means a local `codex resume <id>` process exists —
+a reason to refuse launching a second one, not proof the thread is idle or
+alive (Codex threads can also run under its app-server daemon or the desktop
+app, which `cl` can't see). `cl stop` / `cl start` are Claude-only for now.
+
+**In cmux**, Codex launches via `cmux codex-teams` when that subcommand exists
+(probed, not assumed), otherwise plain `codex`. `CL_TEAMS=0` opts out for both
+agents.
+
+Discovery reads `~/.codex/session_index.jsonl` and the rollout transcripts
+under `~/.codex/sessions/` (`CODEX_HOME` overrides the base dir). Those are
+Codex's private files, not an API: if a Codex release moves them, `cl` prints
+`unsupported Codex storage layout` rather than silently showing no sessions.
+Archived sessions (`codex archive`) are excluded. `tests/test-discover.sh`
+exercises all of this against fixtures.
 
 ## start / stop
 
