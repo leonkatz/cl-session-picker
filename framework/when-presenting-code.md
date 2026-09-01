@@ -6,22 +6,28 @@ type: when
 
 # when-presenting-code
 
-**Trigger:** before presenting *any* code.
+**Trigger:** before presenting code that is meant to be **kept** — a change
+to a repository, a script someone will run again, a snippet that will be
+pasted into production. Not for throwaway illustrations, one-liners in an
+explanation, or code the reader asked to see *as it is*.
 
 ## Checklist
 
 - [ ] **Standards** — the language's standard from `<coding-standards-source>`
-      was consulted; non-obvious choices cite the section; type annotations
-      present where the language supports them; descriptive names.
-- [ ] **Error handling** — explicit, no silent failures; specific exceptions,
-      never a bare catch-all; messages say what failed and where; recovery is
-      appropriate to the failure.
+      was consulted; non-obvious choices cite the section; descriptive names;
+      type annotations where the language and the codebase's convention use
+      them (a dynamically typed idiom is not a failure).
+- [ ] **Error handling** — explicit, no silent failures; the exceptions caught
+      are the ones the code can actually handle; a catch-all is acceptable only
+      at a boundary that logs and re-raises or fails the operation visibly;
+      messages say what failed and where.
 - [ ] **Security** — the infrastructure checklist
       (`when-presenting-infrastructure-code`) passed where it applies; input
       is validated; nothing new is exposed.
 - [ ] **Performance** — no N+1 queries; no nested loops over large data where
-      a set or generator would do; data structures fit the access pattern;
-      impact on `<availability-target>` considered.
+      a set or generator would do; data structures fit the access pattern.
+      *If the code serves a system with an `<availability-target>`*, its impact
+      on that target is considered.
 - [ ] **Documentation** — comments explain *why*, not what; docstrings on
       public functions where the language convention expects them.
 - [ ] **Team** — impact assessed (`when-proposing-a-technical-change`) for
@@ -35,8 +41,9 @@ type: when
 
 ## Present as
 
-The code, followed by a one-line-per-item summary of the checklist —
-pass, waived (with reason), or not applicable.
+The code, followed by the checklist summary — **only the items that were
+waived or that failed and were fixed**, one line each with the reason. An
+all-pass checklist is not reported; silence means it passed.
 
 ## Bindings
 

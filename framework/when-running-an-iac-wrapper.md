@@ -9,6 +9,13 @@ type: when
 **Trigger:** any `<iac-tool>` command appears in code, CI configuration, or
 documentation.
 
+**Applies only if your tool has all three behaviours** this procedure assumes:
+(1) the target environment is selected by an explicit argument that can be
+omitted, (2) there is a non-interactive auto-approve mode, and (3) state
+locking exists and can be overridden by a command. Substituting names cannot
+make a tool without those behaviours fit — if one is missing, **omit this
+procedure** and write a short one of your own for the tool you have.
+
 The failure this guards against: an automated run that applies to *whatever
 environment the tool defaulted to* because the target was not named.
 

@@ -67,11 +67,6 @@ notes" rather than break.
    *produces* the output. They are not bound and not slots; they only ever
    appear inside a ```` ``` ```` block.
 
-Some procedures also carry **shape slots** in angle brackets — `<iac-tool>`,
-`<owner-tag-key>`, `<personal-branch>` — for a tool, flag, tag key, or name
-that the procedure cannot be written without. A shape slot is bound the same
-way, in a table beneath the import. Capability slots say *what kind of thing*
-you have; shape slots say *what it is called*.
 
 ## Files
 

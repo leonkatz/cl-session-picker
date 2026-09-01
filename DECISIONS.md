@@ -165,7 +165,11 @@ they need a bindings table to be concrete.
 
 **Reverses by:** inlining a binding into the shape where one value turns out
 to be universal (e.g. if every user's `<main-branch>` is `main`, drop the
-slot).
+slot) — or, the more serious case, **removing a procedure from the generic
+layer** when what differs between tools is behaviour rather than a name:
+substitution cannot bridge a missing command grammar. Such a procedure either
+declares the behaviours it requires and is omitted when they are absent (the
+IaC wrapper does this now), or moves out to a tool-family template.
 
 **Why:** the alternative — writing each procedure twice, once per cloud or
 tool — is the duplication the framework exists to avoid. When in doubt a

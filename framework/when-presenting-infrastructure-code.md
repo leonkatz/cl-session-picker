@@ -6,17 +6,19 @@ type: when
 
 # when-presenting-infrastructure-code
 
-**Trigger:** before presenting *any* infrastructure code — `<iac-tool>`
-modules, image builds, configuration management, scripts that touch cloud
-resources.
+**Trigger:** before presenting infrastructure code intended to be **applied**
+— `<iac-tool>` modules, image builds, configuration management, scripts that
+touch cloud resources. Not for a fragment shown to explain a concept.
 
 Every item is checked against the code as written, not as intended.
 
 ## Checklist
 
-- [ ] **Credentials** — no hardcoded credentials, tokens, or keys; secrets are
-      read from `<secrets-store>` at runtime; nothing sensitive in variables
-      files or state.
+- [ ] **Credentials** — no hardcoded credentials, tokens, or keys in source
+      or variables files; secrets are read from `<secrets-store>` at runtime.
+      Where `<iac-tool>` necessarily records sensitive values in its state,
+      the invariant is that **state containing sensitive material is
+      protected** — encrypted at rest, access-controlled, not in source control.
 - [ ] **Host hardening** (when compute is created) — the provider's
       instance-hardening controls are set *explicitly*, not left to defaults
       (`<host-hardening-setting>` — e.g. a metadata-service token requirement).
@@ -25,9 +27,11 @@ Every item is checked against the code as written, not as intended.
       equivalent) is justified in a comment.
 - [ ] **Input validation** — user-supplied values are validated; no command,
       query, or path built from raw input.
+- [ ] **Concurrency** — state is locked by `<iac-tool>` (or the apply is
+      serialised some other way) so two applies cannot race.
 - [ ] **Audit trail** (when `<compliance-regime>` applies) — the change is
-      tracked in `{issue-tracker}`; state is locked by `<iac-tool>` so two
-      applies cannot race.
+      tracked in `{issue-tracker}` and the applied change is attributable to
+      a person and a review.
 - [ ] **Encryption** — data at rest encrypted (volumes, buckets, databases);
       data in transit over TLS.
 
