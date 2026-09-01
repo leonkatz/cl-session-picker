@@ -44,6 +44,7 @@ All edits are sentinel-guarded and back up the prior file, so reruns are no-ops.
 - `--no-deps` — skip the Homebrew dependency install
 - `--no-shellrc` — skip `~/.zshrc` edits (PATH + `cl` alias)
 - `--no-tmux-conf` — skip `~/.tmux.conf` edits
+- `--no-framework` — skip installing `framework/*.md` to `~/.claude/framework`
 - `--bin-dir P` — install to `P` instead of `~/.local/bin`
 
 ## Uninstall
@@ -110,6 +111,23 @@ creates the session **detached** and prints `attach with: cl "X"`.
 > but `cl "X"` attaches it immediately (it falls back to the live tmux session by
 > name), and the title is already correct everywhere else. Send one message and it
 > appears in the picker too.
+
+## Framework procedures
+
+`framework/` holds generic operating procedures for an AI coding session — how
+to delegate, propose a change, present a decision, disagree, and route what it
+writes — as one `when-<activity>.md` file each, shape only, no tool names. The
+installer copies them to `~/.claude/framework/` and stops; import the ones you
+want from your own `CLAUDE.md`:
+
+```markdown
+@~/.claude/framework/when-presenting-a-decision.md
+@~/.claude/framework/when-routing-a-communication.md
+```
+
+and bind the `{slot}` placeholders (`{issue-tracker}`, `{chat}`, `{notes}`, …)
+to your own tools beneath the import. See [`framework/README.md`](framework/README.md).
+`--no-framework` skips this step.
 
 ## start / stop
 
