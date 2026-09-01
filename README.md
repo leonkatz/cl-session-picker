@@ -130,8 +130,10 @@ no-registry rule as Claude. They appear in the picker and `cl --list` with a
 
 **Launch policy.** `cl` adds *no* approval or sandbox flag to Codex — it runs
 with whatever `codex` itself is configured to do. To add flags, set
-`CL_CODEX_ARGS`; it is appended verbatim to every Codex launch and is treated as
-shell syntax, so quote it as you would on the command line:
+`CL_CODEX_ARGS`; it is added to every Codex launch **before the subcommand**
+(`codex <args> resume <id>` — some Codex builds reject top-level options placed
+after `resume`) and is treated as shell syntax, so quote it as you would on the
+command line:
 
 ```
 export CL_CODEX_ARGS='--approve-for-me'      # e.g. auto-review approvals
