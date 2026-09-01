@@ -85,3 +85,22 @@ renames it.
 
 **Reverses by:** passing the name through, if Codex gains a launch-time name
 flag.
+
+## 2026-08-28 — Codex sessions are excluded from `cl stop` / `cl start` until a thread-status source exists
+
+**Chose:** `save_state`, `do_stop`, and `do_start` filter to `agent == claude`.
+Codex sessions are discovered, listed, resumed, and created — but never
+killed or relaunched by the lifecycle commands.
+
+**Forecloses:** a single `cl stop` / `cl start` that cycles a mixed working
+set. Codex panes are stopped and restarted by hand for now.
+
+**Unblocking condition:** a Codex CLI interface that reports, for a session
+id, whether a thread is live, which client owns it, and whether it is
+mid-turn — a listing/status command with machine-readable output, or an
+app-server query. Argv matching cannot provide any of those (see the
+marker entry above), so building stop/start on it would produce exactly the
+false-live, false-idle, and wrong-pid-killed failures reviewed on 2026-08-28.
+
+**Reverses by:** replacing the `agent == claude` filters with a call to that
+interface, plus a Codex branch in the busy check and kill path.
