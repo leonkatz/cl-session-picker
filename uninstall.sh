@@ -145,7 +145,22 @@ if [[ -d "$FRAMEWORK_DST_DIR" ]]; then
 fi
 
 # =============================================================================
-# Step 2 — Remove the ~/.zshrc block (PATH + `cl` alias)
+# Step 1c — Remove the shell snippet
+# =============================================================================
+SNIPPET="${HOME}/.local/share/claude-session/shellrc"
+if [[ -e "$SNIPPET" ]]; then
+  say "removing shell snippet ${SNIPPET}"
+  run "rm -f '${SNIPPET}'"
+  _snip_dir="$(dirname "$SNIPPET")"
+  if [[ "$DRY_RUN" != "1" ]] && [[ -d "$_snip_dir" ]] && [[ -z "$(ls -A "$_snip_dir" 2>/dev/null)" ]]; then
+    run "rmdir '${_snip_dir}'"
+  fi
+  unset _snip_dir
+fi
+
+# =============================================================================
+# Step 2 — Remove the ~/.zshrc block (the source guard; older installs carried
+# the inline PATH + alias in the same sentinels — removed identically)
 # =============================================================================
 
 if [[ "$DO_SHELLRC" == "1" ]]; then

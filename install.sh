@@ -237,22 +237,66 @@ else
 fi
 
 # =============================================================================
-# Step 4 — PATH + `cl` alias in ~/.zshrc
+# Step 4 — shell wiring: a snippet this installer OWNS, sourced from ~/.zshrc
 # =============================================================================
-# A single sentinel-guarded block carries both the PATH entry (so BIN_DIR is
-# reachable) and the `cl` alias. Idempotent on the sentinel.
+# The PATH + alias content lives in ~/.local/share/claude-session/shellrc — a
+# file nothing else writes — and ~/.zshrc carries only a one-line source guard.
+# Why: appending real content into ~/.zshrc breaks the moment a dotfiles
+# manager replaces that file (2026-09-01: a manager symlinked ~/.zshrc to its
+# repo copy and the appended block silently vanished). So:
+#   * regular ~/.zshrc → append the guard once, sentinel-marked; an OLD-style
+#     block (inline PATH/alias) is migrated to the guard on rerun;
+#   * SYMLINKED ~/.zshrc → it belongs to a dotfiles manager; never append
+#     through it — print the guard line for the managed file to carry.
+
+SNIPPET_DIR="${HOME}/.local/share/claude-session"
+SNIPPET="${SNIPPET_DIR}/shellrc"
+SOURCE_GUARD='[ -f "$HOME/.local/share/claude-session/shellrc" ] && source "$HOME/.local/share/claude-session/shellrc"'
+
+run "mkdir -p '${SNIPPET_DIR}'"
+_snippet_tmp="$(mktemp)"
+{
+  printf '# claude-session shell wiring — OWNED by cl-session-picker/install.sh.\n'
+  printf '# Rewritten on every install; put your own settings in ~/.zshrc instead.\n'
+  printf 'export PATH="%s:$PATH"\n' "${BIN_DIR}"
+  printf 'alias cl=%s\n' "${SCRIPT_NAME}"
+  printf '# export CL_DEFAULT_DIR="$HOME/your-repo"  # uncomment: dir for  cl new "Name" -d\n'
+} > "${_snippet_tmp}"
+if [[ -e "$SNIPPET" ]] && cmp -s "${_snippet_tmp}" "$SNIPPET"; then
+  say "shell snippet already current: ${SNIPPET}"
+else
+  say "writing shell snippet → ${SNIPPET}"
+  run "cp '${_snippet_tmp}' '${SNIPPET}'"
+fi
+rm -f "${_snippet_tmp}"
 
 if [[ "$DO_SHELLRC" == "1" ]]; then
   ZSH_SENTINEL="# >>> claude-tools >>>"
-  if [[ -f "$ZSHRC" ]] && grep -qsF "$ZSH_SENTINEL" "$ZSHRC"; then
-    say "claude-tools block already in ${ZSHRC} — no-op"
+  ZSH_SENTINEL_END="# <<< claude-tools <<<"
+  if [[ -L "$ZSHRC" ]]; then
+    say "NOTE: ${ZSHRC} is a symlink (a dotfiles manager owns it) — not appending."
+    say "      Make sure the managed file contains this line:"
+    say "        ${SOURCE_GUARD}"
+  elif [[ -f "$ZSHRC" ]] && grep -qsF 'claude-session/shellrc' "$ZSHRC"; then
+    say "source guard already in ${ZSHRC} — no-op"
   else
     if [[ -f "$ZSHRC" ]]; then
       say "backing up ${ZSHRC} → ${ZSHRC}.bak-${TS}"
       run "cp '${ZSHRC}' '${ZSHRC}.bak-${TS}'"
+      if grep -qsF "$ZSH_SENTINEL" "$ZSHRC"; then
+        say "migrating old inline claude-tools block to the source guard"
+        _zshrc_tmp="$(mktemp)"
+        awk -v mark_open="$ZSH_SENTINEL" -v mark_close="$ZSH_SENTINEL_END" '
+          $0 == mark_open  { skip = 1; next }
+          $0 == mark_close { skip = 0; next }
+          !skip { print }
+        ' "$ZSHRC" > "${_zshrc_tmp}"
+        run "cp '${_zshrc_tmp}' '${ZSHRC}'"
+        rm -f "${_zshrc_tmp}"
+      fi
     fi
-    say "adding PATH entry, 'cl' alias, and CL_DEFAULT_DIR hint to ${ZSHRC}"
-    run "printf '\n%s\nexport PATH=\"%s:\$PATH\"\nalias cl=%s\n# export CL_DEFAULT_DIR=\"\$HOME/your-repo\"  # uncomment: dir for  cl new \"Name\" -d\n# <<< claude-tools <<<\n' '${ZSH_SENTINEL}' '${BIN_DIR}' '${SCRIPT_NAME}' >> '${ZSHRC}'"
+    say "adding the claude-tools source guard to ${ZSHRC}"
+    run "printf '\\n%s\\n%s\\n%s\\n' '${ZSH_SENTINEL}' '${SOURCE_GUARD}' '${ZSH_SENTINEL_END}' >> '${ZSHRC}'"
   fi
 else
   say "skipping ~/.zshrc edits (--no-shellrc)"
