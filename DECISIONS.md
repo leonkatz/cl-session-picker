@@ -13,8 +13,10 @@ Launching dispatches on that field.
 **Forecloses:** nothing structural. It does mean the script's name
 (`claude-session`) and the `cl` alias are now slightly misnamed.
 
-**Reverses by:** dropping `discover_codex` and the column; nothing else depends
-on Codex.
+**Reverses by:** removing `discover_codex`, the column, and every agent-aware
+consumer — launch dispatch, `session_pid`, tmux naming, the picker/list rows,
+the `--codex`/`--claude` flags, and the `agent` field in state. A cross-cutting
+removal, not a one-function delete (corrected after review, 2026-09-01).
 
 **Corollary (found in review):** the tmux/cmux session identity is also
 agent-qualified — Codex sessions get a `codex_` prefix — because a Claude and a
@@ -104,3 +106,22 @@ false-live, false-idle, and wrong-pid-killed failures reviewed on 2026-08-28.
 
 **Reverses by:** replacing the `agent == claude` filters with a call to that
 interface, plus a Codex branch in the busy check and kill path.
+
+## 2026-09-01 — Session ids are validated at discovery and quoted at every command boundary
+
+**Chose:** `discover_claude` drops any id that is not `[A-Za-z0-9._-]+`;
+`discover_codex` drops any id that is not a 36-character UUID; `resume_cmd`
+and `do_start` additionally `printf %q` the id where it enters a tmux/cmux
+command string or an `eval`'d exec line.
+
+**Forecloses:** nothing — no real id fails the checks.
+
+**Reverses by:** nothing should. If Codex changes its id format, widen
+`valid_codex_sid`; do not remove it.
+
+**Why:** ids are data read from files another process can write. Before this,
+a crafted `session_index.jsonl` row (or a transcript filename) reached
+`eval "exec $cmd"` verbatim and ran as the user on selection. The Claude
+path had the same exposure before Codex support existed; the adapter copied
+it. (Found in independent review, 2026-09-01.) `tests/test-discover.sh` now
+carries fixtures whose ids are shell syntax and asserts they never become rows.
