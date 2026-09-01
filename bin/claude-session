@@ -54,7 +54,18 @@ STATE_HISTORY_KEEP=10
 # must look like a transcript basename, a Codex id must be a UUID. Anything
 # else is dropped at discovery, so no later consumer has to think about it.
 valid_claude_sid() { case "$1" in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac; return 0; }
-valid_codex_sid()  { [ "${#1}" -eq 36 ] || return 1; case "$1" in *[!0-9a-fA-F-]*) return 1 ;; esac; return 0; }
+# A Codex id is a UUID: 8-4-4-4-12 hex groups. Checked by layout, not just
+# length and alphabet — 36 hyphens is not a session id.
+valid_codex_sid() {
+  local a b c d e rest
+  IFS=- read -r a b c d e rest <<CLSID
+$1
+CLSID
+  [ -z "$rest" ] || return 1
+  [ "${#a}" -eq 8 ] && [ "${#b}" -eq 4 ] && [ "${#c}" -eq 4 ] && [ "${#d}" -eq 4 ] && [ "${#e}" -eq 12 ] || return 1
+  case "$a$b$c$d$e" in *[!0-9a-fA-F]*) return 1 ;; esac
+  return 0
+}
 
 # discover_claude — newest transcript per *current* name
 discover_claude() {

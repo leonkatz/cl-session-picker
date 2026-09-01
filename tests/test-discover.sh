@@ -37,8 +37,10 @@ ID_X=01aaaaaa-0000-7000-8000-000000000003   # archived: index entry, rollout onl
 ID_G=01aaaaaa-0000-7000-8000-000000000004   # cwd no longer exists
 ID_N=01aaaaaa-0000-7000-8000-000000000005   # never named (thread_name empty)
 ID_D=01aaaaaa-0000-7000-8000-000000000006   # same name as ID_A, older — newest must win
+ID_SHAPE='------------------------------------'  # 36 chars, allowed alphabet, wrong layout — must be dropped
+ID_SHAPE2='01aaaaaa0000-7000-8000-00000000000-7'  # 36 hex/dash chars with misplaced dashes — must be dropped
 # shellcheck disable=SC2016  # single quotes are the point: the id must stay literal shell syntax
-ID_EVIL='x; touch cl-pwned; $(id) *'   # not a UUID — must be dropped at discovery (no slash: it has to exist as a filename)
+ID_EVIL='x; touch cl-pwned; $(id) *'   # shell syntax, not a UUID — must be dropped at discovery (no slash: it has to exist as a filename)
 {
   printf '{"id":"%s","thread_name":"first","updated_at":"2026-01-01T00:00:00Z"}\n' "$ID_A"
   printf '{"id":"%s","thread_name":"Shared","updated_at":"2026-01-01T00:00:01Z"}\n' "$ID_S"
@@ -49,6 +51,8 @@ ID_EVIL='x; touch cl-pwned; $(id) *'   # not a UUID — must be dropped at disco
   printf '{"id":"%s","thread_name":"Codex Alpha","updated_at":"2026-01-01T00:00:05Z"}\n' "$ID_A"
   printf '{"id":"%s","thread_name":"Codex Alpha","updated_at":"2026-01-01T00:00:06Z"}\n' "$ID_D"
   printf '{"id":"%s","thread_name":"Evil","updated_at":"2026-01-01T00:00:07Z"}\n' "$ID_EVIL"
+  printf '{"id":"%s","thread_name":"Shape","updated_at":"2026-01-01T00:00:08Z"}\n' "$ID_SHAPE"
+  printf '{"id":"%s","thread_name":"Shape2","updated_at":"2026-01-01T00:00:09Z"}\n' "$ID_SHAPE2"
   printf '%s' '{"id":"trunc","thread_name":"trunc'   # truncated final line, no newline
 } > "$CODEX_HOME/session_index.jsonl"
 
@@ -64,6 +68,8 @@ rollout "$ID_N" "$CODEX_HOME/sessions/2026/01/01"          "$FIX/work"
 rollout "$ID_D" "$CODEX_HOME/sessions/2026/01/01"          "$FIX/work"
 touch -t 202601010000 "$CODEX_HOME/sessions/2026/01/01/rollout-2026-01-01T00-00-00-$ID_D.jsonl"   # older than ID_A's
 rollout "$ID_EVIL" "$CODEX_HOME/sessions/2026/01/01"       "$FIX/work"   # a matching rollout exists — validation alone must stop it
+rollout "$ID_SHAPE" "$CODEX_HOME/sessions/2026/01/01"      "$FIX/work"
+rollout "$ID_SHAPE2" "$CODEX_HOME/sessions/2026/01/01"     "$FIX/work"
 # Claude: a transcript whose basename is shell syntax — must be dropped too
 printf '{"cwd":"%s"}\n{"customTitle":"Evil Claude"}\n' "$FIX/work" > "$HOME/.claude/projects/p1/c; touch cl-pwned; \$(id).jsonl"
 
@@ -73,7 +79,8 @@ out="$("$CL" --discover 2>"$FIX/stderr")"
 names_for() { printf '%s\n' "$out" | awk -F'\t' -v a="$1" '$5==a{print $1}' | sort | tr '\n' '|'; }
 
 check "claude: last customTitle wins, missing cwd dropped" "Alpha Two|Shared|" "$(names_for claude)"
-check "codex: last rename wins; archived, missing-cwd, unnamed, malformed, non-uuid all excluded" "Codex Alpha|Shared|" "$(names_for codex)"
+check "codex: last rename wins; archived, missing-cwd, unnamed, malformed all excluded" "Codex Alpha|Shared|" "$(names_for codex)"
+check "codex: an id not laid out as a UUID (8-4-4-4-12 hex) is dropped even when its rollout exists" "" "$(printf '%s\n' "$out" | grep -E "^Shape")"
 check "codex: two sessions sharing a name → newest wins" "$ID_A" "$(printf '%s\n' "$out" | awk -F'\t' '$1=="Codex Alpha"{print $2}')"
 check "ids that are shell syntax never reach the row set" "" "$(printf '%s\n' "$out" | grep -E ';|\$\(|\*' )"
 check "…and neither evil fixture leaked in by name" "" "$(printf '%s\n' "$out" | grep -c "Evil" | grep -vx 0)"
