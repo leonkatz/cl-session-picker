@@ -49,6 +49,13 @@ STATE_HISTORY_KEEP=10
 # Every discover* function emits:  name<TAB>sid<TAB>cwd<TAB>epoch<TAB>agent
 # agent is "claude" or "codex". Consumers must read all five fields.
 
+# Session ids are DATA read from disk and later spliced into command strings
+# (tmux pane commands, eval'd exec lines). They are never trusted: a Claude id
+# must look like a transcript basename, a Codex id must be a UUID. Anything
+# else is dropped at discovery, so no later consumer has to think about it.
+valid_claude_sid() { case "$1" in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac; return 0; }
+valid_codex_sid()  { [ "${#1}" -eq 36 ] || return 1; case "$1" in *[!0-9a-fA-F-]*) return 1 ;; esac; return 0; }
+
 # discover_claude — newest transcript per *current* name
 discover_claude() {
   # custom-title is the record /rename writes; it covers every named session.
@@ -60,6 +67,7 @@ discover_claude() {
         name=$(grep -oE '"customTitle":"[^"]+"' "$f" 2>/dev/null | tail -1 | sed 's/.*"customTitle":"//; s/"$//')
         [ -n "$name" ] || continue
         sid=$(basename "$f" .jsonl)
+        valid_claude_sid "$sid" || continue
         cwd=$(grep -m1 -oE '"cwd":"[^"]*"' "$f" 2>/dev/null | sed 's/.*"cwd":"//; s/"$//')
         [ -d "$cwd" ] || continue   # drop sessions whose working dir no longer exists
         epoch=$(stat -f %m "$f" 2>/dev/null || echo 0)
@@ -99,13 +107,15 @@ discover_codex() {
     END { for (id in name) printf "%s\t%s\n", id, name[id] }
   ' "$CODEX_INDEX" 2>/dev/null \
     | while IFS=$'\t' read -r sid name; do
+        valid_codex_sid "$sid" || continue
         f=$(find "$CODEX_SESSIONS" -type f -name "rollout-*-${sid}.jsonl" 2>/dev/null | head -1)
         [ -n "$f" ] || continue   # no active rollout: archived or deleted
         cwd=$(head -1 "$f" 2>/dev/null | grep -oE '"cwd":"[^"]*"' | head -1 | sed 's/.*"cwd":"//; s/"$//')
         [ -d "$cwd" ] || continue
         epoch=$(stat -f %m "$f" 2>/dev/null || echo 0)
         printf '%s\t%s\t%s\t%s\tcodex\n' "$name" "$sid" "$cwd" "$epoch"
-      done
+      done \
+    | sort -t "$(printf '\t')" -k4,4nr | awk -F'\t' '!seen[$1]++'
 }
 
 # discover — both agents, newest first. Names are unique per agent (each
@@ -188,8 +198,8 @@ codex_args() { printf '%s' "${CL_CODEX_ARGS:-}"; }
 # are re-split by the caller.
 resume_cmd() {
   case "$1" in
-    codex) printf '%s resume %s %s' "$(codex_cmd)" "$2" "$(codex_args)" ;;
-    *)     printf '%s --resume %s --dangerously-skip-permissions' "$(claude_cmd)" "$2" ;;
+    codex) printf '%s resume %s %s' "$(codex_cmd)" "$(printf '%q' "$2")" "$(codex_args)" ;;
+    *)     printf '%s --resume %s --dangerously-skip-permissions' "$(claude_cmd)" "$(printf '%q' "$2")" ;;
   esac
 }
 
@@ -664,7 +674,7 @@ do_start() {
       else
         [ -d "$cwd" ] || cwd="$HOME"
         cmux new-workspace --name "$name" --cwd "$cwd" --focus false \
-            --command "$(claude_cmd) --resume $sid --dangerously-skip-permissions" >/dev/null \
+            --command "$(claude_cmd) --resume $(printf '%q' "$sid") --dangerously-skip-permissions" >/dev/null \
           && { printf '✓ opened %s  (%s)\n' "$name" "$cwd"; i=$((i+1)); }
       fi
     done < <(jq -r '.[] | [.name, .sid, .cwd] | @tsv' "$STATE")
@@ -686,7 +696,7 @@ do_start() {
     if tmux has-session -t "=${t}" 2>/dev/null; then
       printf '● %s already live\n' "$name"
     else
-      tmux new-session -d -s "$t" -c "$cwd" "claude --resume $sid --dangerously-skip-permissions" \
+      tmux new-session -d -s "$t" -c "$cwd" "claude --resume $(printf '%q' "$sid") --dangerously-skip-permissions" \
         && printf '✓ prepared %s  (%s)\n' "$name" "$cwd"
     fi
     i=$((i+1))
