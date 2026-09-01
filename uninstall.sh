@@ -25,6 +25,9 @@ set -euo pipefail
 
 # Defaults — overridable via flags.
 BIN_DIR_DEFAULT="$HOME/.local/bin"
+# Resolve this script's own directory so the framework file list matches what install.sh shipped.
+COMPONENT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+readonly COMPONENT_DIR
 readonly ZSHRC="$HOME/.zshrc"
 readonly TMUX_CONF="$HOME/.tmux.conf"
 readonly SCRIPT_NAME="claude-session"
@@ -112,6 +115,33 @@ if [[ -e "$DST" ]]; then
   run "rm -f '${DST}'"
 else
   say "  not found at ${DST} — nothing to remove"
+fi
+
+# =============================================================================
+# Step 1b — Remove the installed framework procedures
+# =============================================================================
+# Only files this repo ships are removed — matched by name AND content against
+# framework/ here. A same-named file whose content differs has been edited by
+# the user; it is theirs and is left in place with a note. Anything else in
+# ~/.claude/framework stays. The directory goes only if that leaves it empty.
+
+FRAMEWORK_DST_DIR="${HOME}/.claude/framework"
+if [[ -d "$FRAMEWORK_DST_DIR" ]]; then
+  say "removing framework procedures from ${FRAMEWORK_DST_DIR}"
+  for _fw in "${COMPONENT_DIR}/framework"/*.md; do
+    [[ -e "$_fw" ]] || continue
+    _fw_dst="${FRAMEWORK_DST_DIR}/$(basename "$_fw")"
+    [[ -e "$_fw_dst" ]] || continue
+    if cmp -s "$_fw" "$_fw_dst"; then
+      run "rm -f '${_fw_dst}'"
+    else
+      say "  keeping ${_fw_dst} — it differs from the shipped version (edited locally)"
+    fi
+  done
+  unset _fw _fw_dst
+  if [[ "$DRY_RUN" != "1" ]] && [[ -z "$(ls -A "$FRAMEWORK_DST_DIR" 2>/dev/null)" ]]; then
+    run "rmdir '${FRAMEWORK_DST_DIR}'"
+  fi
 fi
 
 # =============================================================================

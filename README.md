@@ -45,6 +45,7 @@ All edits are sentinel-guarded and back up the prior file, so reruns are no-ops.
 - `--no-deps` — skip the Homebrew dependency install
 - `--no-shellrc` — skip `~/.zshrc` edits (PATH + `cl` alias)
 - `--no-tmux-conf` — skip `~/.tmux.conf` edits
+- `--no-framework` — skip installing `framework/*.md` to `~/.claude/framework`
 - `--bin-dir P` — install to `P` instead of `~/.local/bin`
 
 ## Uninstall
@@ -160,6 +161,23 @@ Codex's private files, not an API: if a Codex release moves them, `cl` prints
 `unsupported Codex storage layout` rather than silently showing no sessions.
 Archived sessions (`codex archive`) are excluded. `tests/test-discover.sh`
 exercises all of this against fixtures.
+
+## Framework procedures
+
+`framework/` holds generic operating procedures for an AI coding session — how
+to delegate, propose a change, present a decision, disagree, and route what it
+writes — as one `when-<activity>.md` file each, shape only, no tool names. The
+installer copies them to `~/.claude/framework/` and stops; import the ones you
+want from your own `CLAUDE.md`:
+
+```markdown
+@~/.claude/framework/when-presenting-a-decision.md
+@~/.claude/framework/when-routing-a-communication.md
+```
+
+and bind the `{slot}` placeholders (`{issue-tracker}`, `{chat}`, `{notes}`, …)
+to your own tools beneath the import. See [`framework/README.md`](framework/README.md).
+`--no-framework` skips this step.
 
 ## start / stop
 

@@ -16,6 +16,7 @@
 #   --no-shellrc     skip ~/.zshrc edits (PATH + `cl` alias)
 #   --no-tmux-conf   skip ~/.tmux.conf edits (set-titles options)
 #   --no-sidebars    skip installing cmux sidebars into ~/.config/cmux/sidebars
+#   --no-framework   skip installing framework/*.md into ~/.claude/framework
 #   --bin-dir P      override default install dir (default: ~/.local/bin)
 #
 # Per Bash standard: [[ ]] for conditionals, printf over echo -e, local for
@@ -39,6 +40,7 @@ DO_DEPS=1
 DO_SHELLRC=1
 DO_TMUX_CONF=1
 DO_SIDEBARS=1
+DO_FRAMEWORK=1
 BIN_DIR="$BIN_DIR_DEFAULT"
 
 # Timestamp for backup filenames — one value for the whole run.
@@ -70,8 +72,9 @@ while [[ $# -gt 0 ]]; do
     --no-shellrc)   DO_SHELLRC=0;    shift ;;
     --no-tmux-conf) DO_TMUX_CONF=0;  shift ;;
     --no-sidebars)  DO_SIDEBARS=0;   shift ;;
+    --no-framework) DO_FRAMEWORK=0;  shift ;;
     --bin-dir)      BIN_DIR="$2";    shift 2 ;;
-    -h|--help)      sed -n '2,21p' "$0"; exit 0 ;;
+    -h|--help)      sed -n '2,22p' "$0"; exit 0 ;;
     *)
       printf 'unknown argument: %s\n' "$1" >&2
       exit 2
@@ -155,6 +158,52 @@ elif [[ "$DO_SIDEBARS" == "1" ]]; then
   say "cmux not found — skipping cmux sidebars (cl works fine without them)"
 else
   say "skipping cmux sidebars (--no-sidebars)"
+fi
+
+# =============================================================================
+# Step 2c — framework procedures → ~/.claude/framework
+# =============================================================================
+# The generic operating procedures (framework/*.md) are copied so a CLAUDE.md
+# can import them with `@~/.claude/framework/<file>`. Copy, not symlink, for
+# the same reason as the binary. Deliberately does NOT touch ~/.claude/CLAUDE.md:
+# that file is the user's own instantiation, and an installer that edits it
+# would be writing content, not scaffolding. --no-framework opts out.
+#
+# Ownership: the installed copies are package-managed — this step will replace
+# them on every rerun. A file that differs from what we ship is backed up
+# beside itself first (same rule as the binary), so a local edit is never lost
+# silently; but the supported place for customisation is the user's own
+# CLAUDE.md beneath the @import, not the installed copy.
+
+if [[ "$DO_FRAMEWORK" == "1" ]]; then
+  FRAMEWORK_SRC_DIR="${COMPONENT_DIR}/framework"
+  FRAMEWORK_DST_DIR="${HOME}/.claude/framework"
+  if [[ -d "$FRAMEWORK_SRC_DIR" ]]; then
+    run "mkdir -p '${FRAMEWORK_DST_DIR}'"
+    for _fw in "$FRAMEWORK_SRC_DIR"/*.md; do
+      [[ -e "$_fw" ]] || continue
+      _fw_name="$(basename "$_fw")"
+      _fw_dst="${FRAMEWORK_DST_DIR}/${_fw_name}"
+      if [[ -e "$_fw_dst" ]] && cmp -s "$_fw" "$_fw_dst"; then
+        say "framework ${_fw_name} already current — skipping"
+      else
+        if [[ -e "$_fw_dst" ]]; then
+          # Never overwrite an earlier backup: two reinstalls in one second
+          # would otherwise leave only the later edit's copy.
+          _fw_bak="${_fw_dst}.bak-${TS}"; _n=1
+          while [[ -e "$_fw_bak" ]]; do _fw_bak="${_fw_dst}.bak-${TS}-${_n}"; _n=$((_n+1)); done
+          say "framework ${_fw_name} differs from the shipped version — backing up → ${_fw_bak}"
+          run "cp '${_fw_dst}' '${_fw_bak}'"
+        fi
+        say "installing framework ${_fw_name} → ${FRAMEWORK_DST_DIR}/"
+        run "cp '${_fw}' '${_fw_dst}'"
+      fi
+    done
+    unset _fw _fw_name _fw_dst _fw_bak _n
+    say "  import one into your CLAUDE.md with e.g.:  @~/.claude/framework/when-presenting-a-decision.md"
+  fi
+else
+  say "skipping framework procedures (--no-framework)"
 fi
 
 # =============================================================================
