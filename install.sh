@@ -188,14 +188,18 @@ if [[ "$DO_FRAMEWORK" == "1" ]]; then
         say "framework ${_fw_name} already current — skipping"
       else
         if [[ -e "$_fw_dst" ]]; then
-          say "framework ${_fw_name} differs from the shipped version — backing up → ${_fw_dst}.bak-${TS}"
-          run "cp '${_fw_dst}' '${_fw_dst}.bak-${TS}'"
+          # Never overwrite an earlier backup: two reinstalls in one second
+          # would otherwise leave only the later edit's copy.
+          _fw_bak="${_fw_dst}.bak-${TS}"; _n=1
+          while [[ -e "$_fw_bak" ]]; do _fw_bak="${_fw_dst}.bak-${TS}-${_n}"; _n=$((_n+1)); done
+          say "framework ${_fw_name} differs from the shipped version — backing up → ${_fw_bak}"
+          run "cp '${_fw_dst}' '${_fw_bak}'"
         fi
         say "installing framework ${_fw_name} → ${FRAMEWORK_DST_DIR}/"
         run "cp '${_fw}' '${_fw_dst}'"
       fi
     done
-    unset _fw _fw_name _fw_dst
+    unset _fw _fw_name _fw_dst _fw_bak _n
     say "  import one into your CLAUDE.md with e.g.:  @~/.claude/framework/when-presenting-a-decision.md"
   fi
 else
