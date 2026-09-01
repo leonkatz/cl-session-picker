@@ -168,6 +168,12 @@ fi
 # the same reason as the binary. Deliberately does NOT touch ~/.claude/CLAUDE.md:
 # that file is the user's own instantiation, and an installer that edits it
 # would be writing content, not scaffolding. --no-framework opts out.
+#
+# Ownership: the installed copies are package-managed — this step will replace
+# them on every rerun. A file that differs from what we ship is backed up
+# beside itself first (same rule as the binary), so a local edit is never lost
+# silently; but the supported place for customisation is the user's own
+# CLAUDE.md beneath the @import, not the installed copy.
 
 if [[ "$DO_FRAMEWORK" == "1" ]]; then
   FRAMEWORK_SRC_DIR="${COMPONENT_DIR}/framework"
@@ -177,14 +183,19 @@ if [[ "$DO_FRAMEWORK" == "1" ]]; then
     for _fw in "$FRAMEWORK_SRC_DIR"/*.md; do
       [[ -e "$_fw" ]] || continue
       _fw_name="$(basename "$_fw")"
-      if [[ -e "${FRAMEWORK_DST_DIR}/${_fw_name}" ]] && cmp -s "$_fw" "${FRAMEWORK_DST_DIR}/${_fw_name}"; then
+      _fw_dst="${FRAMEWORK_DST_DIR}/${_fw_name}"
+      if [[ -e "$_fw_dst" ]] && cmp -s "$_fw" "$_fw_dst"; then
         say "framework ${_fw_name} already current — skipping"
       else
+        if [[ -e "$_fw_dst" ]]; then
+          say "framework ${_fw_name} differs from the shipped version — backing up → ${_fw_dst}.bak-${TS}"
+          run "cp '${_fw_dst}' '${_fw_dst}.bak-${TS}'"
+        fi
         say "installing framework ${_fw_name} → ${FRAMEWORK_DST_DIR}/"
-        run "cp '${_fw}' '${FRAMEWORK_DST_DIR}/${_fw_name}'"
+        run "cp '${_fw}' '${_fw_dst}'"
       fi
     done
-    unset _fw _fw_name
+    unset _fw _fw_name _fw_dst
     say "  import one into your CLAUDE.md with e.g.:  @~/.claude/framework/when-presenting-a-decision.md"
   fi
 else

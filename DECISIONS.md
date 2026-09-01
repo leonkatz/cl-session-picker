@@ -136,7 +136,12 @@ frontmatter. `install.sh` copies them to `~/.claude/framework/` and prints the
 adds the imports themselves.
 
 **Reverses by:** concatenating the files into one, or adding a sentinel-guarded
-import block to CLAUDE.md the way the shell rc is handled.
+import block to CLAUDE.md the way the shell rc is handled. The copy's ownership
+semantics — package-managed, backed up on divergence, never deleted when
+edited — reverse by switching the destination to a symlink into the repo
+(then the repo owns it outright) or to a versioned vendor directory with user
+overrides elsewhere. (Ownership semantics added after review, 2026-09-01: the
+first version overwrote and deleted edited files silently.)
 
 **Why several files:** a memory tool that indexes `when-<activity>.md` can absorb
 them with a move, not a rewrite. **Why no CLAUDE.md edit:** that file is the

@@ -120,9 +120,10 @@ fi
 # =============================================================================
 # Step 1b — Remove the installed framework procedures
 # =============================================================================
-# Only the files this repo ships are removed (matched by name against
-# framework/ here); anything else the user put in ~/.claude/framework is theirs
-# and stays. The directory goes only if that leaves it empty.
+# Only files this repo ships are removed — matched by name AND content against
+# framework/ here. A same-named file whose content differs has been edited by
+# the user; it is theirs and is left in place with a note. Anything else in
+# ~/.claude/framework stays. The directory goes only if that leaves it empty.
 
 FRAMEWORK_DST_DIR="${HOME}/.claude/framework"
 if [[ -d "$FRAMEWORK_DST_DIR" ]]; then
@@ -130,7 +131,12 @@ if [[ -d "$FRAMEWORK_DST_DIR" ]]; then
   for _fw in "${COMPONENT_DIR}/framework"/*.md; do
     [[ -e "$_fw" ]] || continue
     _fw_dst="${FRAMEWORK_DST_DIR}/$(basename "$_fw")"
-    [[ -e "$_fw_dst" ]] && run "rm -f '${_fw_dst}'"
+    [[ -e "$_fw_dst" ]] || continue
+    if cmp -s "$_fw" "$_fw_dst"; then
+      run "rm -f '${_fw_dst}'"
+    else
+      say "  keeping ${_fw_dst} — it differs from the shipped version (edited locally)"
+    fi
   done
   unset _fw _fw_dst
   if [[ "$DRY_RUN" != "1" ]] && [[ -z "$(ls -A "$FRAMEWORK_DST_DIR" 2>/dev/null)" ]]; then

@@ -2,9 +2,10 @@
 
 These files are the **generic layer** of a session's operating instructions: the
 *shape* of how a session should delegate, propose changes, present decisions,
-disagree, and route what it writes. They contain no employer, no team, no tool
-inventory — every line is meant to be true for someone who is not you and works
-somewhere else.
+disagree, and route what it writes. They contain no employer, no team, and no
+private tool inventory — a well-known product name appears only as an example
+of a slot — so every line is meant to be true for someone who is not you and
+works somewhere else.
 
 They are written so a memory tool can index them as-is: flat `type:`
 frontmatter, one procedure per file, named `when-<activity>.md`. Adopting such a
@@ -23,6 +24,13 @@ and never writes into the live-state layer — **installers write scaffolding,
 never content.** A tool that regenerates a file a person has edited destroys
 exactly the most valuable edit in it.
 
+That rule cuts the other way for the installed copies: **`~/.claude/framework/`
+is package-managed.** Re-running the installer replaces those files (backing up
+any that differ first, `*.bak-<timestamp>`), and the uninstaller removes only
+files that still match what was shipped — an edited one is left alone. Don't
+customise by editing the installed copy; customise in your own `CLAUDE.md`
+beneath the `@import`, where nothing will ever overwrite it.
+
 ## Using them
 
 Claude Code resolves `@path` imports inside any `CLAUDE.md` / `CLAUDE.local.md`.
@@ -39,14 +47,25 @@ Then write the instantiation beneath the import — a short table binding each
 unbound; the procedures are written to degrade to "write it down where you keep
 notes" rather than break.
 
-## Capability slots
+## Placeholders — three kinds, don't conflate them
 
-Every placeholder in these files is one of:
-
-`{issue-tracker}` · `{doc-store}` · `{chat}` · `{secrets}` · `{observability}`
-· `{source-control}` · `{calendar}` · `{notes}`
-
-Most people bind three or four of the eight.
+1. **Capability slots** — `{issue-tracker}` · `{doc-store}` · `{chat}` ·
+   `{secrets}` · `{observability}` · `{source-control}` · `{calendar}` ·
+   `{notes}`. Exactly these eight. Each names a *kind of tool* you may or may
+   not have; you bind it to whatever fills that role, or leave it unbound and
+   the procedure degrades as documented. Most people bind three or four.
+2. **Shape slots** — angle brackets, e.g. `<iac-tool>`, `<main-branch>`,
+   `<owner-tag-key>`. A tool name, flag, path, policy, or value that a
+   procedure cannot be written without. Bound in the same table as capability
+   slots. Some are plain names; some are configuration or policy (a compliance
+   regime, a set of repositories) — the procedure says which when it matters.
+   A shape slot is a substitution; it cannot make a procedure apply to a tool
+   that lacks the *behaviour* the procedure assumes — those procedures state
+   their applicability up front, and you omit them when it doesn't hold.
+3. **Template fields** — `{file}`, `{option}`, `{why}`, `{what could go wrong}`
+   inside a fenced output block. These are what the session fills in when it
+   *produces* the output. They are not bound and not slots; they only ever
+   appear inside a ```` ``` ```` block.
 
 ## Files
 
