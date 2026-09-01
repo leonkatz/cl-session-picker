@@ -149,3 +149,42 @@ user's instantiation — their channels, their names. An installer that writes
 into it is writing content, and the repo's rule is that installers write
 scaffolding only. **Why copy:** same as the binary — the installed layer must
 survive the repo not being present.
+
+## 2026-08-31 — Mixed-shape procedures use angle-bracket shape slots, distinct from capability slots
+
+**Chose:** procedures whose every line mentions a tool, flag, tag key, or
+branch name (`when-presenting-infrastructure-code`, `when-running-an-iac-wrapper`,
+`when-committing-on-a-personal-branch`, `when-presenting-code`,
+`when-deleting-cloud-resources`) keep the procedure and replace each such
+name with `<shape-slot>`. `{capability-slot}` still means "what kind of tool
+you have"; `<shape-slot>` means "what it is called." Both are bound in the
+same table beneath the import.
+
+**Forecloses:** reading these five files standalone as usable checklists —
+they need a bindings table to be concrete.
+
+**Reverses by:** inlining a binding into the shape where one value turns out
+to be universal (e.g. if every user's `<main-branch>` is `main`, drop the
+slot).
+
+**Why:** the alternative — writing each procedure twice, once per cloud or
+tool — is the duplication the framework exists to avoid. When in doubt a
+name was slotted, not kept: a slot that turns out unnecessary costs one
+table row; a kept name that turns out to be one employer's is a public leak.
+
+## 2026-08-31 — No leak-check script or fixture lives in this repo
+
+**Chose:** the grep used to verify that framework files carry no employer,
+product, tag-key, or tool inventory is run from the maintainer's private
+side and its result pasted into the review. It is not committed here.
+
+**Forecloses:** a CI job that enforces the public-content rule from inside
+this repo.
+
+**Reverses by:** adding a check that reads its pattern list from an
+untracked, gitignored file (or from the maintainer's private config repo) —
+never from source in this repository.
+
+**Why:** the pattern list *is* the inventory the check exists to keep out. A
+`leak-check.sh` here would publish every name it greps for. Do not add the
+grep to CI.

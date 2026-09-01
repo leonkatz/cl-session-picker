@@ -67,6 +67,12 @@ notes" rather than break.
    *produces* the output. They are not bound and not slots; they only ever
    appear inside a ```` ``` ```` block.
 
+Some procedures also carry **shape slots** in angle brackets — `<iac-tool>`,
+`<owner-tag-key>`, `<personal-branch>` — for a tool, flag, tag key, or name
+that the procedure cannot be written without. A shape slot is bound the same
+way, in a table beneath the import. Capability slots say *what kind of thing*
+you have; shape slots say *what it is called*.
+
 ## Files
 
 | File | Trigger |
@@ -76,3 +82,8 @@ notes" rather than break.
 | `when-presenting-a-decision.md` | any choice with real trade-offs |
 | `when-disagreeing.md` | a statement conflicts with evidence or a standard |
 | `when-routing-a-communication.md` | something needs to be recorded, documented, or said |
+| `when-presenting-infrastructure-code.md` | before showing infrastructure code — security checklist |
+| `when-running-an-iac-wrapper.md` | an infrastructure-as-code command appears anywhere |
+| `when-committing-on-a-personal-branch.md` | committing on a long-lived personal branch |
+| `when-presenting-code.md` | before showing any code |
+| `when-deleting-cloud-resources.md` | before deleting any cloud resource |
