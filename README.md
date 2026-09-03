@@ -35,7 +35,11 @@ installed command keeps working even if this repo isn't present).
    `set -g set-titles-string "#S"` (terminal title tracks the session name),
    `set -g mouse on` (trackpad/wheel scrolls into scrollback), and
    `set -g history-limit 50000` (larger scrollback buffer).
-4. **Shell** — adds the bin dir to `PATH` and the `cl` alias to `~/.zshrc`.
+4. **Shell** — writes the PATH + `cl` alias into a snippet the installer owns
+   (`~/.local/share/claude-session/shellrc`) and appends a one-line source
+   guard to `~/.zshrc`. If `~/.zshrc` is a **symlink** (a dotfiles manager owns
+   it), nothing is appended — add the printed source line to your managed file
+   instead. An older inline block is migrated to the guard on rerun.
 
 All edits are sentinel-guarded and back up the prior file, so reruns are no-ops.
 
@@ -73,7 +77,9 @@ session state. Open a new terminal afterward so the `cl` alias stops resolving.
 ## Usage
 
 - `cl` — open the picker
-- `cl <name>` — launch that named session directly (attaches it if already live)
+- `cl <name>` — launch that named session directly (attaches it if already live).
+  **This is the primary path** — exact, no picker, immune to fuzzy-match misses
+  and to long lists scrolling a session out of view.
 - `cl new "Name" [dir|-d]` — create a **fully-named** session in one step (no `/rename`)
 - `cl new --codex "Name" [dir|-d]` — start a fresh Codex CLI session (see [Codex CLI sessions](#codex-cli-sessions))
 - `cl --list` — print discovered sessions (`--codex` / `--claude` first to filter)

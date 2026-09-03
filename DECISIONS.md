@@ -192,3 +192,33 @@ never from source in this repository.
 **Why:** the pattern list *is* the inventory the check exists to keep out. A
 `leak-check.sh` here would publish every name it greps for. Do not add the
 grep to CI.
+
+## 2026-09-01 — Shell wiring lives in an installer-owned snippet; ~/.zshrc gets only a source guard
+
+**Chose:** `install.sh` writes `~/.local/share/claude-session/shellrc` (a file
+nothing else touches) and appends a single guarded `source` line to a regular
+`~/.zshrc`. A symlinked `~/.zshrc` — a dotfiles manager's file — is never
+appended to; the installer prints the guard line for the managed file to carry.
+Old inline blocks migrate on rerun.
+
+**Forecloses:** a self-contained `~/.zshrc` edit; users of managed dotfiles add
+one line themselves (or their manager's repo carries it).
+
+**Reverses by:** inlining the snippet back into the sentinel block.
+
+**Why:** appending real content into a file another tool owns fails when that
+tool replaces the file — measured 2026-09-01: a dotfiles manager symlinked
+`~/.zshrc` to its repo copy and the appended alias silently vanished. The
+invariant is one writer per file. Same class as the installer-clobbers-edits
+finding earlier that day, from the other direction.
+
+## 2026-09-01 — The picker never hides rows silently
+
+**Chose:** the fzf list uses adaptive height (`--height=~100%`) — it grows to
+fit the list; when it must scroll, fzf's counter and scrollbar say so.
+
+**Why:** a fixed `--height=45%` rendered ~10 rows with no overflow indication;
+a session below the fold looked absent and cost a real search. A list must
+never render a state that looks identical to "that's everything" when it isn't
+— the same silent-truncation family as the seed-template and dry-run-guard
+findings this month.

@@ -237,22 +237,96 @@ else
 fi
 
 # =============================================================================
-# Step 4 — PATH + `cl` alias in ~/.zshrc
+# Step 4 — shell wiring: a snippet this installer OWNS, sourced from ~/.zshrc
 # =============================================================================
-# A single sentinel-guarded block carries both the PATH entry (so BIN_DIR is
-# reachable) and the `cl` alias. Idempotent on the sentinel.
+# The PATH + alias content lives in ~/.local/share/claude-session/shellrc — a
+# file nothing else writes — and ~/.zshrc carries only a one-line source guard.
+# Why: appending real content into ~/.zshrc breaks the moment a dotfiles
+# manager replaces that file (2026-09-01: a manager symlinked ~/.zshrc to its
+# repo copy and the appended block silently vanished). So:
+#   * regular ~/.zshrc → append the guard once, sentinel-marked; an OLD-style
+#     block (inline PATH/alias) is migrated to the guard on rerun;
+#   * SYMLINKED ~/.zshrc → it belongs to a dotfiles manager; never append
+#     through it — print the guard line for the managed file to carry.
+
+SNIPPET_DIR="${HOME}/.local/share/claude-session"
+SNIPPET="${SNIPPET_DIR}/shellrc"
+SOURCE_GUARD='[ -f "$HOME/.local/share/claude-session/shellrc" ] && source "$HOME/.local/share/claude-session/shellrc"'
+
+run "mkdir -p '${SNIPPET_DIR}'"
+_snippet_tmp="$(mktemp)"
+{
+  printf '# claude-session shell wiring — OWNED by cl-session-picker/install.sh.\n'
+  printf '# Rewritten on every install; put your own settings in ~/.zshrc instead.\n'
+  printf 'export PATH="%s:$PATH"\n' "${BIN_DIR}"
+  # Absolute target: a later PATH prepend elsewhere in the rc must not let a
+  # stray same-named binary outrank the installed one (found in review).
+  printf "alias cl='%s'\n" "${BIN_DIR}/${SCRIPT_NAME}"
+  printf '# export CL_DEFAULT_DIR="$HOME/your-repo"  # uncomment: dir for  cl new "Name" -d\n'
+} > "${_snippet_tmp}"
+if [[ -e "$SNIPPET" ]] && cmp -s "${_snippet_tmp}" "$SNIPPET"; then
+  say "shell snippet already current: ${SNIPPET}"
+else
+  say "writing shell snippet → ${SNIPPET}"
+  run "cp '${_snippet_tmp}' '${SNIPPET}'"
+fi
+rm -f "${_snippet_tmp}"
 
 if [[ "$DO_SHELLRC" == "1" ]]; then
   ZSH_SENTINEL="# >>> claude-tools >>>"
-  if [[ -f "$ZSHRC" ]] && grep -qsF "$ZSH_SENTINEL" "$ZSHRC"; then
-    say "claude-tools block already in ${ZSHRC} — no-op"
+  ZSH_SENTINEL_END="# <<< claude-tools <<<"
+  if [[ -L "$ZSHRC" ]]; then
+    say "NOTE: ${ZSHRC} is a symlink (a dotfiles manager owns it) — not appending."
+    say "      Make sure the managed file contains this line:"
+    say "        ${SOURCE_GUARD}"
+  elif [[ -f "$ZSHRC" ]] && grep -qsE '^[[:space:]]*\[ -f .*claude-session/shellrc' "$ZSHRC"; then
+    # An ACTIVE guard line only — a comment mentioning the snippet must not
+    # suppress installation (found in review).
+    say "source guard already in ${ZSHRC} — no-op"
   else
-    if [[ -f "$ZSHRC" ]]; then
-      say "backing up ${ZSHRC} → ${ZSHRC}.bak-${TS}"
-      run "cp '${ZSHRC}' '${ZSHRC}.bak-${TS}'"
+    _migrate_ok=1
+    if [[ -f "$ZSHRC" ]] && grep -qsF "$ZSH_SENTINEL" "$ZSHRC"; then
+      # Migration is only safe on a well-formed block: exactly one open, one
+      # close, in order, on clean LF lines. Anything else — an unmatched open
+      # would have made awk TRUNCATE the rest of the file, and CRLF lines are
+      # found by substring grep but missed by exact-line removal, leaving both
+      # old and new wiring (both found in review). Refuse and touch nothing.
+      _opens=$(grep -cxF "$ZSH_SENTINEL" "$ZSHRC" || true)
+      _closes=$(grep -cxF "$ZSH_SENTINEL_END" "$ZSHRC" || true)
+      # { grep || true; } — under pipefail a no-match grep would fail the whole
+      # pipeline and set -e would kill the installer BEFORE the refusal message
+      # (exactly how a missing close sentinel first manifested: silent exit).
+      _open_ln=$({ grep -nxF "$ZSH_SENTINEL" "$ZSHRC" || true; } | head -1 | cut -d: -f1)
+      _close_ln=$({ grep -nxF "$ZSH_SENTINEL_END" "$ZSHRC" || true; } | head -1 | cut -d: -f1)
+      if LC_ALL=C grep -qs $'\r' "$ZSHRC" || [[ "${_opens:-0}" -ne 1 ]] || [[ "${_closes:-0}" -ne 1 ]] || [[ "${_open_ln:-0}" -ge "${_close_ln:-0}" ]]; then
+        _migrate_ok=0
+      fi
     fi
-    say "adding PATH entry, 'cl' alias, and CL_DEFAULT_DIR hint to ${ZSHRC}"
-    run "printf '\n%s\nexport PATH=\"%s:\$PATH\"\nalias cl=%s\n# export CL_DEFAULT_DIR=\"\$HOME/your-repo\"  # uncomment: dir for  cl new \"Name\" -d\n# <<< claude-tools <<<\n' '${ZSH_SENTINEL}' '${BIN_DIR}' '${SCRIPT_NAME}' >> '${ZSHRC}'"
+    if [[ "$_migrate_ok" -eq 0 ]]; then
+      say "ERROR: ${ZSHRC} contains a claude-tools block this installer cannot migrate safely"
+      say "       (unbalanced sentinels or CRLF line endings). Nothing was changed."
+      say "       Remove the old '# >>> claude-tools >>>' block by hand and re-run;"
+      say "       the new wiring is one line: ${SOURCE_GUARD}"
+    else
+      if [[ -f "$ZSHRC" ]]; then
+        say "backing up ${ZSHRC} → ${ZSHRC}.bak-${TS}"
+        run "cp '${ZSHRC}' '${ZSHRC}.bak-${TS}'"
+        if grep -qsF "$ZSH_SENTINEL" "$ZSHRC"; then
+          say "migrating old inline claude-tools block to the source guard"
+          _zshrc_tmp="$(mktemp)"
+          awk -v mark_open="$ZSH_SENTINEL" -v mark_close="$ZSH_SENTINEL_END" '
+            $0 == mark_open  { skip = 1; next }
+            $0 == mark_close { skip = 0; next }
+            !skip { print }
+          ' "$ZSHRC" > "${_zshrc_tmp}"
+          run "cp '${_zshrc_tmp}' '${ZSHRC}'"
+          rm -f "${_zshrc_tmp}"
+        fi
+      fi
+      say "adding the claude-tools source guard to ${ZSHRC}"
+      run "printf '\\n%s\\n%s\\n%s\\n' '${ZSH_SENTINEL}' '${SOURCE_GUARD}' '${ZSH_SENTINEL_END}' >> '${ZSHRC}'"
+    fi
+    unset _migrate_ok _opens _closes _open_ln _close_ln
   fi
 else
   say "skipping ~/.zshrc edits (--no-shellrc)"

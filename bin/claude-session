@@ -855,7 +855,7 @@ esac
 
 # ---- picker ----
 if command -v fzf >/dev/null 2>&1; then
-  picked=$(rows | fzf --ansi --delimiter='\t' --with-nth=1 --height=45% --reverse \
+  picked=$(rows | fzf --ansi --delimiter='\t' --with-nth=1 --height=~100% --reverse \
             --prompt='session ❯ ' \
             --header='● live   ○ resume      enter: open') || exit 0
   [ -n "$picked" ] || exit 0
