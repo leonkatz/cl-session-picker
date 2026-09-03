@@ -197,9 +197,12 @@ codex_cmd() {
 # configured defaults apply, exactly as if the user had typed `codex resume`.
 # CL_CODEX_ARGS is purely additive and is TRUSTED SHELL SYNTAX — it is spliced
 # into the tmux/cmux command string verbatim, so quote it as you would on a
-# command line (e.g. CL_CODEX_ARGS='-m gpt-5 --approve-for-me'). `--remote` is
-# unsupported here: discovery reads local storage, so resuming a locally found
-# id on a remote app server is meaningless.
+# command line (e.g. CL_CODEX_ARGS='-m gpt-5 --approve-for-me'). It is placed
+# BEFORE the subcommand (`codex <args> resume <id>`): these are top-level
+# options, and some Codex builds reject them after `resume` while every build
+# accepts them before it. `--remote` is unsupported here: discovery reads
+# local storage, so resuming a locally found id on a remote app server is
+# meaningless.
 # (Claude's path keeps --dangerously-skip-permissions: that predates this
 # design and is documented in DECISIONS.md rather than silently changed.)
 codex_args() { printf '%s' "${CL_CODEX_ARGS:-}"; }
@@ -209,7 +212,7 @@ codex_args() { printf '%s' "${CL_CODEX_ARGS:-}"; }
 # are re-split by the caller.
 resume_cmd() {
   case "$1" in
-    codex) printf '%s resume %s %s' "$(codex_cmd)" "$(printf '%q' "$2")" "$(codex_args)" ;;
+    codex) printf '%s %s resume %s' "$(codex_cmd)" "$(codex_args)" "$(printf '%q' "$2")" ;;
     *)     printf '%s --resume %s --dangerously-skip-permissions' "$(claude_cmd)" "$(printf '%q' "$2")" ;;
   esac
 }
