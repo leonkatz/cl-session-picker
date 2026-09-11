@@ -357,10 +357,25 @@ acquire_launch() {
     # Reclaim ONLY on proof the holder is gone or its pid was recycled. Age is
     # not proof: a holder merely slow in ps/pgrep/IO would have its lock stolen
     # and two launchers would enter the critical section together.
+    # A stale lock is NEVER unlinked automatically. Validating the symlink and
+    # then `rm`-ing its pathname are two operations: between them another
+    # waiter can reclaim and establish a live claim, and the delete would then
+    # destroy THAT claim and let two launchers into the critical section. The
+    # start-token proof authenticates the object read, not the object later
+    # unlinked, and portable shell has no compare-and-swap to close that. So:
+    # report it and let a person clear it. (A launcher has to die inside a
+    # few-millisecond window to leave one, so this should be vanishingly rare.)
     case "$hpid" in
-      ''|*[!0-9]*) rm -f "$lock" 2>/dev/null; continue ;;
+      ''|*[!0-9]*)
+        echo "claude-session: $lock is malformed — clear it, then retry:" >&2
+        echo "  rm -f $lock" >&2
+        return 2 ;;
     esac
-    if [ "$(start_token "$hpid")" != "$hstart" ]; then rm -f "$lock" 2>/dev/null; continue; fi
+    if [ "$(start_token "$hpid")" != "$hstart" ]; then
+      echo "claude-session: a previous launcher (pid $hpid) died holding the claim for \"$1\" — clear it, then retry:" >&2
+      echo "  rm -f $lock" >&2
+      return 2
+    fi
     tries=$((tries+1))
     if [ "$tries" -gt "${CL_CLAIM_WAIT_TRIES:-100}" ]; then
       echo "claude-session: another launcher (pid $hpid) is still claiming \"$1\" — not launching; try again" >&2
@@ -506,9 +521,12 @@ launch_session() { # name sid cwd [agent]
     tmux_setup
     exec tmux new-session -A -s "$t" -c "$cwd" "$cmd"
   else
-    if ! pid=$(acquire_launch "$name" "$agent" "$sid"); then
+    pid=$(acquire_launch "$name" "$agent" "$sid"); local arc=$?
+    if [ "$arc" -eq 1 ]; then
       echo "\"$name\" already has a local process resuming it (pid $pid) — switch to its tab instead of resuming it twice." >&2
       exit 1
+    elif [ "$arc" -ne 0 ]; then
+      exit 1   # acquire_launch already said exactly what went wrong
     fi
     cd "$cwd" || exit 1; eval "exec $cmd"
   fi
@@ -561,9 +579,12 @@ launch_named() { # name cwd [agent]
     tmux_setup
     exec tmux new-session -A -s "$t" -c "$cwd" "$cmd"
   else
-    local owner
-    if ! owner=$(acquire_launch "$name" "$agent"); then
+    local owner arc
+    owner=$(acquire_launch "$name" "$agent"); arc=$?
+    if [ "$arc" -eq 1 ]; then
       echo "\"$name\" is already running (pid $owner) — switch to its tab instead of starting it twice." >&2
+      exit 1
+    elif [ "$arc" -ne 0 ]; then
       exit 1
     fi
     cd "$cwd" || exit 1; eval "exec $cmd"

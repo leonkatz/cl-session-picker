@@ -304,6 +304,21 @@ would enter the critical section together. A non-symlink at the lock path is
 refused outright: `ln -s target dir` creates the link *inside* the directory and
 reports success, which would hand a launcher a lock it does not hold.
 
+**A stale claim is reported, never auto-cleared.** Validating the lock symlink
+and then unlinking its pathname are two operations: between them another waiter
+can reclaim and establish a live claim, and the delete would then destroy *that*
+claim and let two launchers into the critical section. The start-token proof
+authenticates the object read, not the object later unlinked, and portable shell
+has no compare-and-swap to close that gap — a second read just before the
+unlink narrows it without fixing it. So a stale lock fails closed with the dead
+holder's pid and the exact `rm -f` to clear it. A launcher has to die inside a
+few-millisecond window to leave one.
+
+*Considered and rejected:* a second "reclaim" lock making the unlink exclusive.
+It does close the race, but it has its own stale case, and recursion is the
+wrong shape for a kill path. Refusing costs a person five seconds, once, in a
+situation that should never arise.
+
 **On testing this:** a wall-clock race between two `cl` invocations does not
 prove mutual exclusion — measured, it passes even with the lock removed,
 because process startup jitter serialises the two anyway. The suite therefore

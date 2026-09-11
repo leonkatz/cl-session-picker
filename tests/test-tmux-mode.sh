@@ -197,8 +197,27 @@ check "a LIVE holder is not displaced by waiting"   "0"                "$([ -e "
 check "…and its lock is untouched"                  "$HOLDER:$HTOK"    "$(readlink "$HLOCK")"
 kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null
 sleep 1
-check "a dead holder IS reclaimed, and the claim succeeds" "0" "$(cat "$FIX/acq2.rc" 2>/dev/null)"
+# A stale lock is reported, never auto-unlinked: validating the symlink and
+# then rm-ing its pathname are two operations, and between them another waiter
+# can establish a live claim that the delete would destroy — letting two
+# launchers into the critical section. Portable shell has no compare-and-swap,
+# so the safe policy is to refuse and let a person clear it.
+check "a dead holder is reported, not silently reclaimed" "2" "$(cat "$FIX/acq2.rc" 2>/dev/null)"
+check "…and the stale lock is left exactly as it was"     "$HOLDER:$HTOK" "$(readlink "$HLOCK")"
 wait "$ACQ2" 2>/dev/null
+
+# …and at the launch level: refused, told how to clear it, agent never reached.
+rm -f "$FIX/argv.claude"
+STALE="$(reg_file 'Solo' claude).lock"
+ln -s "$HOLDER:$HTOK" "$STALE" || setup_failed "could not plant a stale claim for Solo"
+out=$(env -i HOME="$HOME" PATH="$PATHF" TERM_PROGRAM=iTerm.app bash "$CL" Solo 2>&1); rc=$?
+check "a stale claim refuses the launch"    "1"  "$rc"
+check "…and the agent is never reached"     "no" "$(bare)"
+has   "…and says how to clear it"           "$out" "rm -f"
+# The acquisition failure must not masquerade as a duplicate-session message.
+hasnt "…without a bogus 'already has a local process (pid )'" "$out" "already has a local process resuming it (pid )"
+check "…and the stale lock is still there"  "$HOLDER:$HTOK" "$(readlink "$STALE")"
+rm -f "$STALE"
 rm -rf "$HOME/.config/claude-session/pids"
 
 printf 'a non-lock object at the claim path fails closed\n'
