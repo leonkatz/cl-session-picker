@@ -183,7 +183,7 @@ exercises all of this against fixtures.
 | Terminal | Agent runs | Why |
 |---|---|---|
 | **iTerm2** | as the tab's own process (no tmux) | iTerm2's Claude Code integration keys on the tab's foreground job name and finds the tab from the agent's tty. Wrapped in tmux the job is `tmux` and the tty is a tmux pty, so the integration silently does nothing. |
-| **cmux** | as the pane's own process | cmux owns persistence and restore. |
+| **cmux** | as the pane's own process | cmux owns persistence and restore. Detected by asking cmux to confirm this pane's `CMUX_WORKSPACE_ID` is one of its live workspaces — stale ids inherited from a dead cmux context (a tmux server keeps them in its global environment) must not route a launch there. A pane carrying only `CMUX_SURFACE_ID` cannot be confirmed, since cmux lists surfaces by ref rather than id, and is treated as not-cmux. |
 | anything else | inside tmux when available | there, detach/reattach is the only persistence there is. |
 
 **In iTerm this trades detach for the integration.** Closing the tab ends the

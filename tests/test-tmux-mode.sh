@@ -56,10 +56,16 @@ SH
 # A cmux that is RUNNING and healthy, but whose live workspaces do not include
 # the stale id the environment carries. This is the case an app-presence check
 # gets wrong: cmux exists, so stale vars look authoritative.
+# Records what it was asked to do, so the affirmed path can be proved to have
+# actually run rather than merely "not printed a tag". One live workspace, plus
+# a decoy string parked in a title field.
 cat > "$FIX/bin/cmux" <<SH
 #!/bin/sh
+printf '%s\n' "\$*" >> "$FIX/cmux.log"
 case "\$1 \$2" in
-  "workspace list") printf '{"workspaces":[{"id":"a-real-live-workspace"}]}\n' ;;
+  "workspace list")
+    if [ -n "\${CMUX_FAKE_BADJSON:-}" ]; then printf 'not json at all\n'; exit 0; fi
+    printf '{"workspaces":[{"id":"a-real-live-workspace","custom_title":"decoy-in-title"},{"id":"other-ws"}]}\n' ;;
 esac
 exit 0
 SH
@@ -308,11 +314,25 @@ out=$(env -i HOME="$HOME" PATH="$PATHF" TERM_PROGRAM=iTerm.app \
 check "stale ids + a LIVE cmux still take the iTerm path" "yes" "$(bare)"
 has   "…so the tab is still tagged for cl stop" "$out" "1337;SetUserVar=clSession="
 check "…and the agent inherits no stale CMUX_* at all" "" "$(cat "$FIX/env.claude" 2>/dev/null)"
-# …while an id the live cmux DOES report takes the cmux path (no iTerm tag).
-rm -f "$FIX/argv.claude"
-out=$(env -i HOME="$HOME" PATH="$PATHF" TERM_PROGRAM=iTerm.app \
-        CMUX_WORKSPACE_ID=a-real-live-workspace bash "$CL" Solo 2>&1)
-hasnt "an id the live cmux affirms takes the cmux path (untagged)" "$out" "1337;SetUserVar=clSession="
+# Membership must be an EXACT field match, not a substring of the document.
+cmux_case() { # env-id -> prints "bare" or "cmux"
+  rm -f "$FIX/argv.claude" "$FIX/cmux.log"
+  env -i HOME="$HOME" PATH="$PATHF" TERM_PROGRAM=iTerm.app \
+      ${2:+CMUX_FAKE_BADJSON=1} CMUX_WORKSPACE_ID="$1" bash "$CL" Solo >"$FIX/case.out" 2>&1
+  if grep -qF 'rename-tab' "$FIX/cmux.log" 2>/dev/null; then echo cmux; else echo bare; fi
+}
+check "an id that is a SUBSTRING of a live one is not affirmed" "bare" "$(cmux_case workspace)"
+check "an id appearing only in a title field is not affirmed"   "bare" "$(cmux_case decoy-in-title)"
+check "unparseable JSON leaves the context unaffirmed"          "bare" "$(cmux_case a-real-live-workspace bad)"
+
+# The affirmed path must be shown to RUN, not merely to omit the iTerm tag —
+# an aborted command omits it too.
+check "an exact id match takes the cmux path" "cmux" "$(cmux_case a-real-live-workspace)"
+# In cmux the agent is launched THROUGH cmux (claude_cmd -> `cmux claude-teams`),
+# so proof of launch is in the cmux log, not in a bare claude invocation.
+has   "…and the agent really was launched, resuming this session" \
+      "$(cat "$FIX/cmux.log")" "claude-teams --resume $SID"
+hasnt "…without the iTerm tab tag" "$(cat "$FIX/case.out")" "1337;SetUserVar=clSession="
 
 printf 'stop revalidates identity at the destructive boundary\n'
 # cl stop can sit on a "kill it anyway?" prompt for as long as a person takes.

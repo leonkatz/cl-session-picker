@@ -194,9 +194,18 @@ in_cmux() {
   _CL_IN_CMUX=no
   [ -n "${CMUX_WORKSPACE_ID:-}" ] || return 1
   command -v cmux >/dev/null 2>&1 || return 1
-  case "$(cmux workspace list --json 2>/dev/null)" in
-    *"$CMUX_WORKSPACE_ID"*) _CL_IN_CMUX=yes; return 0 ;;
-  esac
+  # Structural, exact comparison against the `.workspaces[].id` field. A
+  # substring test over the raw JSON is not affirmation: the id `workspace`
+  # matches a live `a-real-live-workspace`, and an id can match a title,
+  # directory or any other value in the document. jq is already this tool's
+  # dependency for stop/start; if it or the command or the schema is missing,
+  # the context is simply unaffirmed — the safe direction.
+  command -v jq >/dev/null 2>&1 || return 1
+  if cmux workspace list --json 2>/dev/null \
+     | jq -e --arg id "$CMUX_WORKSPACE_ID" \
+         'any((.workspaces // [])[]?; (.id // "") == $id)' >/dev/null 2>&1; then
+    _CL_IN_CMUX=yes; return 0
+  fi
   return 1
 }
 

@@ -367,11 +367,19 @@ is running, stale ids inherited from a dead context look authoritative again
 and the launch goes down the cmux branch anyway. An id cmux cannot affirm means
 stale, and the normal host path is taken.
 
-Two earlier attempts are recorded because both looked right: `pgrep -f` on the
+The comparison is structural — jq against `.workspaces[].id` — not a substring
+of the raw JSON: an id like `workspace` is a substring of a live
+`a-real-live-workspace`, and any id can also appear in a title, a directory or
+some other field. jq is already required for stop/start; if it, the command, or
+the schema is missing, the context is simply unaffirmed.
+
+Three earlier attempts are recorded because each looked right: `pgrep -f` on the
 app path matched *nothing* on a machine where cmux was demonstrably running
 (`cmux.app/Contents` matched, one character more did not) and `pgrep -f` also
-matches the shell running the check, so a pattern can find itself; and a
-literal `ps` snapshot fixed that but still only proved "a cmux exists". Surfaces
+matches the shell running the check, so a pattern can find itself; a
+literal `ps` snapshot fixed that but still only proved "a cmux exists"; and a
+substring test over the workspace JSON proved only that the id appeared
+*somewhere* in the document. Surfaces
 cannot be validated this way — cmux lists them by ref, not uuid — so a pane
 carrying only `CMUX_SURFACE_ID` counts as unaffirmed, the safe direction.
 
