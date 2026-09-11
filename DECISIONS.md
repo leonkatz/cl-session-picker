@@ -341,6 +341,32 @@ No behavioural test can catch that — the cleanup's lock exists for
 microseconds — so the duplication is removed rather than tested around, and
 what remains asserted is the shape the shared function produces.
 
+**Identity is re-proved at the destructive boundary, and ownership outlives the
+signal.** `cl stop` can sit on a "kill it anyway?" prompt for as long as a
+person takes to answer; the original process can exit in that window and its
+pid be reused, so `retire_process` re-checks pid+start-token immediately before
+signalling and reports "exited while stop was deciding" instead. And `kill`
+returning 0 proves delivery, not exit — while an agent runs its shutdown hooks
+it is still alive, and its record is the only thing preventing a second one, so
+the record is retired only after the exact process is confirmed gone (bounded
+wait; otherwise it is left in place).
+
+**`in_cmux` requires the cmux app to actually be running.** A tmux server
+started under cmux keeps `CMUX_*` in its *global* environment and hands them to
+every pane opened later — including panes opened from another terminal long
+after cmux quit. An environment-only test therefore reported "in cmux" inside
+iTerm, which would route launches down the cmux branch, skip the iTerm tab
+tagging, and dial a dead socket. Non-cmux launches also strip `CMUX_*` before
+exec, and `tmux_setup` clears them from the server's global environment, so the
+staleness does not propagate to the agent or to cmux's own hooks.
+
+*Detection detail:* matched literally against a captured `ps` snapshot, not
+with `pgrep -f`. On macOS `pgrep -f` matched this path inconsistently
+(`cmux.app/Contents` found it, one character more found nothing) and also
+matches the shell running the check, so a pattern can find itself. Matched on
+the app binary, never the CLI at `Contents/Resources/bin/cmux` — that is what
+cmux's hooks spawn, so matching it would call every hook invocation "running".
+
 **On testing this:** a wall-clock race between two `cl` invocations does not
 prove mutual exclusion — measured, it passes even with the lock removed,
 because process startup jitter serialises the two anyway. The suite therefore

@@ -168,7 +168,52 @@ tmux_name() {
 # cmux's Claude integration owns persistence/restore (quit cmux = save; relaunch
 # = resume by session id), so wrapping claude in tmux would only hide it from
 # cmux's lifecycle badges, Feed, and restore.
-in_cmux() { [ -n "${CMUX_SURFACE_ID:-}" ] || [ -n "${CMUX_WORKSPACE_ID:-}" ]; }
+# cmux_app_running: is the cmux APP process alive?
+#
+# Deliberately not `pgrep -f`: on macOS it matched this path inconsistently
+# (`cmux.app/Contents` found it, one character more found nothing), and it also
+# matches the very shell running the check, so a pattern can find itself. A
+# literal match against a captured ps snapshot has neither problem — no regex,
+# no second process in flight to match.
+#
+# Matched on the APP binary, never the CLI at Contents/Resources/bin/cmux —
+# that is what cmux's own hooks spawn, so matching it would call every hook
+# invocation "cmux is running".
+cmux_app_running() {
+  case "$(ps -axo command= 2>/dev/null)" in
+    *"cmux.app/Contents/MacOS/cmux"*) return 0 ;;
+  esac
+  return 1
+}
+
+# in_cmux: is this shell really hosted by a running cmux?
+#
+# The environment alone is not enough. A long-lived tmux server started under
+# cmux keeps CMUX_* in its GLOBAL environment, and every later pane inherits
+# them — including panes opened from another terminal long after cmux quit. An
+# env-only test then reports "in cmux" in iTerm, which would route launches
+# down the cmux branch, skip the iTerm tab tagging, and talk to a dead socket.
+# So the app itself must be running. Matched on the APP binary, never the CLI
+# at Contents/Resources/bin/cmux — that is what cmux's own hooks spawn.
+# Memoised: this runs on every launch decision and pgrep is not free.
+in_cmux() {
+  case "${_CL_IN_CMUX:-}" in yes) return 0 ;; no) return 1 ;; esac
+  if { [ -n "${CMUX_SURFACE_ID:-}" ] || [ -n "${CMUX_WORKSPACE_ID:-}" ]; } \
+     && cmux_app_running; then
+    _CL_IN_CMUX=yes; return 0
+  fi
+  _CL_IN_CMUX=no; return 1
+}
+
+# drop_cmux_env: strip inherited CMUX_* before exec'ing an agent outside cmux.
+# Otherwise the agent — and cmux's own Claude hooks, which fire on every tool
+# call — believe they are inside cmux and dial a socket that is not there.
+drop_cmux_env() {
+  local v
+  for v in $(env | sed -n 's/^\(CMUX_[A-Za-z0-9_]*\)=.*/\1/p'); do
+    unset "$v" 2>/dev/null
+  done
+}
 
 # in_iterm: this shell is hosted by iTerm2 itself. Distinct from iterm_running:
 # "iTerm is open somewhere" is the wrong gate for OPENING tabs — with cmux in
@@ -354,6 +399,31 @@ registered_pid() { # name [agent] -> live pid we launched, or nothing
   return 0
 }
 
+# retire_process <pid> <token> <label>: signal EXACTLY the process identified
+# by that pid+start-token pair, then wait for it to actually go.
+#
+# Revalidating at the destructive boundary is the point. `cl stop` may sit on a
+# "kill it anyway?" prompt for as long as a person takes to answer; the original
+# process can exit in that window and its pid be reused, and an unrevalidated
+# `kill` would then signal a stranger. Prints nothing and returns 1 when the
+# identity no longer matches — the caller reports it as "exited while deciding".
+#
+# Returns 0 when the process is confirmed gone, 2 when it was signalled but is
+# still shutting down (SessionEnd hooks can take a moment). A caller must NOT
+# retire the ownership record in that case: until the process is really gone,
+# that record is the only thing stopping a second agent from launching.
+retire_process() { # pid token [exit-wait-tries]
+  local i=0 max="${3:-30}"
+  [ -n "$1" ] && [ -n "$2" ] || return 1
+  [ "$(start_token "$1")" = "$2" ] || return 1     # not the process we meant
+  kill "$1" 2>/dev/null || return 1
+  while [ "$(start_token "$1")" = "$2" ]; do
+    i=$((i+1)); [ "$i" -gt "$max" ] && return 2
+    sleep 0.1
+  done
+  return 0
+}
+
 # acquire_launch <name> <agent> [sid]: claim this session, or print the pid
 # that already owns it and return 1.
 #
@@ -486,6 +556,15 @@ tmux_setup() {
   tmux set -g allow-passthrough on 2>/dev/null
   tmux set -s extended-keys on 2>/dev/null
   tmux set -as terminal-features 'xterm*:extkeys' 2>/dev/null
+  # The server outlives the cmux session that started it and keeps CMUX_* in
+  # its global environment, so every later pane inherits them. Clear them when
+  # this launch is not in cmux, or those panes keep failing at a dead socket.
+  if ! in_cmux; then
+    local _v
+    for _v in $(tmux show-environment -g 2>/dev/null | sed -n 's/^\(CMUX_[A-Za-z0-9_]*\)=.*/\1/p'); do
+      tmux set-environment -gu "$_v" 2>/dev/null
+    done
+  fi
 }
 
 # iterm_running: true when iTerm2 is actually running. Env vars are unreliable
@@ -571,7 +650,7 @@ launch_session() { # name sid cwd [agent]
     elif [ "$arc" -ne 0 ]; then
       exit 1   # acquire_launch already said exactly what went wrong
     fi
-    cd "$cwd" || exit 1; eval "exec $cmd"
+    drop_cmux_env; cd "$cwd" || exit 1; eval "exec $cmd"
   fi
 }
 
@@ -589,7 +668,7 @@ launch_new() { # cwd [agent]
     tmux_setup
     exec tmux new-session -A -s "$t" -c "$cwd" "$cmd"
   else
-    cd "$cwd" || exit 1; eval "exec $cmd"
+    drop_cmux_env; cd "$cwd" || exit 1; eval "exec $cmd"
   fi
 }
 
@@ -630,7 +709,7 @@ launch_named() { # name cwd [agent]
     elif [ "$arc" -ne 0 ]; then
       exit 1
     fi
-    cd "$cwd" || exit 1; eval "exec $cmd"
+    drop_cmux_env; cd "$cwd" || exit 1; eval "exec $cmd"
   fi
 }
 
@@ -851,7 +930,7 @@ do_stop() {
   local count; count=$(jq 'length' "$STATE" 2>/dev/null || echo 0)
   printf 'saved %s session(s) to %s\n\n' "$count" "$STATE"
 
-  local name t ans pid ptok
+  local name t ans pid ptok rrc
   discover | while IFS=$'\t' read -r name sid cwd epoch agent; do
     [ "$agent" = "claude" ] || continue   # codex lifecycle is out of scope here
     t=$(tmux_name "$name")
@@ -900,13 +979,25 @@ do_stop() {
       printf '⏳ "%s" looks mid-task (pid %s). Kill it anyway? [y/N] ' "$name" "$pid" >&2
       read -r ans </dev/tty
       case "$ans" in
-        y|Y)  kill "$pid" 2>/dev/null \
-                && { printf '   killed %s\n' "$name" >&2; clear_launch "$name" claude "$pid" "$ptok"; [ "$close_tabs" = "1" ] && close_iterm_tab "$t"; close_cmux_surface "$sid" "$name"; } ;;
+        y|Y)  retire_process "$pid" "$ptok"; rrc=$?
+              case "$rrc" in
+                0) printf '   killed %s\n' "$name" >&2; clear_launch "$name" claude "$pid" "$ptok"
+                   [ "$close_tabs" = "1" ] && close_iterm_tab "$t"; close_cmux_surface "$sid" "$name" ;;
+                2) printf '   signalled %s — still shutting down, leaving it registered\n' "$name" >&2
+                   [ "$close_tabs" = "1" ] && close_iterm_tab "$t"; close_cmux_surface "$sid" "$name" ;;
+                *) printf '⚠ %s exited while stop was deciding — not signalling anything\n' "$name" >&2 ;;
+              esac ;;
         *)    printf '   left %s running — re-run cl stop later to close it\n' "$name" >&2 ;;
       esac
     else
-      kill "$pid" 2>/dev/null \
-        && { printf '✓ killed %s\n' "$name" >&2; clear_launch "$name" claude "$pid" "$ptok"; [ "$close_tabs" = "1" ] && close_iterm_tab "$t"; close_cmux_surface "$sid" "$name"; }
+      retire_process "$pid" "$ptok"; rrc=$?
+      case "$rrc" in
+        0) printf '✓ killed %s\n' "$name" >&2; clear_launch "$name" claude "$pid" "$ptok"
+           [ "$close_tabs" = "1" ] && close_iterm_tab "$t"; close_cmux_surface "$sid" "$name" ;;
+        2) printf '✓ signalled %s — still shutting down, leaving it registered\n' "$name" >&2
+           [ "$close_tabs" = "1" ] && close_iterm_tab "$t"; close_cmux_surface "$sid" "$name" ;;
+        *) printf '⚠ %s exited before stop could signal it\n' "$name" >&2 ;;
+      esac
     fi
   done
   printf '\nstate saved. Run cl start to bring these back.\n' >&2

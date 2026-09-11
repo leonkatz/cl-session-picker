@@ -36,6 +36,7 @@ printf '{"cwd":"%s"}\n{"customTitle":"Solo Two"}\n' "$FIX/work" > "$HOME/.claude
 cat > "$FIX/bin/claude" <<SH
 #!/bin/sh
 for a in "\$@"; do printf '%s\n' "\$a"; done > "$FIX/argv.claude"
+env | grep '^CMUX_' > "$FIX/env.claude" 2>/dev/null
 exit 0
 SH
 cat > "$FIX/bin/tmux" <<SH
@@ -52,7 +53,18 @@ cat > "$FIX/bin/osascript" <<SH
 echo true
 exit 0
 SH
-chmod +x "$FIX/bin/claude" "$FIX/bin/tmux" "$FIX/bin/osascript" || setup_failed "chmod"
+# A pass-through `ps` that hides ONLY the cmux app line, so "cmux is not
+# running" can be simulated on a machine where it is. Everything else — start
+# times, the process table used by liveness checks — behaves normally.
+cat > "$FIX/bin/ps" <<SH
+#!/bin/sh
+/bin/ps "\$@" | grep -vF 'cmux.app/Contents/MacOS/cmux'
+SH
+chmod +x "$FIX/bin/claude" "$FIX/bin/tmux" "$FIX/bin/osascript" "$FIX/bin/ps" || setup_failed "chmod"
+# Prove the fake actually hides it, or the cmux cases below test nothing.
+case "$(PATH="$FIX/bin:/usr/bin:/bin" ps -axo command= 2>/dev/null)" in
+  *"cmux.app/Contents/MacOS/cmux"*) setup_failed "the ps fake does not hide the cmux app line" ;;
+esac
 PATHF="$FIX/bin:/usr/bin:/bin:/usr/sbin"
 
 printf 'launch host\n'
@@ -76,7 +88,7 @@ REGLIB="$FIX/reglib.sh"
 { sed -n '/^tmux_name() {/,/^}/p' "$CL"
   awk '/^PID_DIR=/{f=1} /^session_pid\(\) \{/{f=0} f' "$CL"
   sed -n '/^session_pid() {/,/^}/p' "$CL"; } > "$REGLIB"
-for fn in registered_pid acquire_launch reg_file clear_launch session_pid claim_token start_token; do
+for fn in registered_pid acquire_launch reg_file clear_launch session_pid claim_token start_token retire_process; do
   grep -q "^${fn}()" "$REGLIB" || setup_failed "$fn not extracted from $CL"
 done
 # shellcheck disable=SC1090
@@ -283,6 +295,52 @@ check "a directory at the claim path is refused, not walked into" "2" "$rc"
 check "…and nothing was created inside it" "0" "$(find "$STRAY" -mindepth 1 | wc -l | tr -d ' ')"
 rmdir "$STRAY" 2>/dev/null
 rm -rf "$HOME/.config/claude-session/pids"
+
+printf 'stale CMUX_* does not make a launch think it is in cmux\n'
+# A tmux server started under cmux keeps CMUX_* in its GLOBAL environment, so
+# panes opened from iTerm long after cmux quit inherit them. An env-only test
+# then routes the launch down the cmux branch: no iTerm tab tag, and hooks
+# dialling a socket that is not there.
+rm -f "$FIX/argv.claude" "$FIX/env.claude"
+out=$(env -i HOME="$HOME" PATH="$PATHF" TERM_PROGRAM=iTerm.app \
+        CMUX_WORKSPACE_ID=stale-ws CMUX_SURFACE_ID=stale-surf CMUX_SOCKET_PATH=/nope \
+        bash "$CL" Solo 2>&1)
+check "with cmux NOT running, the iTerm path is taken" "yes" "$(bare)"
+has   "…so the tab is still tagged for cl stop" "$out" "1337;SetUserVar=clSession="
+check "…and the agent inherits no stale CMUX_* at all" "" "$(cat "$FIX/env.claude" 2>/dev/null)"
+
+printf 'stop revalidates identity at the destructive boundary\n'
+# cl stop can sit on a "kill it anyway?" prompt for as long as a person takes.
+# The original process can exit in that window and its pid be reused, so the
+# identity must be re-proved immediately before the signal — never once at the
+# top of the loop.
+sleep 60 & VICTIM=$!
+sleep 0.3
+VTOK=$(start_token "$VICTIM"); [ -n "$VTOK" ] || setup_failed "no token for the victim process"
+retire_process "$VICTIM" "not-the-token-we-saw" >/dev/null 2>&1; rrc=$?
+check "a changed start token means no signal is sent" "1" "$rrc"
+check "…and the process is untouched"                 "alive" "$(kill -0 "$VICTIM" 2>/dev/null && echo alive || echo dead)"
+retire_process "$VICTIM" "$VTOK" >/dev/null 2>&1; rrc=$?
+check "the matching identity IS signalled, and exit confirmed" "0" "$rrc"
+check "…and it really is gone" "dead" "$(kill -0 "$VICTIM" 2>/dev/null && echo alive || echo dead)"
+
+printf 'ownership survives a slow shutdown\n'
+# kill returning 0 proves signal delivery, not exit. While the agent runs its
+# SessionEnd hooks it is still alive, and its record is the only thing stopping
+# a second one from launching — so the record must NOT be retired yet.
+cat > "$FIX/stubborn.sh" <<'SH'
+#!/bin/sh
+trap 'sleep 9' TERM
+sleep 60
+SH
+chmod +x "$FIX/stubborn.sh"
+"$FIX/stubborn.sh" & STUBBORN=$!
+sleep 0.4
+STOK=$(start_token "$STUBBORN"); [ -n "$STOK" ] || setup_failed "no token for the stubborn process"
+retire_process "$STUBBORN" "$STOK" 5 >/dev/null 2>&1; rrc=$?
+check "a process still shutting down reports 'signalled, not gone'" "2" "$rrc"
+check "…and is indeed still alive" "alive" "$(kill -0 "$STUBBORN" 2>/dev/null && echo alive || echo dead)"
+kill -9 "$STUBBORN" 2>/dev/null; wait "$STUBBORN" 2>/dev/null
 
 printf 'two launchers racing: exactly one reaches the agent (smoke)\n'
 # Kept as a smoke test of the whole path, NOT as the atomicity proof — see
