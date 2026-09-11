@@ -271,6 +271,30 @@ outside tmux are registered, which is exactly the set nothing else can
 identify. (Design chosen after review flagged the substring bug; the cheaper
 "refuse ambiguous matches" floor was rejected because this is a kill path.)
 
+Two further properties, both added after a second review round:
+
+* **The key is a digest of agent + the exact name**, not `tmux_name`'s
+  sanitiser. That sanitiser maps `A B` and `A.B` to one identity — harmless
+  under tmux, where `new-session -A` made colliding names share a single
+  session so two owners could not exist, but bare they both launch and the
+  second record overwrites the first, handing one session's pid to the other's
+  kill path. The record also stores the agent and name, and is rejected if
+  they do not match, so a digest collision could not kill the wrong session
+  either.
+* **Acquisition is atomic**, guarded by `mkdir`. A check followed by a write is
+  not: two tabs running `cl <name>` together could both see nothing, both
+  write, and both exec an agent on one transcript. `tmux new-session -A` had
+  been that arbiter; without tmux this is. A launcher that dies holding the
+  lock is reclaimed after a few seconds, which is safe because the record
+  inside is still validated.
+
+**On testing this:** a wall-clock race between two `cl` invocations does not
+prove mutual exclusion — measured, it passes even with the lock removed,
+because process startup jitter serialises the two anyway. The suite therefore
+proves the property directly (while a claim is held, `acquire_launch` must
+block), and keeps the two-launcher race only as a smoke test of the whole
+path.
+
 **Also fixed, found by the new tests:** `do_stop`'s "is this agent owned by a
 tmux server?" guard compared the parent's whole command line against `*tmux*`,
 so any parent whose arguments merely mentioned tmux silently skipped the kill.

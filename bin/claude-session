@@ -275,27 +275,71 @@ resume_cmd() {
 # two names that collide there collide here too — the same pre-existing
 # equivalence, not a new one.
 PID_DIR="$HOME/.config/claude-session/pids"
-reg_file() { printf '%s/%s' "$PID_DIR" "$(tmux_name "$1" "${2:-claude}")"; }
 
-register_launch() { # name [agent] — call immediately before exec'ing the agent
-  local f; f=$(reg_file "$1" "${2:-claude}")
-  mkdir -p "$PID_DIR" 2>/dev/null || return 0
-  printf '%s\t%s\n' "$$" "$(ps -o lstart= -p $$ 2>/dev/null | tr -s ' ')" > "$f" 2>/dev/null || true
-  return 0
+# The key is a digest of agent + the EXACT name, never tmux_name's sanitiser:
+# that maps `A B` and `A.B` to one identity. Under tmux that was harmless —
+# `new-session -A` made colliding names share one session, so two owners could
+# not exist. Bare, both launch, the second record overwrites the first, and a
+# kill path then reads someone else's pid. The record also carries the agent
+# and name so a mismatch can be caught even if a digest ever collided.
+reg_file() { # name [agent]
+  local key
+  key=$(printf '%s\037%s' "${2:-claude}" "$1" | shasum -a 256 2>/dev/null | cut -c1-40)
+  [ -n "$key" ] || key=$(printf '%s\037%s' "${2:-claude}" "$1" | cksum | tr -d ' ')
+  printf '%s/%s' "$PID_DIR" "$key"
 }
 
 clear_launch() { rm -f "$(reg_file "$1" "${2:-claude}")" 2>/dev/null; return 0; }
 
 registered_pid() { # name [agent] -> live pid we launched, or nothing
-  local f pid started now
+  local f pid started ragent rname now
   f=$(reg_file "$1" "${2:-claude}")
   [ -r "$f" ] || return 0
-  IFS=$(printf '\t') read -r pid started < "$f" || return 0
+  IFS=$(printf '\t') read -r pid started ragent rname < "$f" || return 0
   case "$pid" in ''|*[!0-9]*) rm -f "$f"; return 0 ;; esac
+  # A record must prove it is about THIS session before a kill path sees it.
+  if [ "$ragent" != "${2:-claude}" ] || [ "$rname" != "$1" ]; then rm -f "$f"; return 0; fi
   now=$(ps -o lstart= -p "$pid" 2>/dev/null | tr -s ' ')
   # Gone, or the pid was recycled into a different process: the record is a
   # lie, so delete it rather than hand a stranger's pid to a kill path.
   if [ -n "$now" ] && [ "$now" = "$started" ]; then printf '%s\n' "$pid"; else rm -f "$f"; fi
+  return 0
+}
+
+# acquire_launch <name> <agent> [sid]: claim this session, or print the pid
+# that already owns it and return 1.
+#
+# Atomic on purpose. A check followed by a write is not: two tabs running
+# `cl <name>` together could both see nothing, both write, and both exec an
+# agent on one transcript. `tmux new-session -A` used to be that arbiter; with
+# no tmux we have to be it. mkdir is the atomic primitive — it either creates
+# the directory or fails — so the check and the claim happen under it.
+acquire_launch() {
+  local f lock owner tries=0
+  f=$(reg_file "$1" "${2:-claude}"); lock="${f}.lock"
+  mkdir -p "$PID_DIR" 2>/dev/null || return 0   # no registry: never block a launch
+  while ! mkdir "$lock" 2>/dev/null; do
+    tries=$((tries+1))
+    if [ "$tries" -gt 30 ]; then
+      # Whoever held it died mid-claim. Reclaiming is safe: the record inside
+      # is still validated below, so a live session cannot be handed away.
+      rm -rf "$lock" 2>/dev/null
+      continue
+    fi
+    sleep 0.1
+  done
+  owner=""
+  [ -z "${3:-}" ] || owner=$(session_pid "$3" "${2:-claude}" "$1")
+  [ -n "$owner" ] || owner=$(registered_pid "$1" "${2:-claude}")
+  if [ -n "$owner" ]; then
+    rm -rf "$lock" 2>/dev/null
+    printf '%s\n' "$owner"
+    return 1
+  fi
+  # exec keeps this pid AND this start time, so the record describes the agent
+  # that is about to replace this shell.
+  printf '%s\t%s\t%s\t%s\n' "$$" "$(ps -o lstart= -p $$ 2>/dev/null | tr -s ' ')" "${2:-claude}" "$1" > "$f" 2>/dev/null
+  rm -rf "$lock" 2>/dev/null
   return 0
 }
 
@@ -389,18 +433,16 @@ launch_session() { # name sid cwd [agent]
   local name="$1" sid="$2" cwd="$3" agent="${4:-claude}" t pid cmd
   t=$(tmux_name "$name" "$agent"); [ -d "$cwd" ] || cwd="$HOME"
   cmd=$(resume_cmd "$agent" "$sid")
-  # `tmux new-session -A` attaches instead of duplicating; nothing does that for
-  # us otherwise, so refuse a second launch ourselves — in cmux and in a bare
-  # terminal alike. (`cl start` can otherwise open a tab for a session `cl stop`
-  # deliberately left running, and start a second agent on the same transcript.)
-  if ! use_tmux; then
+  # `tmux new-session -A` attaches instead of duplicating; nothing does that
+  # for us otherwise, so a second launch has to be refused here. cmux keeps the
+  # plain check (it owns its own workspace lifecycle); the bare path below uses
+  # the atomic claim, because there two tabs really can race.
+  if in_cmux; then
     pid=$(session_pid "$sid" "$agent" "$name")
     if [ -n "$pid" ]; then
       echo "\"$name\" already has a local process resuming it (pid $pid) — switch to its tab instead of resuming it twice." >&2
       exit 1
     fi
-  fi
-  if in_cmux; then
     cmux rename-tab "$name" >/dev/null 2>&1
     cd "$cwd" || exit 1; eval "exec $cmd"
   fi
@@ -411,7 +453,10 @@ launch_session() { # name sid cwd [agent]
     tmux_setup
     exec tmux new-session -A -s "$t" -c "$cwd" "$cmd"
   else
-    register_launch "$name" "$agent"
+    if ! pid=$(acquire_launch "$name" "$agent" "$sid"); then
+      echo "\"$name\" already has a local process resuming it (pid $pid) — switch to its tab instead of resuming it twice." >&2
+      exit 1
+    fi
     cd "$cwd" || exit 1; eval "exec $cmd"
   fi
 }
@@ -463,7 +508,11 @@ launch_named() { # name cwd [agent]
     tmux_setup
     exec tmux new-session -A -s "$t" -c "$cwd" "$cmd"
   else
-    register_launch "$name" "$agent"
+    local owner
+    if ! owner=$(acquire_launch "$name" "$agent"); then
+      echo "\"$name\" is already running (pid $owner) — switch to its tab instead of starting it twice." >&2
+      exit 1
+    fi
     cd "$cwd" || exit 1; eval "exec $cmd"
   fi
 }

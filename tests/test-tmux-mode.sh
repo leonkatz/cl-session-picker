@@ -74,21 +74,40 @@ printf 'launch registry — identity for a session with no id in its argv\n'
 # built exactly. Extraction failure aborts instead of vacuously passing.
 REGLIB="$FIX/reglib.sh"
 { sed -n '/^tmux_name() {/,/^}/p' "$CL"
-  awk '/^PID_DIR=/{f=1} /^session_pid\(\) \{/{f=0} f' "$CL"; } > "$REGLIB"
-grep -q '^registered_pid()' "$REGLIB"  || setup_failed "registered_pid not extracted from $CL"
-grep -q '^register_launch()' "$REGLIB" || setup_failed "register_launch not extracted from $CL"
+  awk '/^PID_DIR=/{f=1} /^session_pid\(\) \{/{f=0} f' "$CL"
+  sed -n '/^session_pid() {/,/^}/p' "$CL"; } > "$REGLIB"
+for fn in registered_pid acquire_launch reg_file clear_launch session_pid; do
+  grep -q "^${fn}()" "$REGLIB" || setup_failed "$fn not extracted from $CL"
+done
 # shellcheck disable=SC1090
 . "$REGLIB"
 
-register_launch "Solo"
-check "registers the calling process" "$$" "$(registered_pid "Solo")"
-register_launch "Solo Two"
-check "a longer name is a separate record" "$$" "$(registered_pid "Solo Two")"
-# The substring trap: matching ps text, `--name Solo` also matched `--name Solo
-# Two`, so cl stop could kill the wrong agent. Separate records cannot.
-check "'Solo' and 'Solo Two' keep distinct records" "2" \
-  "$(ls "$HOME/.config/claude-session/pids" 2>/dev/null | wc -l | tr -d ' ')"
-rm -f "$(reg_file 'Solo Two')"
+acquire_launch "Solo" claude || setup_failed "first acquire should succeed"
+check "the claim records the calling process" "$$" "$(registered_pid "Solo")"
+check "a second claim on a live session is refused" "1" \
+  "$(acquire_launch "Solo" claude >/dev/null; echo $?)"
+
+# Names that COLLIDE under tmux_name's sanitiser must not share a record.
+# Under tmux `new-session -A` made them one session so two owners could not
+# exist; bare, both launch, and a shared record hands one session's pid to the
+# other's kill path.
+check "tmux_name really does collide on these (the premise)" "same" \
+  "$([ "$(tmux_name 'A B')" = "$(tmux_name 'A.B')" ] && echo same || echo differ)"
+check "…but their record files differ" "differ" \
+  "$([ "$(reg_file 'A B' claude)" != "$(reg_file 'A.B' claude)" ] && echo differ || echo same)"
+acquire_launch "A B" claude  || setup_failed "acquire A B"
+acquire_launch "A.B" claude  || setup_failed "acquire A.B (must not be blocked by A B)"
+check "both colliding names are owned at once" "$$ $$" \
+  "$(registered_pid 'A B') $(registered_pid 'A.B')"
+clear_launch "A.B"
+check "clearing one leaves the other owned" "$$" "$(registered_pid 'A B')"
+clear_launch "A B"
+
+# Defence in depth: a record that does not name this session is not trusted
+# even if it were found under this key.
+printf '%s\t%s\t%s\t%s\n' "$$" "$(ps -o lstart= -p $$ | tr -s ' ')" claude "Someone Else" > "$(reg_file 'Solo Two' claude)"
+check "a record naming another session is rejected" "" "$(registered_pid 'Solo Two')"
+check "…and deleted" "0" "$([ -e "$(reg_file 'Solo Two' claude)" ] && echo 1 || echo 0)"
 
 printf '%s\t%s\n' 999999 "Mon Jan  1 00:00:00 2001" > "$(reg_file Dead)"
 check "a record whose process is gone yields nothing" "" "$(registered_pid Dead)"
@@ -136,6 +155,51 @@ has   "cl stop reported killing it" "$out" "killed Solo"
 has   "…and asked iTerm to close its tagged tab" "$(cat "$FIX/osascript.log")" "user.clSession"
 hasnt "no tmux server is no longer read as an empty fleet" "$out" "nothing to stop"
 kill "$LIVE" 2>/dev/null
+
+printf 'the claim is mutually exclusive (deterministic)\n'
+# A wall-clock race between two `cl` invocations does NOT prove this: measured
+# 2026-09-11, the two-launcher test below passes even with the lock removed,
+# because process startup jitter serialises them anyway. So prove the property
+# directly — while another launcher holds the claim, acquire_launch must WAIT
+# rather than walk through the check-and-write. With the lock gone it returns
+# immediately and this fails.
+rm -rf "$HOME/.config/claude-session/pids"
+mkdir -p "$HOME/.config/claude-session/pids" || setup_failed "mkdir pids"
+HELD="$(reg_file 'Locked' claude).lock"
+mkdir "$HELD" || setup_failed "could not simulate a held claim"
+( acquire_launch "Locked" claude >/dev/null 2>&1; echo done > "$FIX/acq.done" ) & ACQ=$!
+sleep 0.6
+check "blocked while another launcher holds the claim" "0" "$([ -e "$FIX/acq.done" ] && echo 1 || echo 0)"
+rmdir "$HELD" 2>/dev/null
+sleep 0.8
+check "proceeds once the claim is released" "1" "$([ -e "$FIX/acq.done" ] && echo 1 || echo 0)"
+wait "$ACQ" 2>/dev/null; rm -f "$FIX/acq.done"
+rm -rf "$HOME/.config/claude-session/pids"
+
+printf 'two launchers racing: exactly one reaches the agent (smoke)\n'
+# Kept as a smoke test of the whole path, NOT as the atomicity proof — see
+# above for that. Both launchers are released from one barrier.
+mkdir -p "$FIX/cbin" || setup_failed "mkdir cbin"
+cp "$FIX/bin/tmux" "$FIX/bin/osascript" "$FIX/cbin/" || setup_failed "cp fakes"
+cat > "$FIX/cbin/claude" <<SH
+#!/bin/sh
+printf 'launched\n' >> "$FIX/launches.log"
+exec sleep 4
+SH
+chmod +x "$FIX/cbin/claude" || setup_failed "chmod cbin/claude"
+rm -rf "$HOME/.config/claude-session/pids"; : > "$FIX/launches.log"; rm -f "$FIX/go"
+for i in 1 2; do
+  ( until [ -e "$FIX/go" ]; do sleep 0.02; done
+    env -i HOME="$HOME" PATH="$FIX/cbin:/usr/bin:/bin:/usr/sbin" TERM_PROGRAM=iTerm.app \
+      bash "$CL" "Solo Two" > "$FIX/c$i.out" 2>&1
+    echo $? > "$FIX/c$i.rc" ) &
+done
+sleep 0.4; : > "$FIX/go"; sleep 2
+[ -e "$FIX/c1.rc" ] || [ -e "$FIX/c2.rc" ] || setup_failed "neither launcher finished — barrier never released"
+check "exactly one launcher reached the agent" "1" "$(grep -c launched "$FIX/launches.log" | tr -d ' ')"
+check "the other exited 1"                     "1" "$(cat "$FIX/c1.rc" "$FIX/c2.rc" 2>/dev/null | grep -c '^1$' | tr -d ' ')"
+has   "…saying the session is already running" "$(cat "$FIX/c1.out" "$FIX/c2.out" 2>/dev/null)" "already has a local process"
+pkill -f 'cbin/claude' 2>/dev/null; wait 2>/dev/null
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
