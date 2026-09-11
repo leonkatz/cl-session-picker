@@ -42,28 +42,19 @@ cat > "$FIX/bin/cmux" <<CMUX
 #!/bin/sh
 case "\$1" in
   --help) echo "  codex-teams [codex-args...]"; exit 0 ;;
+  workspace) printf '{"workspaces":[{"id":"ws-under-test"}]}\n'; exit 0 ;;
   rename-tab) exit 0 ;;
   codex-teams) shift; for a in "\$@"; do printf '%s\n' "\$a"; done > "$FIX/argv.cmux"; exit 0 ;;
 esac
 exit 0
 CMUX
 chmod +x "$FIX/bin/cmux"
-# in_cmux now requires the cmux APP to be running, not just CMUX_* in the
-# environment — a tmux server started under cmux keeps those vars forever and
-# hands them to panes opened long after cmux quit. So stand up a process whose
-# command line looks like the app bundle's binary.
-mkdir -p "$FIX/cmux.app/Contents/MacOS"
-ln -sf "$(command -v perl)" "$FIX/cmux.app/Contents/MacOS/cmux"
-"$FIX/cmux.app/Contents/MacOS/cmux" -e 'sleep 60' & CMUXAPP=$!
-sleep 0.4
-case "$(ps -axo command= 2>/dev/null)" in
-  *"cmux.app/Contents/MacOS/cmux"*) : ;;
-  *) echo "FIXTURE SETUP FAILED: the fake cmux app is not visible in ps" >&2; kill "$CMUXAPP" 2>/dev/null; exit 2 ;;
-esac
-( cd "$FIX" && env -i HOME="$HOME" CODEX_HOME="$CODEX_HOME" PATH="$BASEPATH" CMUX_SURFACE_ID=x CL_CODEX_ARGS='--approve-for-me' bash "$CL" --codex T >/dev/null 2>&1 )
+# in_cmux asks the live cmux to affirm THIS shell's workspace id, so the fake
+# must report that id among its workspaces — presence of a cmux is not enough.
+( cd "$FIX" && env -i HOME="$HOME" CODEX_HOME="$CODEX_HOME" PATH="$BASEPATH" \
+    CMUX_WORKSPACE_ID=ws-under-test CL_CODEX_ARGS='--approve-for-me' \
+    bash "$CL" --codex T >/dev/null 2>&1 )
 check "cmux path forwards the same grammar to codex-teams" "--approve-for-me|resume|$SID" "$(paste -sd'|' - < "$FIX/argv.cmux")"
-
-kill "$CMUXAPP" 2>/dev/null
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

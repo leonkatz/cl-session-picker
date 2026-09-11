@@ -360,12 +360,20 @@ tagging, and dial a dead socket. Non-cmux launches also strip `CMUX_*` before
 exec, and `tmux_setup` clears them from the server's global environment, so the
 staleness does not propagate to the agent or to cmux's own hooks.
 
-*Detection detail:* matched literally against a captured `ps` snapshot, not
-with `pgrep -f`. On macOS `pgrep -f` matched this path inconsistently
-(`cmux.app/Contents` found it, one character more found nothing) and also
-matches the shell running the check, so a pattern can find itself. Matched on
-the app binary, never the CLI at `Contents/Resources/bin/cmux` — that is what
-cmux's hooks spawn, so matching it would call every hook invocation "running".
+*How the check is made:* cmux is asked to affirm **this shell's** workspace id
+— it must appear in the live instance's own `workspace list --json`. Presence
+of a cmux app is not enough: if cmux has since reopened, or a second instance
+is running, stale ids inherited from a dead context look authoritative again
+and the launch goes down the cmux branch anyway. An id cmux cannot affirm means
+stale, and the normal host path is taken.
+
+Two earlier attempts are recorded because both looked right: `pgrep -f` on the
+app path matched *nothing* on a machine where cmux was demonstrably running
+(`cmux.app/Contents` matched, one character more did not) and `pgrep -f` also
+matches the shell running the check, so a pattern can find itself; and a
+literal `ps` snapshot fixed that but still only proved "a cmux exists". Surfaces
+cannot be validated this way — cmux lists them by ref, not uuid — so a pane
+carrying only `CMUX_SURFACE_ID` counts as unaffirmed, the safe direction.
 
 **On testing this:** a wall-clock race between two `cl` invocations does not
 prove mutual exclusion — measured, it passes even with the lock removed,

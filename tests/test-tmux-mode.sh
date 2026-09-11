@@ -53,18 +53,17 @@ cat > "$FIX/bin/osascript" <<SH
 echo true
 exit 0
 SH
-# A pass-through `ps` that hides ONLY the cmux app line, so "cmux is not
-# running" can be simulated on a machine where it is. Everything else — start
-# times, the process table used by liveness checks — behaves normally.
-cat > "$FIX/bin/ps" <<SH
+# A cmux that is RUNNING and healthy, but whose live workspaces do not include
+# the stale id the environment carries. This is the case an app-presence check
+# gets wrong: cmux exists, so stale vars look authoritative.
+cat > "$FIX/bin/cmux" <<SH
 #!/bin/sh
-/bin/ps "\$@" | grep -vF 'cmux.app/Contents/MacOS/cmux'
-SH
-chmod +x "$FIX/bin/claude" "$FIX/bin/tmux" "$FIX/bin/osascript" "$FIX/bin/ps" || setup_failed "chmod"
-# Prove the fake actually hides it, or the cmux cases below test nothing.
-case "$(PATH="$FIX/bin:/usr/bin:/bin" ps -axo command= 2>/dev/null)" in
-  *"cmux.app/Contents/MacOS/cmux"*) setup_failed "the ps fake does not hide the cmux app line" ;;
+case "\$1 \$2" in
+  "workspace list") printf '{"workspaces":[{"id":"a-real-live-workspace"}]}\n' ;;
 esac
+exit 0
+SH
+chmod +x "$FIX/bin/claude" "$FIX/bin/tmux" "$FIX/bin/osascript" "$FIX/bin/cmux" || setup_failed "chmod"
 PATHF="$FIX/bin:/usr/bin:/bin:/usr/sbin"
 
 printf 'launch host\n'
@@ -298,16 +297,22 @@ rm -rf "$HOME/.config/claude-session/pids"
 
 printf 'stale CMUX_* does not make a launch think it is in cmux\n'
 # A tmux server started under cmux keeps CMUX_* in its GLOBAL environment, so
-# panes opened from iTerm long after cmux quit inherit them. An env-only test
-# then routes the launch down the cmux branch: no iTerm tab tag, and hooks
-# dialling a socket that is not there.
+# panes opened from iTerm long after that context died inherit them. Note the
+# fake cmux here is ALIVE and answering — this is the case "is a cmux app
+# running?" gets wrong, because presence is not identity. The stale workspace
+# id is simply not among the live ones.
 rm -f "$FIX/argv.claude" "$FIX/env.claude"
 out=$(env -i HOME="$HOME" PATH="$PATHF" TERM_PROGRAM=iTerm.app \
         CMUX_WORKSPACE_ID=stale-ws CMUX_SURFACE_ID=stale-surf CMUX_SOCKET_PATH=/nope \
         bash "$CL" Solo 2>&1)
-check "with cmux NOT running, the iTerm path is taken" "yes" "$(bare)"
+check "stale ids + a LIVE cmux still take the iTerm path" "yes" "$(bare)"
 has   "…so the tab is still tagged for cl stop" "$out" "1337;SetUserVar=clSession="
 check "…and the agent inherits no stale CMUX_* at all" "" "$(cat "$FIX/env.claude" 2>/dev/null)"
+# …while an id the live cmux DOES report takes the cmux path (no iTerm tag).
+rm -f "$FIX/argv.claude"
+out=$(env -i HOME="$HOME" PATH="$PATHF" TERM_PROGRAM=iTerm.app \
+        CMUX_WORKSPACE_ID=a-real-live-workspace bash "$CL" Solo 2>&1)
+hasnt "an id the live cmux affirms takes the cmux path (untagged)" "$out" "1337;SetUserVar=clSession="
 
 printf 'stop revalidates identity at the destructive boundary\n'
 # cl stop can sit on a "kill it anyway?" prompt for as long as a person takes.

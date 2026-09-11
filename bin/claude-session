@@ -168,41 +168,36 @@ tmux_name() {
 # cmux's Claude integration owns persistence/restore (quit cmux = save; relaunch
 # = resume by session id), so wrapping claude in tmux would only hide it from
 # cmux's lifecycle badges, Feed, and restore.
-# cmux_app_running: is the cmux APP process alive?
+# in_cmux: is this shell really a live cmux pane?
 #
-# Deliberately not `pgrep -f`: on macOS it matched this path inconsistently
-# (`cmux.app/Contents` found it, one character more found nothing), and it also
-# matches the very shell running the check, so a pattern can find itself. A
-# literal match against a captured ps snapshot has neither problem — no regex,
-# no second process in flight to match.
+# Neither the environment nor "a cmux is running somewhere" is enough. A tmux
+# server started under cmux keeps CMUX_* in its GLOBAL environment and hands
+# them to every pane opened later — including panes opened from another
+# terminal long after that cmux context died. If cmux has since reopened, or a
+# second instance is running, "an app exists" makes those stale ids look
+# authoritative and routes an iTerm launch down the cmux branch: no tab tag, no
+# claim, and commands aimed at a surface that no longer exists.
 #
-# Matched on the APP binary, never the CLI at Contents/Resources/bin/cmux —
-# that is what cmux's own hooks spawn, so matching it would call every hook
-# invocation "cmux is running".
-cmux_app_running() {
-  case "$(ps -axo command= 2>/dev/null)" in
-    *"cmux.app/Contents/MacOS/cmux"*) return 0 ;;
-  esac
-  return 1
-}
-
-# in_cmux: is this shell really hosted by a running cmux?
+# So ask cmux to affirm THIS shell's identity — the workspace id must appear in
+# the live instance's own workspace list. If it cannot be affirmed (cmux gone,
+# cmux restarted, ids belonging to some other context) the environment is
+# stale, and the normal host path is taken. The launch paths also strip CMUX_*
+# before exec, so nothing downstream inherits the lie.
 #
-# The environment alone is not enough. A long-lived tmux server started under
-# cmux keeps CMUX_* in its GLOBAL environment, and every later pane inherits
-# them — including panes opened from another terminal long after cmux quit. An
-# env-only test then reports "in cmux" in iTerm, which would route launches
-# down the cmux branch, skip the iTerm tab tagging, and talk to a dead socket.
-# So the app itself must be running. Matched on the APP binary, never the CLI
-# at Contents/Resources/bin/cmux — that is what cmux's own hooks spawn.
-# Memoised: this runs on every launch decision and pgrep is not free.
+# Surfaces cannot be checked this way — cmux lists them by ref, not by uuid —
+# so a pane carrying only CMUX_SURFACE_ID counts as unaffirmed, which is the
+# safe direction.
+#
+# Memoised: it shells out, and it is consulted on every launch decision.
 in_cmux() {
   case "${_CL_IN_CMUX:-}" in yes) return 0 ;; no) return 1 ;; esac
-  if { [ -n "${CMUX_SURFACE_ID:-}" ] || [ -n "${CMUX_WORKSPACE_ID:-}" ]; } \
-     && cmux_app_running; then
-    _CL_IN_CMUX=yes; return 0
-  fi
-  _CL_IN_CMUX=no; return 1
+  _CL_IN_CMUX=no
+  [ -n "${CMUX_WORKSPACE_ID:-}" ] || return 1
+  command -v cmux >/dev/null 2>&1 || return 1
+  case "$(cmux workspace list --json 2>/dev/null)" in
+    *"$CMUX_WORKSPACE_ID"*) _CL_IN_CMUX=yes; return 0 ;;
+  esac
+  return 1
 }
 
 # drop_cmux_env: strip inherited CMUX_* before exec'ing an agent outside cmux.
