@@ -3,11 +3,22 @@
 # Codex CLI sessions.
 #
 # Bound to `cl`. Auto-discovers every session you've /renamed (no registry to
-# maintain — name a session and it shows up), marks which are live in tmux, and
-# on select cd's into that session's dir and attaches/launches it in a persistent
-# tmux session. A "new … here" entry starts a fresh session in the current
-# directory. Claude launches with --dangerously-skip-permissions; Codex launches
-# with its own configured defaults (add flags via CL_CODEX_ARGS).
+# maintain — name a session and it shows up), marks which are live, and on
+# select cd's into that session's dir and launches or resumes it. A "new … here"
+# entry starts a fresh session in the current directory. Claude launches with
+# --dangerously-skip-permissions; Codex launches with its own configured
+# defaults (add flags via CL_CODEX_ARGS).
+#
+# Where the agent runs:
+#   in iTerm2  — as the tab's own process, NOT inside tmux, so iTerm's Claude
+#                Code integration (job-name triggers, status hooks) can see it.
+#                Trade-off: no detach — closing the tab ends the session, and
+#                Ctrl-Z suspends the agent (no tmux keybind to swallow it).
+#                Recovery is `cl <name>`, which resumes by session id.
+#                CL_TMUX=1 restores the old tmux wrapping instead.
+#   in cmux    — as the pane's own process; cmux owns persistence/restore.
+#   elsewhere  — inside tmux when available (detach/reattach is the only
+#                persistence there), otherwise directly.
 #
 # Usage:
 #   claude-session            # picker (fzf if available, numbered menu otherwise)
@@ -24,7 +35,7 @@
 #                             #   Covers cmux-native sessions too: their claude
 #                             #   processes are killed and surfaces closed.
 #   claude-session start      # relaunch every session from the last stop
-#                             #   (reattach if live, else resume by session id).
+#                             #   (skips any already live, else resumes by id).
 #                             #   In cmux: opens one workspace per session.
 #   claude-session restore    # restore state.json from the newest history
 #                             #   snapshot (add --list to pick; then run start)
@@ -157,13 +168,80 @@ tmux_name() {
 # cmux's Claude integration owns persistence/restore (quit cmux = save; relaunch
 # = resume by session id), so wrapping claude in tmux would only hide it from
 # cmux's lifecycle badges, Feed, and restore.
-in_cmux() { [ -n "${CMUX_SURFACE_ID:-}" ] || [ -n "${CMUX_WORKSPACE_ID:-}" ]; }
+# in_cmux: is this shell really a live cmux pane?
+#
+# Neither the environment nor "a cmux is running somewhere" is enough. A tmux
+# server started under cmux keeps CMUX_* in its GLOBAL environment and hands
+# them to every pane opened later — including panes opened from another
+# terminal long after that cmux context died. If cmux has since reopened, or a
+# second instance is running, "an app exists" makes those stale ids look
+# authoritative and routes an iTerm launch down the cmux branch: no tab tag, no
+# claim, and commands aimed at a surface that no longer exists.
+#
+# So ask cmux to affirm THIS shell's identity — the workspace id must appear in
+# the live instance's own workspace list. If it cannot be affirmed (cmux gone,
+# cmux restarted, ids belonging to some other context) the environment is
+# stale, and the normal host path is taken. The launch paths also strip CMUX_*
+# before exec, so nothing downstream inherits the lie.
+#
+# Surfaces cannot be checked this way — cmux lists them by ref, not by uuid —
+# so a pane carrying only CMUX_SURFACE_ID counts as unaffirmed, which is the
+# safe direction.
+#
+# Memoised: it shells out, and it is consulted on every launch decision.
+in_cmux() {
+  case "${_CL_IN_CMUX:-}" in yes) return 0 ;; no) return 1 ;; esac
+  _CL_IN_CMUX=no
+  [ -n "${CMUX_WORKSPACE_ID:-}" ] || return 1
+  command -v cmux >/dev/null 2>&1 || return 1
+  # Structural, exact comparison against the `.workspaces[].id` field. A
+  # substring test over the raw JSON is not affirmation: the id `workspace`
+  # matches a live `a-real-live-workspace`, and an id can match a title,
+  # directory or any other value in the document. jq is already this tool's
+  # dependency for stop/start; if it or the command or the schema is missing,
+  # the context is simply unaffirmed — the safe direction.
+  command -v jq >/dev/null 2>&1 || return 1
+  if cmux workspace list --json 2>/dev/null \
+     | jq -e --arg id "$CMUX_WORKSPACE_ID" \
+         'any((.workspaces // [])[]?; (.id // "") == $id)' >/dev/null 2>&1; then
+    _CL_IN_CMUX=yes; return 0
+  fi
+  return 1
+}
+
+# drop_cmux_env: strip inherited CMUX_* before exec'ing an agent outside cmux.
+# Otherwise the agent — and cmux's own Claude hooks, which fire on every tool
+# call — believe they are inside cmux and dial a socket that is not there.
+drop_cmux_env() {
+  local v
+  for v in $(env | sed -n 's/^\(CMUX_[A-Za-z0-9_]*\)=.*/\1/p'); do
+    unset "$v" 2>/dev/null
+  done
+}
 
 # in_iterm: this shell is hosted by iTerm2 itself. Distinct from iterm_running:
 # "iTerm is open somewhere" is the wrong gate for OPENING tabs — with cmux in
 # the picture it would open tabs in a terminal the user isn't looking at.
 # (iterm_running stays correct for CLOSING previously-tagged iTerm tabs.)
 in_iterm() { ! in_cmux && [ "${TERM_PROGRAM:-}" = "iTerm.app" ]; }
+
+# use_tmux: should this launch be wrapped in tmux?
+#
+# NOT in iTerm, by default. iTerm2 ships a Claude Code integration whose
+# profile triggers key on the tab's foreground job name, and whose status hooks
+# locate the tab from the agent's tty. Wrapped in tmux the job is `tmux` and the
+# tty is a tmux pty, so neither can find the tab — the integration silently does
+# nothing. Running the agent as the tab's own process is what makes it work,
+# which is the same reason the cmux path skips tmux (cmux owns persistence
+# there). CL_TMUX=1 opts back in, trading the integration for detach/reattach.
+#
+# Outside iTerm (Terminal.app, ssh, other emulators) nothing changes: tmux when
+# it is available, because there detach/reattach is the only persistence there is.
+use_tmux() {
+  command -v tmux >/dev/null 2>&1 || return 1
+  in_cmux && return 1   # cmux owns persistence; never nest tmux inside it
+  if in_iterm; then [ "${CL_TMUX:-0}" = "1" ]; else return 0; fi
+}
 
 # claude_cmd: the command used to start claude in a cmux pane. Defaults to
 # `cmux claude-teams`, which deploys cmux's fake-tmux shim so Agent Teams
@@ -228,10 +306,237 @@ resume_cmd() {
 # <sid>` argv here — and the npm launcher is a node wrapper plus a native
 # child that BOTH match. So: a hit is a conservative reason to refuse a second
 # launch; a miss proves nothing; and the pid must never be used as a kill target.
-session_pid() {
+# --- launch registry ---------------------------------------------------------
+# A session created by `cl new` runs `claude --name <name>`: its argv carries no
+# session id, so an id match cannot find it. `tmux has-session` used to cover
+# that; without tmux nothing did, and `cl stop` skipped the newest session while
+# reporting the fleet saved.
+#
+# Matching the NAME inside ps output is not a safe answer: ps renders the
+# command as text, so `--name Solo` is a substring of `--name Solo Two` and the
+# wrong agent gets killed. Instead, record the pid at launch. `exec` keeps both
+# the pid AND the process start time, so a record written by this shell just
+# before exec still describes the agent that replaces it — and the start time
+# makes pid reuse detectable. No command-text parsing anywhere.
+#
+# Only sessions this tool launched outside tmux are registered; that is exactly
+# the set nothing else can identify. A record judged stale is left in place for
+# the claim holder to overwrite — read paths never mutate one.
+PID_DIR="$HOME/.config/claude-session/pids"
+
+# The key is a digest of agent + the EXACT name. It deliberately does NOT reuse
+# tmux_name's sanitiser, which maps `A B` and `A.B` to one identity.
+# Under tmux that collision was harmless —
+# `new-session -A` made colliding names share one session, so two owners could
+# not exist. Bare, both launch, the second record overwrites the first, and a
+# kill path then reads someone else's pid. The record also carries the agent
+# and name so a mismatch can be caught even if a digest ever collided.
+reg_file() { # name [agent]
+  local key
+  key=$(printf '%s\037%s' "${2:-claude}" "$1" | shasum -a 256 2>/dev/null | cut -c1-40)
+  [ -n "$key" ] || key=$(printf '%s\037%s' "${2:-claude}" "$1" | cksum | tr -d ' ')
+  printf '%s/%s' "$PID_DIR" "$key"
+}
+
+# Remove a record ONLY if it still describes the exact owner being retired —
+# pid AND start token AND agent AND name — and only while holding that name's
+# claim. `cl stop` kills a pid and then cleans up; a new launcher can acquire
+# and register in between, and a replacement can even REUSE the dead pid, which
+# is exactly why the record carries a start token. Comparing the number alone
+# would delete that replacement's registration. If the claim cannot be taken,
+# the record is left alone — a stale record is inert, a deleted live one is not.
+#
+# The caller must capture the token BEFORE killing: it cannot be read back out
+# of a dead process.
+clear_launch() { # name agent expected-pid expected-token
+  local f lock me rpid rtok ragent rname
+  [ -n "${3:-}" ] && [ -n "${4:-}" ] || return 0
+  f=$(reg_file "$1" "${2:-claude}"); lock="${f}.lock"
+  [ -r "$f" ] || return 0
+  # A real start token, not a placeholder: acquire_launch parses this target as
+  # pid:token, so "cleanup" would make a LIVE cleanup holder look like a dead
+  # one and tell the user to delete a perfectly valid lock.
+  me=$(claim_token); case "$me" in *:) return 0 ;; esac
+  ln -s "$me" "$lock" 2>/dev/null || return 0
+  IFS=$(printf '\t') read -r rpid rtok ragent rname < "$f" 2>/dev/null
+  if [ "$rpid" = "$3" ] && [ "$rtok" = "$4" ] \
+     && [ "$ragent" = "${2:-claude}" ] && [ "$rname" = "$1" ]; then
+    rm -f "$f" 2>/dev/null
+  fi
+  rm -f "$lock" 2>/dev/null
+  return 0
+}
+
+# start_token <pid>: the process's start time as one whitespace-free word, so
+# it can live in a record field or a symlink target. Empty if the process is
+# gone — callers treat empty as "cannot prove anything about this pid".
+start_token() { ps -o lstart= -p "${1:-$$}" 2>/dev/null | tr -s ' ' | tr ' ' '_'; }
+
+# claim_token: the lock symlink's target — `<pid>:<start token>`. Both holders
+# of a claim (a launcher and a cleanup) MUST use this, because acquire_launch
+# parses the target back into pid and token to decide whether the holder is
+# still alive. A hand-written placeholder here made a running cleanup read as a
+# dead holder and told the user to delete a valid lock; one definition removes
+# the chance of the two drifting apart again.
+claim_token() { printf '%s:%s' "$$" "$(start_token $$)"; }
+
+
+# READ-ONLY on purpose. It used to delete records it judged stale, which is the
+# same validate-then-unlink-a-pathname race as the claim lock: a launcher
+# holding the lock can write a fresh record between the read and the delete,
+# and the cleanup would then remove the NEW owner's registration, leaving that
+# agent untracked and duplicable. A stale record is harmless — every reader
+# validates before trusting, and acquire_launch overwrites it while holding the
+# lock — so nothing here mutates.
+registered_pid() { # name [agent] -> live pid we launched, or nothing
+  local f pid started ragent rname now
+  f=$(reg_file "$1" "${2:-claude}")
+  [ -r "$f" ] || return 0
+  IFS=$(printf '\t') read -r pid started ragent rname < "$f" || return 0
+  case "$pid" in ''|*[!0-9]*) return 0 ;; esac
+  # A record must prove it is about THIS session before a kill path sees it.
+  [ "$ragent" = "${2:-claude}" ] && [ "$rname" = "$1" ] || return 0
+  now=$(start_token "$pid")
+  # Gone, or the pid was recycled into a different process: the record is a
+  # lie, so report nothing — but leave it for the lock holder to replace.
+  [ -n "$now" ] && [ "$now" = "$started" ] && printf '%s\n' "$pid"
+  return 0
+}
+
+# retire_process <pid> <token> <label>: signal EXACTLY the process identified
+# by that pid+start-token pair, then wait for it to actually go.
+#
+# Revalidating at the destructive boundary is the point. `cl stop` may sit on a
+# "kill it anyway?" prompt for as long as a person takes to answer; the original
+# process can exit in that window and its pid be reused, and an unrevalidated
+# `kill` would then signal a stranger. Prints nothing and returns 1 when the
+# identity no longer matches — the caller reports it as "exited while deciding".
+#
+# Returns 0 when the process is confirmed gone, 2 when it was signalled but is
+# still shutting down (SessionEnd hooks can take a moment). A caller must NOT
+# retire the ownership record in that case: until the process is really gone,
+# that record is the only thing stopping a second agent from launching.
+retire_process() { # pid token [exit-wait-tries]
+  local i=0 max="${3:-30}"
+  [ -n "$1" ] && [ -n "$2" ] || return 1
+  [ "$(start_token "$1")" = "$2" ] || return 1     # not the process we meant
+  kill "$1" 2>/dev/null || return 1
+  while [ "$(start_token "$1")" = "$2" ]; do
+    i=$((i+1)); [ "$i" -gt "$max" ] && return 2
+    sleep 0.1
+  done
+  return 0
+}
+
+# acquire_launch <name> <agent> [sid]: claim this session, or print the pid
+# that already owns it and return 1.
+#
+# Atomic on purpose. A check followed by a write is not: two tabs running
+# `cl <name>` together could both see nothing, both write, and both exec an
+# agent on one transcript. `tmux new-session -A` used to be that arbiter; with
+# no tmux we have to be it. mkdir is the atomic primitive — it either creates
+# the directory or fails — so the check and the claim happen under it.
+acquire_launch() {
+  local f lock me holder hpid hstart tries=0 envfail=0 owner back
+  me=$(start_token $$)
+  # Without a start token the record could never be validated later, so there
+  # is no safe way to own anything. Fail closed.
+  [ -n "$me" ] || { echo "claude-session: cannot read this process's start time — refusing to launch unowned" >&2; return 2; }
+  f=$(reg_file "$1" "${2:-claude}"); lock="${f}.lock"
+  mkdir -p "$PID_DIR" 2>/dev/null || { echo "claude-session: cannot create $PID_DIR — refusing to launch a session the registry cannot track" >&2; return 2; }
+
+  # The lock is a SYMLINK whose target names its owner. ln -s is atomic and
+  # carries the identity in the same operation, so there is never a window
+  # where the lock exists but its owner is unknown.
+  # `ln -s target dir` creates the link INSIDE the directory and reports
+  # success, so anything that is not a symlink sitting at the lock path would
+  # hand us a lock we do not actually hold. Refuse rather than pretend.
+  if [ -e "$lock" ] && [ ! -L "$lock" ]; then
+    echo "claude-session: $lock exists and is not a claim lock — remove it, then retry" >&2
+    return 2
+  fi
+  while ! ln -s "$(claim_token)" "$lock" 2>/dev/null; do
+    holder=$(readlink "$lock" 2>/dev/null)
+    if [ -z "$holder" ]; then
+      # Either the lock vanished between our attempt and the read (retrying is
+      # right), or links cannot be created here at all — in which case looping
+      # would spin forever, so fail closed after a few tries.
+      if [ ! -L "$lock" ] && [ ! -e "$lock" ]; then
+        envfail=$((envfail+1))
+        if [ "$envfail" -gt 5 ]; then
+          echo "claude-session: cannot create the claim lock in $PID_DIR — refusing to launch untracked" >&2
+          return 2
+        fi
+      fi
+      sleep 0.1; continue
+    fi
+    hpid=${holder%%:*}; hstart=${holder#*:}
+    # Reclaim ONLY on proof the holder is gone or its pid was recycled. Age is
+    # not proof: a holder merely slow in ps/pgrep/IO would have its lock stolen
+    # and two launchers would enter the critical section together.
+    # A stale lock is NEVER unlinked automatically. Validating the symlink and
+    # then `rm`-ing its pathname are two operations: between them another
+    # waiter can reclaim and establish a live claim, and the delete would then
+    # destroy THAT claim and let two launchers into the critical section. The
+    # start-token proof authenticates the object read, not the object later
+    # unlinked, and portable shell has no compare-and-swap to close that. So:
+    # report it and let a person clear it. (A launcher has to die inside a
+    # few-millisecond window to leave one, so this should be vanishingly rare.)
+    case "$hpid" in
+      ''|*[!0-9]*)
+        echo "claude-session: $lock is malformed — clear it, then retry:" >&2
+        echo "  rm -f $(printf '%q' "$lock")" >&2
+        return 2 ;;
+    esac
+    if [ "$(start_token "$hpid")" != "$hstart" ]; then
+      echo "claude-session: a previous launcher (pid $hpid) died holding the claim for \"$1\" — clear it, then retry:" >&2
+      echo "  rm -f $(printf '%q' "$lock")" >&2
+      return 2
+    fi
+    tries=$((tries+1))
+    if [ "$tries" -gt "${CL_CLAIM_WAIT_TRIES:-100}" ]; then
+      echo "claude-session: another launcher (pid $hpid) is still claiming \"$1\" — not launching; try again" >&2
+      return 2
+    fi
+    sleep 0.1
+  done
+
+  owner=""
+  [ -z "${3:-}" ] || owner=$(session_pid "$3" "${2:-claude}" "$1")
+  [ -n "$owner" ] || owner=$(registered_pid "$1" "${2:-claude}")
+  if [ -n "$owner" ]; then
+    rm -f "$lock" 2>/dev/null
+    printf '%s\n' "$owner"
+    return 1
+  fi
+  # exec keeps this pid AND this start time, so the record describes the agent
+  # that is about to replace this shell. Written, then read back: a record that
+  # did not land means the session would be unidentifiable, which is the whole
+  # failure this registry exists to prevent — so that fails closed too.
+  if ! printf '%s\t%s\t%s\t%s\n' "$$" "$me" "${2:-claude}" "$1" > "$f" 2>/dev/null; then
+    rm -f "$f" "$lock" 2>/dev/null
+    echo "claude-session: cannot write the ownership record in $PID_DIR — refusing to launch untracked" >&2
+    return 2
+  fi
+  back=$(registered_pid "$1" "${2:-claude}")
+  rm -f "$lock" 2>/dev/null
+  if [ "$back" != "$$" ]; then
+    rm -f "$f" 2>/dev/null
+    echo "claude-session: the ownership record did not verify — refusing to launch untracked" >&2
+    return 2
+  fi
+  return 0
+}
+
+session_pid() { # sid [agent] [name]
+  local pid
   case "${2:-claude}" in
     codex) pgrep -f "codex.* resume $1( |\$)" 2>/dev/null | head -1 ;;
-    *)     pgrep -f "(-resume|-session-id) $1" 2>/dev/null | head -1 ;;
+    *)
+      pid=$(pgrep -f "(-resume|-session-id) $1" 2>/dev/null | head -1)
+      [ -n "$pid" ] || [ -z "${3:-}" ] || pid=$(registered_pid "$3" claude)
+      printf '%s\n' "$pid"
+      ;;
   esac
 }
 
@@ -248,6 +553,22 @@ tmux_setup() {
   tmux set -g set-titles on 2>/dev/null
   tmux set -g set-titles-string "#S" 2>/dev/null
   tmux bind-key -n C-z if-shell -F '#{m:*sh,#{pane_current_command}}' 'send-keys C-z' '' 2>/dev/null
+  # Terminal features the agent needs and tmux withholds by default: OSC
+  # passthrough (notifications, progress) and extended keys (Shift+Enter).
+  # These do NOT make the iTerm integration work under tmux — job-name
+  # detection still sees `tmux` — they just make the opt-in path less degraded.
+  tmux set -g allow-passthrough on 2>/dev/null
+  tmux set -s extended-keys on 2>/dev/null
+  tmux set -as terminal-features 'xterm*:extkeys' 2>/dev/null
+  # The server outlives the cmux session that started it and keeps CMUX_* in
+  # its global environment, so every later pane inherits them. Clear them when
+  # this launch is not in cmux, or those panes keep failing at a dead socket.
+  if ! in_cmux; then
+    local _v
+    for _v in $(tmux show-environment -g 2>/dev/null | sed -n 's/^\(CMUX_[A-Za-z0-9_]*\)=.*/\1/p'); do
+      tmux set-environment -gu "$_v" 2>/dev/null
+    done
+  fi
 }
 
 # iterm_running: true when iTerm2 is actually running. Env vars are unreliable
@@ -306,8 +627,12 @@ launch_session() { # name sid cwd [agent]
   local name="$1" sid="$2" cwd="$3" agent="${4:-claude}" t pid cmd
   t=$(tmux_name "$name" "$agent"); [ -d "$cwd" ] || cwd="$HOME"
   cmd=$(resume_cmd "$agent" "$sid")
+  # `tmux new-session -A` attaches instead of duplicating; nothing does that
+  # for us otherwise, so a second launch has to be refused here. cmux keeps the
+  # plain check (it owns its own workspace lifecycle); the bare path below uses
+  # the atomic claim, because there two tabs really can race.
   if in_cmux; then
-    pid=$(session_pid "$sid" "$agent")
+    pid=$(session_pid "$sid" "$agent" "$name")
     if [ -n "$pid" ]; then
       echo "\"$name\" already has a local process resuming it (pid $pid) — switch to its tab instead of resuming it twice." >&2
       exit 1
@@ -315,12 +640,21 @@ launch_session() { # name sid cwd [agent]
     cmux rename-tab "$name" >/dev/null 2>&1
     cd "$cwd" || exit 1; eval "exec $cmd"
   fi
-  if command -v tmux >/dev/null 2>&1; then
-    in_iterm && tag_iterm_session "$t"   # so `cl stop` can close this tab later
+  # The iTerm tab is tagged in BOTH branches: `cl stop` closes tabs by that
+  # user variable, and that has nothing to do with tmux.
+  in_iterm && tag_iterm_session "$t"
+  if use_tmux; then
     tmux_setup
     exec tmux new-session -A -s "$t" -c "$cwd" "$cmd"
   else
-    cd "$cwd" || exit 1; eval "exec $cmd"
+    pid=$(acquire_launch "$name" "$agent" "$sid"); local arc=$?
+    if [ "$arc" -eq 1 ]; then
+      echo "\"$name\" already has a local process resuming it (pid $pid) — switch to its tab instead of resuming it twice." >&2
+      exit 1
+    elif [ "$arc" -ne 0 ]; then
+      exit 1   # acquire_launch already said exactly what went wrong
+    fi
+    drop_cmux_env; cd "$cwd" || exit 1; eval "exec $cmd"
   fi
 }
 
@@ -334,11 +668,11 @@ launch_new() { # cwd [agent]
     cd "$cwd" || exit 1; eval "exec $cmd"
   fi
   t="$agent-$(basename "$cwd")"
-  if command -v tmux >/dev/null 2>&1; then
+  if use_tmux; then
     tmux_setup
     exec tmux new-session -A -s "$t" -c "$cwd" "$cmd"
   else
-    cd "$cwd" || exit 1; eval "exec $cmd"
+    drop_cmux_env; cd "$cwd" || exit 1; eval "exec $cmd"
   fi
 }
 
@@ -366,12 +700,20 @@ launch_named() { # name cwd [agent]
     cd "$cwd" || exit 1; eval "exec $cmd"
   fi
   t=$(tmux_name "$name" "$agent")
-  if command -v tmux >/dev/null 2>&1; then
-    in_iterm && tag_iterm_session "$t"
+  in_iterm && tag_iterm_session "$t"
+  if use_tmux; then
     tmux_setup
     exec tmux new-session -A -s "$t" -c "$cwd" "$cmd"
   else
-    cd "$cwd" || exit 1; eval "exec $cmd"
+    local owner arc
+    owner=$(acquire_launch "$name" "$agent"); arc=$?
+    if [ "$arc" -eq 1 ]; then
+      echo "\"$name\" is already running (pid $owner) — switch to its tab instead of starting it twice." >&2
+      exit 1
+    elif [ "$arc" -ne 0 ]; then
+      exit 1
+    fi
+    drop_cmux_env; cd "$cwd" || exit 1; eval "exec $cmd"
   fi
 }
 
@@ -422,13 +764,15 @@ do_new() {
     exit 0
   fi
 
-  if ! command -v tmux >/dev/null 2>&1; then
-    launch_named "$name" "$cwd" "$agent"
-  fi
-
   if [ -t 1 ] && [ -t 0 ]; then
     # interactive: create + attach, like the picker
     launch_named "$name" "$cwd" "$agent"
+  elif ! use_tmux; then
+    # No TTY and nothing to detach into. Say so rather than exec a TTY-less
+    # agent that will exit immediately and look like a silent failure.
+    echo "claude-session: no TTY and not using tmux — cannot create '$name' detached." >&2
+    echo "  run cl new from a terminal, or set CL_TMUX=1 to create it in tmux." >&2
+    exit 1
   else
     # no TTY (script / Claude Bash call): create detached so the caller isn't
     # blocked on an attach — attach later with `cl "<name>"`.
@@ -544,7 +888,7 @@ save_state() {
     # agent field is recorded so a later reader can tell the two apart.
     discover | while IFS=$'\t' read -r name sid cwd epoch agent; do
       [ "$agent" = "claude" ] || continue
-      tmux has-session -t "$(tmux_name "$name")" 2>/dev/null || [ -n "$(session_pid "$sid")" ] || continue
+      tmux has-session -t "$(tmux_name "$name")" 2>/dev/null || [ -n "$(session_pid "$sid" claude "$name")" ] || continue
       [ "$first" -eq 1 ] && first=0 || printf ','
       jq -nc --arg name "$name" --arg sid "$sid" --arg cwd "$cwd" --arg agent "$agent" \
         '{name:$name, sid:$sid, cwd:$cwd, agent:$agent}'
@@ -575,10 +919,12 @@ do_stop() {
   command -v jq >/dev/null 2>&1 || { echo "claude-session: stop needs jq (brew install jq)" >&2; exit 1; }
   local keep_tabs=0
   [ "${1:-}" = "--keep-tabs" ] && keep_tabs=1
-  if ! tmux list-sessions >/dev/null 2>&1 && ! in_cmux; then
-    echo "claude-session: no tmux server running — nothing to stop" >&2
-    exit 0
-  fi
+  # No precondition here. "No tmux server" stopped meaning "nothing to stop"
+  # the moment sessions began running without tmux, and every cheap substitute
+  # (is any process named claude alive?) fails the same way: it cannot know
+  # every launch shape, and its failure direction is the unsafe one — report
+  # success having saved nothing and stopped nothing. Session discovery is the
+  # only thing that actually knows, so let it decide.
 
   # Also close each killed session's iTerm tab, unless opted out or not in iTerm.
   local close_tabs=0
@@ -588,7 +934,7 @@ do_stop() {
   local count; count=$(jq 'length' "$STATE" 2>/dev/null || echo 0)
   printf 'saved %s session(s) to %s\n\n' "$count" "$STATE"
 
-  local name t ans pid
+  local name t ans pid ptok rrc
   discover | while IFS=$'\t' read -r name sid cwd epoch agent; do
     [ "$agent" = "claude" ] || continue   # codex lifecycle is out of scope here
     t=$(tmux_name "$name")
@@ -614,26 +960,48 @@ do_stop() {
     # No tmux session — a cmux-native (or bare) claude: kill the process
     # itself. SIGTERM is a clean shutdown (SessionEnd hooks fire), then the
     # hosting surface (now a bare shell) is closed best-effort.
-    pid=$(session_pid "$sid"); [ -n "$pid" ] || continue
+    pid=$(session_pid "$sid" claude "$name"); [ -n "$pid" ] || continue
+    # Captured now: a dead process has no start time to read back, and without
+    # it cleanup cannot tell this owner from a replacement that reused the pid.
+    ptok=$(start_token "$pid")
     # Safety: a claude whose PARENT is a tmux server belongs to tmux — if we
     # can't see that server (different socket/user context), it is not ours
     # to process-kill. This branch only ever touches cmux/bare claudes.
     # (Learned the hard way 2026-07-31: a hidden tmux server let this branch
     # sweep 10 live tmux-hosted sessions.)
-    case "$(ps -o command= -p "$(ps -o ppid= -p "$pid" | tr -d ' ')" 2>/dev/null)" in
-      *tmux*) printf '⚠ skipping %s — owned by a tmux server not visible here\n' "$name" >&2; continue ;;
+    # Compare the parent's EXECUTABLE, not its whole command line: the old
+    # substring test matched any parent whose arguments merely mentioned tmux
+    # — a script with tmux in its path or filename was enough to silently skip
+    # a real session. (Found 2026-09-11 when a test file named
+    # test-tmux-mode.sh blocked its own kill.)
+    _ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+    _pcomm=$(ps -o comm= -p "${_ppid:-0}" 2>/dev/null); _pcomm=${_pcomm##*/}
+    case "$_pcomm" in
+      tmux*) printf '⚠ skipping %s — owned by a tmux server not visible here\n' "$name" >&2; continue ;;
     esac
     if claude_busy "$pid"; then
       printf '⏳ "%s" looks mid-task (pid %s). Kill it anyway? [y/N] ' "$name" "$pid" >&2
       read -r ans </dev/tty
       case "$ans" in
-        y|Y)  kill "$pid" 2>/dev/null \
-                && { printf '   killed %s\n' "$name" >&2; close_cmux_surface "$sid" "$name"; } ;;
+        y|Y)  retire_process "$pid" "$ptok"; rrc=$?
+              case "$rrc" in
+                0) printf '   killed %s\n' "$name" >&2; clear_launch "$name" claude "$pid" "$ptok"
+                   [ "$close_tabs" = "1" ] && close_iterm_tab "$t"; close_cmux_surface "$sid" "$name" ;;
+                2) printf '   signalled %s — still shutting down, leaving it registered\n' "$name" >&2
+                   [ "$close_tabs" = "1" ] && close_iterm_tab "$t"; close_cmux_surface "$sid" "$name" ;;
+                *) printf '⚠ %s exited while stop was deciding — not signalling anything\n' "$name" >&2 ;;
+              esac ;;
         *)    printf '   left %s running — re-run cl stop later to close it\n' "$name" >&2 ;;
       esac
     else
-      kill "$pid" 2>/dev/null \
-        && { printf '✓ killed %s\n' "$name" >&2; close_cmux_surface "$sid" "$name"; }
+      retire_process "$pid" "$ptok"; rrc=$?
+      case "$rrc" in
+        0) printf '✓ killed %s\n' "$name" >&2; clear_launch "$name" claude "$pid" "$ptok"
+           [ "$close_tabs" = "1" ] && close_iterm_tab "$t"; close_cmux_surface "$sid" "$name" ;;
+        2) printf '✓ signalled %s — still shutting down, leaving it registered\n' "$name" >&2
+           [ "$close_tabs" = "1" ] && close_iterm_tab "$t"; close_cmux_surface "$sid" "$name" ;;
+        *) printf '⚠ %s exited before stop could signal it\n' "$name" >&2 ;;
+      esac
     fi
   done
   printf '\nstate saved. Run cl start to bring these back.\n' >&2
@@ -702,13 +1070,23 @@ do_start() {
   #    then attaches it. Creating here (not relying on the tab) means a failed
   #    tab still leaves a recoverable session. launch_session execs, so we
   #    replicate its create-detached form (incl. tmux_setup).
-  command -v tmux >/dev/null 2>&1 && tmux_setup
-  local name sid cwd t i=0
+  use_tmux && tmux_setup
+  local name sid cwd t i=0 live_names=""
   while IFS=$'\t' read -r name sid cwd; do
     t=$(tmux_name "$name")
     [ -d "$cwd" ] || cwd="$HOME"
-    if tmux has-session -t "=${t}" 2>/dev/null; then
+    if ! use_tmux; then
+      # Without tmux there is nothing to pre-create: each tab's `cl <name>`
+      # execs the agent itself. Record the live ones so no tab is opened for
+      # them — `cl stop` leaves busy sessions running on purpose, and a tab
+      # for one would start a SECOND agent on the same transcript.
+      if [ -n "$(session_pid "$sid" claude "$name")" ]; then
+        printf '● %s already live\n' "$name"
+        live_names="${live_names}${name}"$'\n'
+      fi
+    elif tmux has-session -t "=${t}" 2>/dev/null; then
       printf '● %s already live\n' "$name"
+      live_names="${live_names}${name}"$'\n'
     else
       tmux new-session -d -s "$t" -c "$cwd" "claude --resume $(printf '%q' "$sid") --dangerously-skip-permissions" \
         && printf '✓ prepared %s  (%s)\n' "$name" "$cwd"
@@ -719,7 +1097,11 @@ do_start() {
   # 2. Open a real iTerm tab per session (or fall back to printing commands).
   #    Read names into an array first so the STATE file can be cleared safely.
   local -a names=()
-  while IFS= read -r name; do names+=("$name"); done < <(jq -r '.[].name' "$STATE")
+  while IFS= read -r name; do
+    # Skip the ones reported live above: opening a tab for them duplicates.
+    printf '%s' "$live_names" | grep -qxF -- "$name" && continue
+    names+=("$name")
+  done < <(jq -r '.[].name' "$STATE")
 
   # Snapshot consumed: archive a copy first (so a failed relaunch never loses the
   # list — restore from STATE_HISTORY_DIR), then clear for the next clean cycle.
@@ -729,6 +1111,11 @@ do_start() {
   # Open tabs only when THIS shell is iTerm-hosted (in_iterm). Inside a tmux
   # pane TERM_PROGRAM reads "tmux", so in_iterm is false there — cl start then
   # degrades to printing the commands instead of guessing a terminal to target.
+  if [ "${#names[@]}" -eq 0 ]; then
+    printf '\nevery saved session is already live — nothing to open.\n'
+    return 0
+  fi
+
   local have_iterm=0
   in_iterm && have_iterm=1
   if [ "$have_iterm" = "1" ] && open_iterm_tabs "${names[@]}"; then
@@ -789,7 +1176,7 @@ do_restore() {
 # process exists, ○ otherwise. For codex ● means "a local resume process
 # matches", nothing stronger (see session_pid).
 live_dot() {
-  if tmux has-session -t "$(tmux_name "$1" "$3")" 2>/dev/null || [ -n "$(session_pid "$2" "$3")" ]; then printf '●'; else printf '○'; fi
+  if tmux has-session -t "$(tmux_name "$1" "$3")" 2>/dev/null || [ -n "$(session_pid "$2" "$3" "$1")" ]; then printf '●'; else printf '○'; fi
 }
 
 # agent_tag <agent>: short marker shown beside non-default agents.

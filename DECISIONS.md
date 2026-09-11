@@ -222,3 +222,175 @@ a session below the fold looked absent and cost a real search. A list must
 never render a state that looks identical to "that's everything" when it isn't
 — the same silent-truncation family as the seed-template and dry-run-guard
 findings this month.
+
+## 2026-09-11 — In iTerm the agent is the tab's own process; tmux is opt-in
+
+**Chose:** `use_tmux()` decides per launch — false in iTerm2 (unless
+`CL_TMUX=1`), true elsewhere when tmux exists, and the cmux path is untouched.
+`cl stop` / `cl start` gained the machinery that tmux used to provide for free.
+
+**Forecloses:** detach/reattach in iTerm. Closing the tab ends the session and
+Ctrl-Z suspends the agent; `cl <name>` resumes by session id, and a
+never-messaged `cl new` session is unreachable by name until its first message.
+
+**Reverses by:** `export CL_TMUX=1`, or flipping the default inside
+`use_tmux()`.
+
+**Why:** iTerm2's Claude Code integration keys its profile triggers on the
+tab's foreground job name and locates the tab from the agent's tty. Inside tmux
+the job is `tmux` and the tty is a tmux pty, so both signals miss and the
+integration silently does nothing — the same reason the cmux path already
+skipped tmux.
+
+**Three repairs this forced, each a silent failure if skipped:**
+1. `do_stop` bailed with "no tmux server — nothing to stop" and exited 0. With
+   no tmux that is no longer evidence of an empty fleet; it now also requires
+   no cmux and no live agent process.
+2. Only the tmux branch of `do_stop` closed the iTerm tab, so without tmux
+   every session left a dead `[Process completed]` tab behind.
+3. `session_pid` matched only `--resume`/`--session-id`, so a session created
+   by `cl new` (argv carries `--name`, no id) was invisible: `tmux has-session`
+   had been covering it. `cl stop` would have saved and killed everything
+   *except* the newest session, silently.
+4. Nothing refused a duplicate outside cmux, because `tmux new-session -A`
+   had been doing it. `cl stop` leaves a busy session running on purpose, and
+   `cl start` then opened a tab for it — a second agent on one transcript.
+   The refusal now covers every non-tmux launch, and `cl start` skips live
+   entries when building its tab list.
+
+**How a session with no id in its argv is identified — a launch registry, not
+a name match.** The first attempt matched the name inside `ps` output. `ps`
+renders the command as text, so `--name Solo` is a substring of `--name Solo
+Two`: `cl stop` could kill the wrong agent. Instead each non-tmux launch
+records `pid + process start time` under
+`~/.config/claude-session/pids/<key>` immediately before `exec` — which keeps
+both values — and a record is trusted only while the pid is alive *and* its
+start time still matches, so a recycled pid is detected and the record
+deleted. No command-text parsing anywhere. Only sessions this tool launched
+outside tmux are registered, which is exactly the set nothing else can
+identify. (Design chosen after review flagged the substring bug; the cheaper
+"refuse ambiguous matches" floor was rejected because this is a kill path.)
+
+Two further properties, both added after a second review round:
+
+* **The key is a digest of agent + the exact name**, not `tmux_name`'s
+  sanitiser. That sanitiser maps `A B` and `A.B` to one identity — harmless
+  under tmux, where `new-session -A` made colliding names share a single
+  session so two owners could not exist, but bare they both launch and the
+  second record overwrites the first, handing one session's pid to the other's
+  kill path. The record also stores the agent and name, and is rejected if
+  they do not match, so a digest collision could not kill the wrong session
+  either.
+* **Acquisition is atomic**, guarded by `mkdir`. A check followed by a write is
+  not: two tabs running `cl <name>` together could both see nothing, both
+  write, and both exec an agent on one transcript. `tmux new-session -A` had
+  been that arbiter; without tmux this is. A launcher that dies holding the
+  lock is reclaimed after a few seconds, which is safe because the record
+  inside is still validated.
+
+**Acquisition fails closed.** If the registry directory, the claim lock, the
+start token, or the ownership record cannot be created *and verified*, the
+launch is refused with a specific reason. The first version returned success
+in those cases, which launched an agent the registry could not identify — no
+duplicate protection, and `cl stop` might skip it: precisely the failure the
+registry exists to prevent. An occasional refused launch is the safer side.
+
+**A held claim is reclaimed only on proof.** The lock is a symlink whose target
+names its owner (`pid:start-token`), which `ln -s` creates atomically, so there
+is never a window where the lock exists but its owner is unknown. A waiter
+reclaims only when that owner is gone or its pid was recycled — never on age,
+because a holder merely slow in `ps`/IO would be displaced and two launchers
+would enter the critical section together. A non-symlink at the lock path is
+refused outright: `ln -s target dir` creates the link *inside* the directory and
+reports success, which would hand a launcher a lock it does not hold.
+
+**A stale claim is reported, never auto-cleared.** Validating the lock symlink
+and then unlinking its pathname are two operations: between them another waiter
+can reclaim and establish a live claim, and the delete would then destroy *that*
+claim and let two launchers into the critical section. The start-token proof
+authenticates the object read, not the object later unlinked, and portable shell
+has no compare-and-swap to close that gap — a second read just before the
+unlink narrows it without fixing it. So a stale lock fails closed with the dead
+holder's pid and the exact `rm -f` to clear it. A launcher has to die inside a
+few-millisecond window to leave one.
+
+*Considered and rejected:* a second "reclaim" lock making the unlink exclusive.
+It does close the race, but it has its own stale case, and recursion is the
+wrong shape for a kill path. Refusing costs a person five seconds, once, in a
+situation that should never arise.
+
+**Nothing mutates a record except under the claim.** `registered_pid` is
+read-only: it used to delete records it judged stale, which is the same
+validate-then-unlink-a-pathname race — a launcher holding the lock can write a
+fresh record between the read and the delete, and the cleanup would remove the
+*new* owner's registration, leaving that agent untracked and duplicable. A
+stale record is inert (every reader validates it) and `acquire_launch`
+overwrites it under the lock. `clear_launch` likewise deletes only a record
+that still names the exact pid being retired, under the claim — `cl stop`
+kills, and a new launcher can register before cleanup runs.
+
+**Cleanup compares the whole owner, and both holders share one lock format.**
+A replacement process can reuse a dead owner's pid number — that is why the
+record carries a start token — so cleanup matches pid *and* token *and* agent
+*and* name, and `do_stop` captures the token before the kill because it cannot
+be read back out of a dead process. The lock target is produced by a single
+`claim_token`, used by launcher and cleanup alike: when the cleanup wrote its
+own literal instead, `acquire_launch` parsed it as a start token, judged a
+running cleanup to be a dead holder, and told the user to delete a valid lock.
+No behavioural test can catch that — the cleanup's lock exists for
+microseconds — so the duplication is removed rather than tested around, and
+what remains asserted is the shape the shared function produces.
+
+**Identity is re-proved at the destructive boundary, and ownership outlives the
+signal.** `cl stop` can sit on a "kill it anyway?" prompt for as long as a
+person takes to answer; the original process can exit in that window and its
+pid be reused, so `retire_process` re-checks pid+start-token immediately before
+signalling and reports "exited while stop was deciding" instead. And `kill`
+returning 0 proves delivery, not exit — while an agent runs its shutdown hooks
+it is still alive, and its record is the only thing preventing a second one, so
+the record is retired only after the exact process is confirmed gone (bounded
+wait; otherwise it is left in place).
+
+**`in_cmux` requires the cmux app to actually be running.** A tmux server
+started under cmux keeps `CMUX_*` in its *global* environment and hands them to
+every pane opened later — including panes opened from another terminal long
+after cmux quit. An environment-only test therefore reported "in cmux" inside
+iTerm, which would route launches down the cmux branch, skip the iTerm tab
+tagging, and dial a dead socket. Non-cmux launches also strip `CMUX_*` before
+exec, and `tmux_setup` clears them from the server's global environment, so the
+staleness does not propagate to the agent or to cmux's own hooks.
+
+*How the check is made:* cmux is asked to affirm **this shell's** workspace id
+— it must appear in the live instance's own `workspace list --json`. Presence
+of a cmux app is not enough: if cmux has since reopened, or a second instance
+is running, stale ids inherited from a dead context look authoritative again
+and the launch goes down the cmux branch anyway. An id cmux cannot affirm means
+stale, and the normal host path is taken.
+
+The comparison is structural — jq against `.workspaces[].id` — not a substring
+of the raw JSON: an id like `workspace` is a substring of a live
+`a-real-live-workspace`, and any id can also appear in a title, a directory or
+some other field. jq is already required for stop/start; if it, the command, or
+the schema is missing, the context is simply unaffirmed.
+
+Three earlier attempts are recorded because each looked right: `pgrep -f` on the
+app path matched *nothing* on a machine where cmux was demonstrably running
+(`cmux.app/Contents` matched, one character more did not) and `pgrep -f` also
+matches the shell running the check, so a pattern can find itself; a
+literal `ps` snapshot fixed that but still only proved "a cmux exists"; and a
+substring test over the workspace JSON proved only that the id appeared
+*somewhere* in the document. Surfaces
+cannot be validated this way — cmux lists them by ref, not uuid — so a pane
+carrying only `CMUX_SURFACE_ID` counts as unaffirmed, the safe direction.
+
+**On testing this:** a wall-clock race between two `cl` invocations does not
+prove mutual exclusion — measured, it passes even with the lock removed,
+because process startup jitter serialises the two anyway. The suite therefore
+proves the property directly (while a claim is held, `acquire_launch` must
+block), and keeps the two-launcher race only as a smoke test of the whole
+path.
+
+**Also fixed, found by the new tests:** `do_stop`'s "is this agent owned by a
+tmux server?" guard compared the parent's whole command line against `*tmux*`,
+so any parent whose arguments merely mentioned tmux silently skipped the kill.
+It now compares the parent's executable name.
