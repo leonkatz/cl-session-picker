@@ -288,6 +288,22 @@ Two further properties, both added after a second review round:
   lock is reclaimed after a few seconds, which is safe because the record
   inside is still validated.
 
+**Acquisition fails closed.** If the registry directory, the claim lock, the
+start token, or the ownership record cannot be created *and verified*, the
+launch is refused with a specific reason. The first version returned success
+in those cases, which launched an agent the registry could not identify — no
+duplicate protection, and `cl stop` might skip it: precisely the failure the
+registry exists to prevent. An occasional refused launch is the safer side.
+
+**A held claim is reclaimed only on proof.** The lock is a symlink whose target
+names its owner (`pid:start-token`), which `ln -s` creates atomically, so there
+is never a window where the lock exists but its owner is unknown. A waiter
+reclaims only when that owner is gone or its pid was recycled — never on age,
+because a holder merely slow in `ps`/IO would be displaced and two launchers
+would enter the critical section together. A non-symlink at the lock path is
+refused outright: `ln -s target dir` creates the link *inside* the directory and
+reports success, which would hand a launcher a lock it does not hold.
+
 **On testing this:** a wall-clock race between two `cl` invocations does not
 prove mutual exclusion — measured, it passes even with the lock removed,
 because process startup jitter serialises the two anyway. The suite therefore

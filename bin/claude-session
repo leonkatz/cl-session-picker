@@ -291,6 +291,11 @@ reg_file() { # name [agent]
 
 clear_launch() { rm -f "$(reg_file "$1" "${2:-claude}")" 2>/dev/null; return 0; }
 
+# start_token <pid>: the process's start time as one whitespace-free word, so
+# it can live in a record field or a symlink target. Empty if the process is
+# gone — callers treat empty as "cannot prove anything about this pid".
+start_token() { ps -o lstart= -p "${1:-$$}" 2>/dev/null | tr -s ' ' | tr ' ' '_'; }
+
 registered_pid() { # name [agent] -> live pid we launched, or nothing
   local f pid started ragent rname now
   f=$(reg_file "$1" "${2:-claude}")
@@ -299,7 +304,7 @@ registered_pid() { # name [agent] -> live pid we launched, or nothing
   case "$pid" in ''|*[!0-9]*) rm -f "$f"; return 0 ;; esac
   # A record must prove it is about THIS session before a kill path sees it.
   if [ "$ragent" != "${2:-claude}" ] || [ "$rname" != "$1" ]; then rm -f "$f"; return 0; fi
-  now=$(ps -o lstart= -p "$pid" 2>/dev/null | tr -s ' ')
+  now=$(start_token "$pid")
   # Gone, or the pid was recycled into a different process: the record is a
   # lie, so delete it rather than hand a stranger's pid to a kill path.
   if [ -n "$now" ] && [ "$now" = "$started" ]; then printf '%s\n' "$pid"; else rm -f "$f"; fi
@@ -315,31 +320,79 @@ registered_pid() { # name [agent] -> live pid we launched, or nothing
 # no tmux we have to be it. mkdir is the atomic primitive — it either creates
 # the directory or fails — so the check and the claim happen under it.
 acquire_launch() {
-  local f lock owner tries=0
+  local f lock me holder hpid hstart tries=0 envfail=0 owner back
+  me=$(start_token $$)
+  # Without a start token the record could never be validated later, so there
+  # is no safe way to own anything. Fail closed.
+  [ -n "$me" ] || { echo "claude-session: cannot read this process's start time — refusing to launch unowned" >&2; return 2; }
   f=$(reg_file "$1" "${2:-claude}"); lock="${f}.lock"
-  mkdir -p "$PID_DIR" 2>/dev/null || return 0   # no registry: never block a launch
-  while ! mkdir "$lock" 2>/dev/null; do
+  mkdir -p "$PID_DIR" 2>/dev/null || { echo "claude-session: cannot create $PID_DIR — refusing to launch a session the registry cannot track" >&2; return 2; }
+
+  # The lock is a SYMLINK whose target names its owner. ln -s is atomic and
+  # carries the identity in the same operation, so there is never a window
+  # where the lock exists but its owner is unknown.
+  # `ln -s target dir` creates the link INSIDE the directory and reports
+  # success, so anything that is not a symlink sitting at the lock path would
+  # hand us a lock we do not actually hold. Refuse rather than pretend.
+  if [ -e "$lock" ] && [ ! -L "$lock" ]; then
+    echo "claude-session: $lock exists and is not a claim lock — remove it, then retry" >&2
+    return 2
+  fi
+  while ! ln -s "$$:$me" "$lock" 2>/dev/null; do
+    holder=$(readlink "$lock" 2>/dev/null)
+    if [ -z "$holder" ]; then
+      # Either the lock vanished between our attempt and the read (retrying is
+      # right), or links cannot be created here at all — in which case looping
+      # would spin forever, so fail closed after a few tries.
+      if [ ! -L "$lock" ] && [ ! -e "$lock" ]; then
+        envfail=$((envfail+1))
+        if [ "$envfail" -gt 5 ]; then
+          echo "claude-session: cannot create the claim lock in $PID_DIR — refusing to launch untracked" >&2
+          return 2
+        fi
+      fi
+      sleep 0.1; continue
+    fi
+    hpid=${holder%%:*}; hstart=${holder#*:}
+    # Reclaim ONLY on proof the holder is gone or its pid was recycled. Age is
+    # not proof: a holder merely slow in ps/pgrep/IO would have its lock stolen
+    # and two launchers would enter the critical section together.
+    case "$hpid" in
+      ''|*[!0-9]*) rm -f "$lock" 2>/dev/null; continue ;;
+    esac
+    if [ "$(start_token "$hpid")" != "$hstart" ]; then rm -f "$lock" 2>/dev/null; continue; fi
     tries=$((tries+1))
-    if [ "$tries" -gt 30 ]; then
-      # Whoever held it died mid-claim. Reclaiming is safe: the record inside
-      # is still validated below, so a live session cannot be handed away.
-      rm -rf "$lock" 2>/dev/null
-      continue
+    if [ "$tries" -gt "${CL_CLAIM_WAIT_TRIES:-100}" ]; then
+      echo "claude-session: another launcher (pid $hpid) is still claiming \"$1\" — not launching; try again" >&2
+      return 2
     fi
     sleep 0.1
   done
+
   owner=""
   [ -z "${3:-}" ] || owner=$(session_pid "$3" "${2:-claude}" "$1")
   [ -n "$owner" ] || owner=$(registered_pid "$1" "${2:-claude}")
   if [ -n "$owner" ]; then
-    rm -rf "$lock" 2>/dev/null
+    rm -f "$lock" 2>/dev/null
     printf '%s\n' "$owner"
     return 1
   fi
   # exec keeps this pid AND this start time, so the record describes the agent
-  # that is about to replace this shell.
-  printf '%s\t%s\t%s\t%s\n' "$$" "$(ps -o lstart= -p $$ 2>/dev/null | tr -s ' ')" "${2:-claude}" "$1" > "$f" 2>/dev/null
-  rm -rf "$lock" 2>/dev/null
+  # that is about to replace this shell. Written, then read back: a record that
+  # did not land means the session would be unidentifiable, which is the whole
+  # failure this registry exists to prevent — so that fails closed too.
+  if ! printf '%s\t%s\t%s\t%s\n' "$$" "$me" "${2:-claude}" "$1" > "$f" 2>/dev/null; then
+    rm -f "$f" "$lock" 2>/dev/null
+    echo "claude-session: cannot write the ownership record in $PID_DIR — refusing to launch untracked" >&2
+    return 2
+  fi
+  back=$(registered_pid "$1" "${2:-claude}")
+  rm -f "$lock" 2>/dev/null
+  if [ "$back" != "$$" ]; then
+    rm -f "$f" 2>/dev/null
+    echo "claude-session: the ownership record did not verify — refusing to launch untracked" >&2
+    return 2
+  fi
   return 0
 }
 

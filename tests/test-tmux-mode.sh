@@ -156,24 +156,63 @@ has   "…and asked iTerm to close its tagged tab" "$(cat "$FIX/osascript.log")"
 hasnt "no tmux server is no longer read as an empty fleet" "$out" "nothing to stop"
 kill "$LIVE" 2>/dev/null
 
-printf 'the claim is mutually exclusive (deterministic)\n'
-# A wall-clock race between two `cl` invocations does NOT prove this: measured
-# 2026-09-11, the two-launcher test below passes even with the lock removed,
-# because process startup jitter serialises them anyway. So prove the property
-# directly — while another launcher holds the claim, acquire_launch must WAIT
-# rather than walk through the check-and-write. With the lock gone it returns
-# immediately and this fails.
+printf 'acquisition fails CLOSED — an unregisterable session is never launched\n'
+# The registry exists so a session is always identifiable. If it cannot record
+# ownership, launching anyway produces exactly the invisible session it was
+# built to prevent: no duplicate protection, and cl stop may skip it.
 rm -rf "$HOME/.config/claude-session/pids"
+mkdir -p "$HOME/.config/claude-session" || setup_failed "mkdir config"
+chmod 500 "$HOME/.config/claude-session" || setup_failed "chmod config"
+rm -f "$FIX/argv.claude"
+out=$(env -i HOME="$HOME" PATH="$PATHF" TERM_PROGRAM=iTerm.app bash "$CL" Solo 2>&1); rc=$?
+check "registry dir uncreatable: exits non-zero" "1" "$rc"
+check "…and the agent is never reached"          "no" "$(bare)"
+has   "…with a specific reason"                  "$out" "refusing to launch"
+chmod 700 "$HOME/.config/claude-session" || setup_failed "restore chmod"
+
 mkdir -p "$HOME/.config/claude-session/pids" || setup_failed "mkdir pids"
-HELD="$(reg_file 'Locked' claude).lock"
-mkdir "$HELD" || setup_failed "could not simulate a held claim"
-( acquire_launch "Locked" claude >/dev/null 2>&1; echo done > "$FIX/acq.done" ) & ACQ=$!
-sleep 0.6
-check "blocked while another launcher holds the claim" "0" "$([ -e "$FIX/acq.done" ] && echo 1 || echo 0)"
-rmdir "$HELD" 2>/dev/null
-sleep 0.8
-check "proceeds once the claim is released" "1" "$([ -e "$FIX/acq.done" ] && echo 1 || echo 0)"
-wait "$ACQ" 2>/dev/null; rm -f "$FIX/acq.done"
+chmod 500 "$HOME/.config/claude-session/pids" || setup_failed "chmod pids"
+rm -f "$FIX/argv.claude"
+out=$(env -i HOME="$HOME" PATH="$PATHF" TERM_PROGRAM=iTerm.app bash "$CL" Solo 2>&1); rc=$?
+check "record unwritable: exits non-zero" "1" "$rc"
+check "…and the agent is never reached"   "no" "$(bare)"
+has   "…with a specific reason"           "$out" "refusing to launch"
+chmod 700 "$HOME/.config/claude-session/pids" || setup_failed "restore chmod pids"
+rm -rf "$HOME/.config/claude-session/pids"
+
+printf 'a held claim is reclaimed only on PROOF the holder is gone\n'
+# Age is not proof. A holder merely slow in ps/pgrep/IO must never be displaced,
+# or two launchers enter the critical section together.
+mkdir -p "$HOME/.config/claude-session/pids" || setup_failed "mkdir pids"
+sleep 120 & HOLDER=$!
+sleep 0.3
+HTOK=$(start_token "$HOLDER")
+[ -n "$HTOK" ] || setup_failed "could not read the holder's start token"
+HLOCK="$(reg_file 'Held' claude).lock"
+ln -s "$HOLDER:$HTOK" "$HLOCK" || setup_failed "could not simulate a held claim"
+rm -f "$FIX/acq2.rc"
+( acquire_launch "Held" claude >/dev/null 2>&1; echo $? > "$FIX/acq2.rc" ) & ACQ2=$!
+sleep 1.5
+check "a LIVE holder is not displaced by waiting"   "0"                "$([ -e "$FIX/acq2.rc" ] && echo 1 || echo 0)"
+check "…and its lock is untouched"                  "$HOLDER:$HTOK"    "$(readlink "$HLOCK")"
+kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null
+sleep 1
+check "a dead holder IS reclaimed, and the claim succeeds" "0" "$(cat "$FIX/acq2.rc" 2>/dev/null)"
+wait "$ACQ2" 2>/dev/null
+rm -rf "$HOME/.config/claude-session/pids"
+
+printf 'a non-lock object at the claim path fails closed\n'
+# `ln -s target dir` creates the link INSIDE the directory and returns success,
+# so a leftover directory there would give a launcher a lock it does not hold
+# and mutual exclusion would be silently gone. (Found 2026-09-11 when an older
+# mkdir-based fixture left exactly that behind.)
+mkdir -p "$HOME/.config/claude-session/pids" || setup_failed "mkdir pids"
+STRAY="$(reg_file 'Stray' claude).lock"
+mkdir "$STRAY" || setup_failed "could not create the stray directory"
+rc=$(acquire_launch "Stray" claude >/dev/null 2>&1; echo $?)
+check "a directory at the claim path is refused, not walked into" "2" "$rc"
+check "…and nothing was created inside it" "0" "$(find "$STRAY" -mindepth 1 | wc -l | tr -d ' ')"
+rmdir "$STRAY" 2>/dev/null
 rm -rf "$HOME/.config/claude-session/pids"
 
 printf 'two launchers racing: exactly one reaches the agent (smoke)\n'
