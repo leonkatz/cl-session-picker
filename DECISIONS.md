@@ -319,6 +319,16 @@ It does close the race, but it has its own stale case, and recursion is the
 wrong shape for a kill path. Refusing costs a person five seconds, once, in a
 situation that should never arise.
 
+**Nothing mutates a record except under the claim.** `registered_pid` is
+read-only: it used to delete records it judged stale, which is the same
+validate-then-unlink-a-pathname race — a launcher holding the lock can write a
+fresh record between the read and the delete, and the cleanup would remove the
+*new* owner's registration, leaving that agent untracked and duplicable. A
+stale record is inert (every reader validates it) and `acquire_launch`
+overwrites it under the lock. `clear_launch` likewise deletes only a record
+that still names the exact pid being retired, under the claim — `cl stop`
+kills, and a new launcher can register before cleanup runs.
+
 **On testing this:** a wall-clock race between two `cl` invocations does not
 prove mutual exclusion — measured, it passes even with the lock removed,
 because process startup jitter serialises the two anyway. The suite therefore

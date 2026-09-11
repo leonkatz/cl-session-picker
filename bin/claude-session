@@ -276,8 +276,8 @@ resume_cmd() {
 # equivalence, not a new one.
 PID_DIR="$HOME/.config/claude-session/pids"
 
-# The key is a digest of agent + the EXACT name, never tmux_name's sanitiser:
-# that maps `A B` and `A.B` to one identity. Under tmux that was harmless —
+# The key is a digest of agent + the EXACT name. It deliberately does NOT reuse
+# tmux_name's sanitiser, which maps `A B` and `A.B` to one identity. Under tmux that was harmless —
 # `new-session -A` made colliding names share one session, so two owners could
 # not exist. Bare, both launch, the second record overwrites the first, and a
 # kill path then reads someone else's pid. The record also carries the agent
@@ -289,25 +289,47 @@ reg_file() { # name [agent]
   printf '%s/%s' "$PID_DIR" "$key"
 }
 
-clear_launch() { rm -f "$(reg_file "$1" "${2:-claude}")" 2>/dev/null; return 0; }
+# Remove a record ONLY if it still names the exact owner being retired, and
+# only while holding that name's claim. `cl stop` kills a pid and then cleans
+# up; a new launcher can acquire and register in between, and an unconditional
+# unlink would delete that replacement's registration. If the claim cannot be
+# taken, the record is left alone — a stale record is inert, a deleted live one
+# is not.
+clear_launch() { # name agent expected-pid
+  local f lock rpid
+  [ -n "${3:-}" ] || return 0
+  f=$(reg_file "$1" "${2:-claude}"); lock="${f}.lock"
+  ln -s "$$:cleanup" "$lock" 2>/dev/null || return 0
+  rpid=$(cut -f1 "$f" 2>/dev/null | head -1)
+  [ "$rpid" = "$3" ] && rm -f "$f" 2>/dev/null
+  rm -f "$lock" 2>/dev/null
+  return 0
+}
 
 # start_token <pid>: the process's start time as one whitespace-free word, so
 # it can live in a record field or a symlink target. Empty if the process is
 # gone — callers treat empty as "cannot prove anything about this pid".
 start_token() { ps -o lstart= -p "${1:-$$}" 2>/dev/null | tr -s ' ' | tr ' ' '_'; }
 
+# READ-ONLY on purpose. It used to delete records it judged stale, which is the
+# same validate-then-unlink-a-pathname race as the claim lock: a launcher
+# holding the lock can write a fresh record between the read and the delete,
+# and the cleanup would then remove the NEW owner's registration, leaving that
+# agent untracked and duplicable. A stale record is harmless — every reader
+# validates before trusting, and acquire_launch overwrites it while holding the
+# lock — so nothing here mutates.
 registered_pid() { # name [agent] -> live pid we launched, or nothing
   local f pid started ragent rname now
   f=$(reg_file "$1" "${2:-claude}")
   [ -r "$f" ] || return 0
   IFS=$(printf '\t') read -r pid started ragent rname < "$f" || return 0
-  case "$pid" in ''|*[!0-9]*) rm -f "$f"; return 0 ;; esac
+  case "$pid" in ''|*[!0-9]*) return 0 ;; esac
   # A record must prove it is about THIS session before a kill path sees it.
-  if [ "$ragent" != "${2:-claude}" ] || [ "$rname" != "$1" ]; then rm -f "$f"; return 0; fi
+  [ "$ragent" = "${2:-claude}" ] && [ "$rname" = "$1" ] || return 0
   now=$(start_token "$pid")
   # Gone, or the pid was recycled into a different process: the record is a
-  # lie, so delete it rather than hand a stranger's pid to a kill path.
-  if [ -n "$now" ] && [ "$now" = "$started" ]; then printf '%s\n' "$pid"; else rm -f "$f"; fi
+  # lie, so report nothing — but leave it for the lock holder to replace.
+  [ -n "$now" ] && [ "$now" = "$started" ] && printf '%s\n' "$pid"
   return 0
 }
 
@@ -368,12 +390,12 @@ acquire_launch() {
     case "$hpid" in
       ''|*[!0-9]*)
         echo "claude-session: $lock is malformed — clear it, then retry:" >&2
-        echo "  rm -f $lock" >&2
+        echo "  rm -f $(printf '%q' "$lock")" >&2
         return 2 ;;
     esac
     if [ "$(start_token "$hpid")" != "$hstart" ]; then
       echo "claude-session: a previous launcher (pid $hpid) died holding the claim for \"$1\" — clear it, then retry:" >&2
-      echo "  rm -f $lock" >&2
+      echo "  rm -f $(printf '%q' "$lock")" >&2
       return 2
     fi
     tries=$((tries+1))
@@ -855,12 +877,12 @@ do_stop() {
       read -r ans </dev/tty
       case "$ans" in
         y|Y)  kill "$pid" 2>/dev/null \
-                && { printf '   killed %s\n' "$name" >&2; clear_launch "$name"; [ "$close_tabs" = "1" ] && close_iterm_tab "$t"; close_cmux_surface "$sid" "$name"; } ;;
+                && { printf '   killed %s\n' "$name" >&2; clear_launch "$name" claude "$pid"; [ "$close_tabs" = "1" ] && close_iterm_tab "$t"; close_cmux_surface "$sid" "$name"; } ;;
         *)    printf '   left %s running — re-run cl stop later to close it\n' "$name" >&2 ;;
       esac
     else
       kill "$pid" 2>/dev/null \
-        && { printf '✓ killed %s\n' "$name" >&2; clear_launch "$name"; [ "$close_tabs" = "1" ] && close_iterm_tab "$t"; close_cmux_surface "$sid" "$name"; }
+        && { printf '✓ killed %s\n' "$name" >&2; clear_launch "$name" claude "$pid"; [ "$close_tabs" = "1" ] && close_iterm_tab "$t"; close_cmux_surface "$sid" "$name"; }
     fi
   done
   printf '\nstate saved. Run cl start to bring these back.\n' >&2

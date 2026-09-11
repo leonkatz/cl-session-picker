@@ -99,24 +99,44 @@ acquire_launch "A B" claude  || setup_failed "acquire A B"
 acquire_launch "A.B" claude  || setup_failed "acquire A.B (must not be blocked by A B)"
 check "both colliding names are owned at once" "$$ $$" \
   "$(registered_pid 'A B') $(registered_pid 'A.B')"
-clear_launch "A.B"
+clear_launch "A.B" claude "$$"
+check "the record really was cleared" "0" "$([ -e "$(reg_file 'A.B' claude)" ] && echo 1 || echo 0)"
 check "clearing one leaves the other owned" "$$" "$(registered_pid 'A B')"
-clear_launch "A B"
+clear_launch "A B" claude "$$"
 
 # Defence in depth: a record that does not name this session is not trusted
 # even if it were found under this key.
 printf '%s\t%s\t%s\t%s\n' "$$" "$(ps -o lstart= -p $$ | tr -s ' ')" claude "Someone Else" > "$(reg_file 'Solo Two' claude)"
 check "a record naming another session is rejected" "" "$(registered_pid 'Solo Two')"
-check "…and deleted" "0" "$([ -e "$(reg_file 'Solo Two' claude)" ] && echo 1 || echo 0)"
+check "…and left for the lock holder to replace" "1" "$([ -e "$(reg_file 'Solo Two' claude)" ] && echo 1 || echo 0)"
 
-printf '%s\t%s\n' 999999 "Mon Jan  1 00:00:00 2001" > "$(reg_file Dead)"
+# Cleanup after a kill must be conditional on the exact owner. `cl stop` kills
+# a pid then cleans up; a new launcher can acquire and register in between, and
+# an unconditional unlink would delete that replacement's registration.
+printf '%s\t%s\t%s\t%s\n' 555555 "tok-B" claude "Handover" > "$(reg_file 'Handover' claude)"
+clear_launch "Handover" claude 444444          # retiring a DIFFERENT (older) pid
+check "cleanup for pid A does not delete owner B's record" "1" \
+  "$([ -e "$(reg_file 'Handover' claude)" ] && echo 1 || echo 0)"
+clear_launch "Handover" claude 555555          # retiring the pid it actually names
+check "…and does delete the record it actually names" "0" \
+  "$([ -e "$(reg_file 'Handover' claude)" ] && echo 1 || echo 0)"
+
+printf '%s\t%s\t%s\t%s\n' 999999 "Mon_Jan__1_00:00:00_2001" claude "Dead" > "$(reg_file Dead)"
+check "fixture sanity: the Dead record is well-formed (4 fields)" "4" \
+  "$(awk -F'\t' '{print NF; exit}' "$(reg_file Dead)")"
 check "a record whose process is gone yields nothing" "" "$(registered_pid Dead)"
-check "…and the stale record is deleted" "0" "$([ -e "$(reg_file Dead)" ] && echo 1 || echo 0)"
-printf '%s\t%s\n' "$$" "Mon Jan  1 00:00:00 2001" > "$(reg_file Reused)"
+# It must NOT delete it. Validate-then-unlink-a-pathname is the same ABA race
+# as the claim lock: a launcher holding the lock can write a fresh record
+# between the read and the delete, and the cleanup would remove the NEW
+# owner's registration. A stale record is inert — every reader validates it.
+check "…and leaves the record alone (deleting it could remove a new owner's)" "1" \
+  "$([ -e "$(reg_file Dead)" ] && echo 1 || echo 0)"
+printf '%s\t%s\t%s\t%s\n' "$$" "Mon_Jan__1_00:00:00_2001" claude "Reused" > "$(reg_file Reused)"
 check "a recycled pid (start time differs) yields nothing" "" "$(registered_pid Reused)"
-check "…and that record is deleted too" "0" "$([ -e "$(reg_file Reused)" ] && echo 1 || echo 0)"
-printf 'x\ty\n' > "$(reg_file Junk)"
+check "…and that record is left alone too" "1" "$([ -e "$(reg_file Reused)" ] && echo 1 || echo 0)"
+printf '%s\t%s\t%s\t%s\n' 'x' 'y' claude "Junk" > "$(reg_file Junk)"
 check "a non-numeric record never reaches a kill path" "" "$(registered_pid Junk)"
+check "…and is not deleted either" "1" "$([ -e "$(reg_file Junk)" ] && echo 1 || echo 0)"
 rm -rf "$HOME/.config/claude-session/pids"
 
 printf 'a live session is never launched twice\n'
