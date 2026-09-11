@@ -3,11 +3,22 @@
 # Codex CLI sessions.
 #
 # Bound to `cl`. Auto-discovers every session you've /renamed (no registry to
-# maintain — name a session and it shows up), marks which are live in tmux, and
-# on select cd's into that session's dir and attaches/launches it in a persistent
-# tmux session. A "new … here" entry starts a fresh session in the current
-# directory. Claude launches with --dangerously-skip-permissions; Codex launches
-# with its own configured defaults (add flags via CL_CODEX_ARGS).
+# maintain — name a session and it shows up), marks which are live, and on
+# select cd's into that session's dir and launches or resumes it. A "new … here"
+# entry starts a fresh session in the current directory. Claude launches with
+# --dangerously-skip-permissions; Codex launches with its own configured
+# defaults (add flags via CL_CODEX_ARGS).
+#
+# Where the agent runs:
+#   in iTerm2  — as the tab's own process, NOT inside tmux, so iTerm's Claude
+#                Code integration (job-name triggers, status hooks) can see it.
+#                Trade-off: no detach — closing the tab ends the session, and
+#                Ctrl-Z suspends the agent (no tmux keybind to swallow it).
+#                Recovery is `cl <name>`, which resumes by session id.
+#                CL_TMUX=1 restores the old tmux wrapping instead.
+#   in cmux    — as the pane's own process; cmux owns persistence/restore.
+#   elsewhere  — inside tmux when available (detach/reattach is the only
+#                persistence there), otherwise directly.
 #
 # Usage:
 #   claude-session            # picker (fzf if available, numbered menu otherwise)
@@ -24,7 +35,7 @@
 #                             #   Covers cmux-native sessions too: their claude
 #                             #   processes are killed and surfaces closed.
 #   claude-session start      # relaunch every session from the last stop
-#                             #   (reattach if live, else resume by session id).
+#                             #   (skips any already live, else resumes by id).
 #                             #   In cmux: opens one workspace per session.
 #   claude-session restore    # restore state.json from the newest history
 #                             #   snapshot (add --list to pick; then run start)
@@ -165,6 +176,23 @@ in_cmux() { [ -n "${CMUX_SURFACE_ID:-}" ] || [ -n "${CMUX_WORKSPACE_ID:-}" ]; }
 # (iterm_running stays correct for CLOSING previously-tagged iTerm tabs.)
 in_iterm() { ! in_cmux && [ "${TERM_PROGRAM:-}" = "iTerm.app" ]; }
 
+# use_tmux: should this launch be wrapped in tmux?
+#
+# NOT in iTerm, by default. iTerm2 ships a Claude Code integration whose
+# profile triggers key on the tab's foreground job name, and whose status hooks
+# locate the tab from the agent's tty. Wrapped in tmux the job is `tmux` and the
+# tty is a tmux pty, so neither can find the tab — the integration silently does
+# nothing. Running the agent as the tab's own process is what makes it work,
+# which is the same reason the cmux path skips tmux (cmux owns persistence
+# there). CL_TMUX=1 opts back in, trading the integration for detach/reattach.
+#
+# Outside iTerm (Terminal.app, ssh, other emulators) nothing changes: tmux when
+# it is available, because there detach/reattach is the only persistence there is.
+use_tmux() {
+  command -v tmux >/dev/null 2>&1 || return 1
+  if in_iterm; then [ "${CL_TMUX:-0}" = "1" ]; else return 0; fi
+}
+
 # claude_cmd: the command used to start claude in a cmux pane. Defaults to
 # `cmux claude-teams`, which deploys cmux's fake-tmux shim so Agent Teams
 # teammates render as native cmux splits — the teams *feature* comes from
@@ -228,10 +256,26 @@ resume_cmd() {
 # <sid>` argv here — and the npm launcher is a node wrapper plus a native
 # child that BOTH match. So: a hit is a conservative reason to refuse a second
 # launch; a miss proves nothing; and the pid must never be used as a kill target.
-session_pid() {
+session_pid() { # sid [agent] [name]
+  local pid
   case "${2:-claude}" in
     codex) pgrep -f "codex.* resume $1( |\$)" 2>/dev/null | head -1 ;;
-    *)     pgrep -f "(-resume|-session-id) $1" 2>/dev/null | head -1 ;;
+    *)
+      pid=$(pgrep -f "(-resume|-session-id) $1" 2>/dev/null | head -1)
+      # A session created by `cl new` runs `claude --name <name>`: its argv
+      # carries no session id, so the id match above cannot see it. Inside tmux
+      # `tmux has-session` covered that; without tmux nothing did, and `cl stop`
+      # silently skipped the newest session while claiming to save the fleet.
+      # Matched literally (awk index(), never a regex or glob — a name may
+      # contain either) and only against a process whose command basename is
+      # `claude`: other programs take a --name flag too.
+      if [ -z "$pid" ] && [ -n "${3:-}" ]; then
+        pid=$(ps -axo pid=,command= 2>/dev/null | awk -v want="--name $3" '
+          index($0, want) == 0 { next }
+          { cmd = $2; sub(/.*\//, "", cmd); if (cmd == "claude") { print $1; exit } }')
+      fi
+      printf '%s\n' "$pid"
+      ;;
   esac
 }
 
@@ -248,6 +292,13 @@ tmux_setup() {
   tmux set -g set-titles on 2>/dev/null
   tmux set -g set-titles-string "#S" 2>/dev/null
   tmux bind-key -n C-z if-shell -F '#{m:*sh,#{pane_current_command}}' 'send-keys C-z' '' 2>/dev/null
+  # Terminal features the agent needs and tmux withholds by default: OSC
+  # passthrough (notifications, progress) and extended keys (Shift+Enter).
+  # These do NOT make the iTerm integration work under tmux — job-name
+  # detection still sees `tmux` — they just make the opt-in path less degraded.
+  tmux set -g allow-passthrough on 2>/dev/null
+  tmux set -s extended-keys on 2>/dev/null
+  tmux set -as terminal-features 'xterm*:extkeys' 2>/dev/null
 }
 
 # iterm_running: true when iTerm2 is actually running. Env vars are unreliable
@@ -315,8 +366,10 @@ launch_session() { # name sid cwd [agent]
     cmux rename-tab "$name" >/dev/null 2>&1
     cd "$cwd" || exit 1; eval "exec $cmd"
   fi
-  if command -v tmux >/dev/null 2>&1; then
-    in_iterm && tag_iterm_session "$t"   # so `cl stop` can close this tab later
+  # The iTerm tab is tagged in BOTH branches: `cl stop` closes tabs by that
+  # user variable, and that has nothing to do with tmux.
+  in_iterm && tag_iterm_session "$t"
+  if use_tmux; then
     tmux_setup
     exec tmux new-session -A -s "$t" -c "$cwd" "$cmd"
   else
@@ -334,7 +387,7 @@ launch_new() { # cwd [agent]
     cd "$cwd" || exit 1; eval "exec $cmd"
   fi
   t="$agent-$(basename "$cwd")"
-  if command -v tmux >/dev/null 2>&1; then
+  if use_tmux; then
     tmux_setup
     exec tmux new-session -A -s "$t" -c "$cwd" "$cmd"
   else
@@ -366,8 +419,8 @@ launch_named() { # name cwd [agent]
     cd "$cwd" || exit 1; eval "exec $cmd"
   fi
   t=$(tmux_name "$name" "$agent")
-  if command -v tmux >/dev/null 2>&1; then
-    in_iterm && tag_iterm_session "$t"
+  in_iterm && tag_iterm_session "$t"
+  if use_tmux; then
     tmux_setup
     exec tmux new-session -A -s "$t" -c "$cwd" "$cmd"
   else
@@ -422,13 +475,15 @@ do_new() {
     exit 0
   fi
 
-  if ! command -v tmux >/dev/null 2>&1; then
-    launch_named "$name" "$cwd" "$agent"
-  fi
-
   if [ -t 1 ] && [ -t 0 ]; then
     # interactive: create + attach, like the picker
     launch_named "$name" "$cwd" "$agent"
+  elif ! use_tmux; then
+    # No TTY and nothing to detach into. Say so rather than exec a TTY-less
+    # agent that will exit immediately and look like a silent failure.
+    echo "claude-session: no TTY and not using tmux — cannot create '$name' detached." >&2
+    echo "  run cl new from a terminal, or set CL_TMUX=1 to create it in tmux." >&2
+    exit 1
   else
     # no TTY (script / Claude Bash call): create detached so the caller isn't
     # blocked on an attach — attach later with `cl "<name>"`.
@@ -544,7 +599,7 @@ save_state() {
     # agent field is recorded so a later reader can tell the two apart.
     discover | while IFS=$'\t' read -r name sid cwd epoch agent; do
       [ "$agent" = "claude" ] || continue
-      tmux has-session -t "$(tmux_name "$name")" 2>/dev/null || [ -n "$(session_pid "$sid")" ] || continue
+      tmux has-session -t "$(tmux_name "$name")" 2>/dev/null || [ -n "$(session_pid "$sid" claude "$name")" ] || continue
       [ "$first" -eq 1 ] && first=0 || printf ','
       jq -nc --arg name "$name" --arg sid "$sid" --arg cwd "$cwd" --arg agent "$agent" \
         '{name:$name, sid:$sid, cwd:$cwd, agent:$agent}'
@@ -575,8 +630,12 @@ do_stop() {
   command -v jq >/dev/null 2>&1 || { echo "claude-session: stop needs jq (brew install jq)" >&2; exit 1; }
   local keep_tabs=0
   [ "${1:-}" = "--keep-tabs" ] && keep_tabs=1
-  if ! tmux list-sessions >/dev/null 2>&1 && ! in_cmux; then
-    echo "claude-session: no tmux server running — nothing to stop" >&2
+  # "No tmux server" stopped meaning "nothing to stop" the moment sessions
+  # began running without tmux (in iTerm, and in cmux). Bailing here skipped
+  # the whole fleet while reporting success. Only give up when there is no
+  # tmux server, no cmux, AND no live agent process at all.
+  if ! tmux list-sessions >/dev/null 2>&1 && ! in_cmux && ! pgrep -x claude >/dev/null 2>&1; then
+    echo "claude-session: no tmux server and no live claude process — nothing to stop" >&2
     exit 0
   fi
 
@@ -614,7 +673,7 @@ do_stop() {
     # No tmux session — a cmux-native (or bare) claude: kill the process
     # itself. SIGTERM is a clean shutdown (SessionEnd hooks fire), then the
     # hosting surface (now a bare shell) is closed best-effort.
-    pid=$(session_pid "$sid"); [ -n "$pid" ] || continue
+    pid=$(session_pid "$sid" claude "$name"); [ -n "$pid" ] || continue
     # Safety: a claude whose PARENT is a tmux server belongs to tmux — if we
     # can't see that server (different socket/user context), it is not ours
     # to process-kill. This branch only ever touches cmux/bare claudes.
@@ -628,12 +687,12 @@ do_stop() {
       read -r ans </dev/tty
       case "$ans" in
         y|Y)  kill "$pid" 2>/dev/null \
-                && { printf '   killed %s\n' "$name" >&2; close_cmux_surface "$sid" "$name"; } ;;
+                && { printf '   killed %s\n' "$name" >&2; [ "$close_tabs" = "1" ] && close_iterm_tab "$t"; close_cmux_surface "$sid" "$name"; } ;;
         *)    printf '   left %s running — re-run cl stop later to close it\n' "$name" >&2 ;;
       esac
     else
       kill "$pid" 2>/dev/null \
-        && { printf '✓ killed %s\n' "$name" >&2; close_cmux_surface "$sid" "$name"; }
+        && { printf '✓ killed %s\n' "$name" >&2; [ "$close_tabs" = "1" ] && close_iterm_tab "$t"; close_cmux_surface "$sid" "$name"; }
     fi
   done
   printf '\nstate saved. Run cl start to bring these back.\n' >&2
@@ -702,12 +761,16 @@ do_start() {
   #    then attaches it. Creating here (not relying on the tab) means a failed
   #    tab still leaves a recoverable session. launch_session execs, so we
   #    replicate its create-detached form (incl. tmux_setup).
-  command -v tmux >/dev/null 2>&1 && tmux_setup
+  use_tmux && tmux_setup
   local name sid cwd t i=0
   while IFS=$'\t' read -r name sid cwd; do
     t=$(tmux_name "$name")
     [ -d "$cwd" ] || cwd="$HOME"
-    if tmux has-session -t "=${t}" 2>/dev/null; then
+    if ! use_tmux; then
+      # Without tmux there is nothing to pre-create: each tab's `cl <name>`
+      # execs the agent itself. Only report what is already running.
+      [ -n "$(session_pid "$sid" claude "$name")" ] && printf '● %s already live\n' "$name"
+    elif tmux has-session -t "=${t}" 2>/dev/null; then
       printf '● %s already live\n' "$name"
     else
       tmux new-session -d -s "$t" -c "$cwd" "claude --resume $(printf '%q' "$sid") --dangerously-skip-permissions" \
@@ -789,7 +852,7 @@ do_restore() {
 # process exists, ○ otherwise. For codex ● means "a local resume process
 # matches", nothing stronger (see session_pid).
 live_dot() {
-  if tmux has-session -t "$(tmux_name "$1" "$3")" 2>/dev/null || [ -n "$(session_pid "$2" "$3")" ]; then printf '●'; else printf '○'; fi
+  if tmux has-session -t "$(tmux_name "$1" "$3")" 2>/dev/null || [ -n "$(session_pid "$2" "$3" "$1")" ]; then printf '●'; else printf '○'; fi
 }
 
 # agent_tag <agent>: short marker shown beside non-default agents.

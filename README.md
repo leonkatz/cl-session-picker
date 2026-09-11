@@ -5,11 +5,14 @@ and [Codex CLI](https://github.com/openai/codex)
 sessions, bound to the `cl` alias.
 
 Auto-discovers every session you've `/renamed` (no registry to maintain — name a
-session and it shows up), marks which are live in tmux, and on select attaches or
-relaunches it in a persistent tmux session. A "new claude here" entry starts a
-fresh session in the current directory. `cl stop` / `cl start` tear down and
-rebuild your whole working set, with a rotating state history so a failed restart
-never loses the list.
+session and it shows up), marks which are live, and on select resumes it where it
+left off. A "new claude here" entry starts a fresh session in the current
+directory. `cl stop` / `cl start` tear down and rebuild your whole working set,
+with a rotating state history so a failed restart never loses the list.
+
+In iTerm2 the agent runs as the tab's own process so iTerm's Claude Code
+integration can see it; elsewhere it runs inside tmux. See
+[Where the agent runs](#where-the-agent-runs--tmux-iterm2-cmux).
 
 ## Install
 
@@ -112,14 +115,17 @@ export CL_DEFAULT_DIR="$HOME/path/to/your-repo"   # in ~/.zshrc
 ```
 
 Run interactively, `cl new` creates **and attaches** the session. Run without a
-TTY (from a script, or a Claude Bash call — "spin me up a session called X"), it
-creates the session **detached** and prints `attach with: cl "X"`.
+TTY (from a script, or a Claude Bash call — "spin me up a session called X") it
+creates the session **detached** and prints `attach with: cl "X"` — but that
+needs tmux, so in iTerm it reports that it can't instead of starting an agent
+with no terminal to talk to. Set `CL_TMUX=1` for the detached-create path.
 
 > Note: `claude --name` writes the session's title into its transcript on its
-> **first message**, so a brand-new, untouched session isn't in `cl --list` yet —
-> but `cl "X"` attaches it immediately (it falls back to the live tmux session by
-> name), and the title is already correct everywhere else. Send one message and it
-> appears in the picker too.
+> **first message**, so a brand-new, untouched session isn't in `cl --list` yet.
+> Under tmux, `cl "X"` still attaches it immediately by tmux session name; in
+> iTerm (no tmux) there is nothing to attach to until that first message. The
+> title is already correct everywhere else — send one message and it appears in
+> the picker too.
 
 ## Codex CLI sessions
 
@@ -169,6 +175,31 @@ Codex's private files, not an API: if a Codex release moves them, `cl` prints
 `unsupported Codex storage layout` rather than silently showing no sessions.
 Archived sessions (`codex archive`) are excluded. `tests/test-discover.sh`
 exercises all of this against fixtures.
+
+## Where the agent runs — tmux, iTerm2, cmux
+
+`cl` picks the host for you:
+
+| Terminal | Agent runs | Why |
+|---|---|---|
+| **iTerm2** | as the tab's own process (no tmux) | iTerm2's Claude Code integration keys on the tab's foreground job name and finds the tab from the agent's tty. Wrapped in tmux the job is `tmux` and the tty is a tmux pty, so the integration silently does nothing. |
+| **cmux** | as the pane's own process | cmux owns persistence and restore. |
+| anything else | inside tmux when available | there, detach/reattach is the only persistence there is. |
+
+**In iTerm this trades detach for the integration.** Closing the tab ends the
+session and `Ctrl-Z` suspends the agent (in tmux, `cl` binds that away).
+Recovery is `cl <name>` — it resumes by session id from the transcript, so
+nothing is lost. `cl stop` / `cl start` still tear down and rebuild the whole
+working set, closing and reopening real iTerm tabs.
+
+Prefer the old behaviour? `export CL_TMUX=1` puts iTerm launches back inside
+tmux — detachable, but the iTerm integration will not see them. Outside iTerm
+nothing changed.
+
+> One caveat while in iTerm mode: a session created by `cl new "X"` that has
+> not sent its first message yet is not in any transcript, and without tmux
+> there is no session to re-attach by name — so `cl X` can't find it until it
+> has spoken once. Send a message and it is resumable forever after.
 
 ## Framework procedures
 

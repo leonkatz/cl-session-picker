@@ -222,3 +222,34 @@ a session below the fold looked absent and cost a real search. A list must
 never render a state that looks identical to "that's everything" when it isn't
 — the same silent-truncation family as the seed-template and dry-run-guard
 findings this month.
+
+## 2026-09-11 — In iTerm the agent is the tab's own process; tmux is opt-in
+
+**Chose:** `use_tmux()` decides per launch — false in iTerm2 (unless
+`CL_TMUX=1`), true elsewhere when tmux exists, and the cmux path is untouched.
+`cl stop` / `cl start` gained the machinery that tmux used to provide for free.
+
+**Forecloses:** detach/reattach in iTerm. Closing the tab ends the session and
+Ctrl-Z suspends the agent; `cl <name>` resumes by session id, and a
+never-messaged `cl new` session is unreachable by name until its first message.
+
+**Reverses by:** `export CL_TMUX=1`, or flipping the default inside
+`use_tmux()`.
+
+**Why:** iTerm2's Claude Code integration keys its profile triggers on the
+tab's foreground job name and locates the tab from the agent's tty. Inside tmux
+the job is `tmux` and the tty is a tmux pty, so both signals miss and the
+integration silently does nothing — the same reason the cmux path already
+skipped tmux.
+
+**Three repairs this forced, each a silent failure if skipped:**
+1. `do_stop` bailed with "no tmux server — nothing to stop" and exited 0. With
+   no tmux that is no longer evidence of an empty fleet; it now also requires
+   no cmux and no live agent process.
+2. Only the tmux branch of `do_stop` closed the iTerm tab, so without tmux
+   every session left a dead `[Process completed]` tab behind.
+3. `session_pid` matched only `--resume`/`--session-id`, so a session created
+   by `cl new` (argv carries `--name`, no id) was invisible: `tmux has-session`
+   had been covering it. `cl stop` would have saved and killed everything
+   *except* the newest session, silently. It now also matches `--name`
+   literally, claude-only (other programs take `--name` too).
