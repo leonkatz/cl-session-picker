@@ -251,5 +251,27 @@ skipped tmux.
 3. `session_pid` matched only `--resume`/`--session-id`, so a session created
    by `cl new` (argv carries `--name`, no id) was invisible: `tmux has-session`
    had been covering it. `cl stop` would have saved and killed everything
-   *except* the newest session, silently. It now also matches `--name`
-   literally, claude-only (other programs take `--name` too).
+   *except* the newest session, silently.
+4. Nothing refused a duplicate outside cmux, because `tmux new-session -A`
+   had been doing it. `cl stop` leaves a busy session running on purpose, and
+   `cl start` then opened a tab for it — a second agent on one transcript.
+   The refusal now covers every non-tmux launch, and `cl start` skips live
+   entries when building its tab list.
+
+**How a session with no id in its argv is identified — a launch registry, not
+a name match.** The first attempt matched the name inside `ps` output. `ps`
+renders the command as text, so `--name Solo` is a substring of `--name Solo
+Two`: `cl stop` could kill the wrong agent. Instead each non-tmux launch
+records `pid + process start time` under
+`~/.config/claude-session/pids/<key>` immediately before `exec` — which keeps
+both values — and a record is trusted only while the pid is alive *and* its
+start time still matches, so a recycled pid is detected and the record
+deleted. No command-text parsing anywhere. Only sessions this tool launched
+outside tmux are registered, which is exactly the set nothing else can
+identify. (Design chosen after review flagged the substring bug; the cheaper
+"refuse ambiguous matches" floor was rejected because this is a kill path.)
+
+**Also fixed, found by the new tests:** `do_stop`'s "is this agent owned by a
+tmux server?" guard compared the parent's whole command line against `*tmux*`,
+so any parent whose arguments merely mentioned tmux silently skipped the kill.
+It now compares the parent's executable name.
