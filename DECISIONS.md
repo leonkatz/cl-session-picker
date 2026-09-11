@@ -329,6 +329,18 @@ overwrites it under the lock. `clear_launch` likewise deletes only a record
 that still names the exact pid being retired, under the claim — `cl stop`
 kills, and a new launcher can register before cleanup runs.
 
+**Cleanup compares the whole owner, and both holders share one lock format.**
+A replacement process can reuse a dead owner's pid number — that is why the
+record carries a start token — so cleanup matches pid *and* token *and* agent
+*and* name, and `do_stop` captures the token before the kill because it cannot
+be read back out of a dead process. The lock target is produced by a single
+`claim_token`, used by launcher and cleanup alike: when the cleanup wrote its
+own literal instead, `acquire_launch` parsed it as a start token, judged a
+running cleanup to be a dead holder, and told the user to delete a valid lock.
+No behavioural test can catch that — the cleanup's lock exists for
+microseconds — so the duplication is removed rather than tested around, and
+what remains asserted is the shape the shared function produces.
+
 **On testing this:** a wall-clock race between two `cl` invocations does not
 prove mutual exclusion — measured, it passes even with the lock removed,
 because process startup jitter serialises the two anyway. The suite therefore

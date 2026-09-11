@@ -76,7 +76,7 @@ REGLIB="$FIX/reglib.sh"
 { sed -n '/^tmux_name() {/,/^}/p' "$CL"
   awk '/^PID_DIR=/{f=1} /^session_pid\(\) \{/{f=0} f' "$CL"
   sed -n '/^session_pid() {/,/^}/p' "$CL"; } > "$REGLIB"
-for fn in registered_pid acquire_launch reg_file clear_launch session_pid; do
+for fn in registered_pid acquire_launch reg_file clear_launch session_pid claim_token start_token; do
   grep -q "^${fn}()" "$REGLIB" || setup_failed "$fn not extracted from $CL"
 done
 # shellcheck disable=SC1090
@@ -99,10 +99,10 @@ acquire_launch "A B" claude  || setup_failed "acquire A B"
 acquire_launch "A.B" claude  || setup_failed "acquire A.B (must not be blocked by A B)"
 check "both colliding names are owned at once" "$$ $$" \
   "$(registered_pid 'A B') $(registered_pid 'A.B')"
-clear_launch "A.B" claude "$$"
+clear_launch "A.B" claude "$$" "$(start_token $$)"
 check "the record really was cleared" "0" "$([ -e "$(reg_file 'A.B' claude)" ] && echo 1 || echo 0)"
 check "clearing one leaves the other owned" "$$" "$(registered_pid 'A B')"
-clear_launch "A B" claude "$$"
+clear_launch "A B" claude "$$" "$(start_token $$)"
 
 # Defence in depth: a record that does not name this session is not trusted
 # even if it were found under this key.
@@ -113,13 +113,43 @@ check "…and left for the lock holder to replace" "1" "$([ -e "$(reg_file 'Solo
 # Cleanup after a kill must be conditional on the exact owner. `cl stop` kills
 # a pid then cleans up; a new launcher can acquire and register in between, and
 # an unconditional unlink would delete that replacement's registration.
-printf '%s\t%s\t%s\t%s\n' 555555 "tok-B" claude "Handover" > "$(reg_file 'Handover' claude)"
-clear_launch "Handover" claude 444444          # retiring a DIFFERENT (older) pid
-check "cleanup for pid A does not delete owner B's record" "1" \
+# Same PID, different start token — the reuse case the token exists for. A
+# replacement can inherit the dead owner's pid number; comparing the number
+# alone would delete the replacement's valid registration.
+printf '%s\t%s\t%s\t%s\n' 555555 "token-of-B" claude "Handover" > "$(reg_file 'Handover' claude)"
+clear_launch "Handover" claude 555555 "token-of-A"   # same pid, the DEAD owner's token
+check "cleanup for a reused pid does not delete the new owner's record" "1" \
   "$([ -e "$(reg_file 'Handover' claude)" ] && echo 1 || echo 0)"
-clear_launch "Handover" claude 555555          # retiring the pid it actually names
-check "…and does delete the record it actually names" "0" \
+clear_launch "Handover" claude 555555 "token-of-B"   # the exact owner it names
+check "…and does delete the exact owner it names" "0" \
   "$([ -e "$(reg_file 'Handover' claude)" ] && echo 1 || echo 0)"
+printf '%s\t%s\t%s\t%s\n' 555555 "token-of-B" claude "Handover" > "$(reg_file 'Handover' claude)"
+clear_launch "Handover" claude 555555 "token-of-B" ; :
+printf '%s\t%s\t%s\t%s\n' 555555 "token-of-B" claude "Elsewhere" > "$(reg_file 'Handover' claude)"
+clear_launch "Handover" claude 555555 "token-of-B"
+check "…and refuses a record naming a different session" "1" \
+  "$([ -e "$(reg_file 'Handover' claude)" ] && echo 1 || echo 0)"
+rm -f "$(reg_file 'Handover' claude)"
+
+# A cleanup in progress must look LIVE to a launcher. The lock target is parsed
+# as pid:start-token, so a placeholder there would make a running cleanup read
+# as a dead holder — and the user would be told to delete a valid lock.
+# Both a launcher and a cleanup hold the claim, and acquire_launch parses the
+# target back into pid:token to judge liveness — so they must write the same
+# shape. That is now one shared function rather than two literals, and this
+# asserts the shape it produces. (A placeholder in the cleanup's copy used to
+# make a running cleanup read as a dead holder; no behavioural test could see
+# it, because the cleanup lock exists for microseconds.)
+LTOK=$(start_token $$)
+[ -n "$LTOK" ] || setup_failed "no start token for this process"
+check "claim_token is <pid>:<real start token>" "$$:$LTOK" "$(claim_token)"
+LLOCK="$(reg_file 'CleanupLive' claude).lock"
+ln -s "$$:$LTOK" "$LLOCK" || setup_failed "could not plant a live cleanup claim"
+err=$(CL_CLAIM_WAIT_TRIES=3 acquire_launch "CleanupLive" claude 2>&1 >/dev/null); lrc=$?
+check "a live cleanup claim blocks a launcher, then fails closed" "2" "$lrc"
+hasnt "…and is never misreported as a dead holder" "$err" "died holding"
+check "…and its lock is untouched" "$$:$LTOK" "$(readlink "$LLOCK")"
+rm -f "$LLOCK"
 
 printf '%s\t%s\t%s\t%s\n' 999999 "Mon_Jan__1_00:00:00_2001" claude "Dead" > "$(reg_file Dead)"
 check "fixture sanity: the Dead record is well-formed (4 fields)" "4" \
