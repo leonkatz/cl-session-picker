@@ -315,11 +315,18 @@ check "stale ids + a LIVE cmux still take the iTerm path" "yes" "$(bare)"
 has   "…so the tab is still tagged for cl stop" "$out" "1337;SetUserVar=clSession="
 check "…and the agent inherits no stale CMUX_* at all" "" "$(cat "$FIX/env.claude" 2>/dev/null)"
 # Membership must be an EXACT field match, not a substring of the document.
-cmux_case() { # env-id -> prints "bare" or "cmux"
+# "bare" must mean the iTerm path actually ran — a command that aborted before
+# launching anything also fails to call rename-tab, and would otherwise be
+# scored the same as a correct negative.
+cmux_case() { # env-id [bad-json] -> "cmux" | "bare" | "aborted"
+  local rc
   rm -f "$FIX/argv.claude" "$FIX/cmux.log"
   env -i HOME="$HOME" PATH="$PATHF" TERM_PROGRAM=iTerm.app \
       ${2:+CMUX_FAKE_BADJSON=1} CMUX_WORKSPACE_ID="$1" bash "$CL" Solo >"$FIX/case.out" 2>&1
-  if grep -qF 'rename-tab' "$FIX/cmux.log" 2>/dev/null; then echo cmux; else echo bare; fi
+  rc=$?
+  if grep -qF 'rename-tab' "$FIX/cmux.log" 2>/dev/null; then echo cmux
+  elif [ "$rc" -eq 0 ] && [ -s "$FIX/argv.claude" ]; then echo bare
+  else echo aborted; fi
 }
 check "an id that is a SUBSTRING of a live one is not affirmed" "bare" "$(cmux_case workspace)"
 check "an id appearing only in a title field is not affirmed"   "bare" "$(cmux_case decoy-in-title)"
