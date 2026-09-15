@@ -4,6 +4,49 @@ Form-factor choices that could have gone another way. Each entry records what
 was chosen, what it forecloses, and what would reverse it — so a later change
 is a deliberate reversal, not an accident.
 
+## 2026-09-15 — a remembered model is keyed by name, in its own file
+
+**Chose:** `cl model <name> <id>` stores the choice in
+`~/.config/claude-session/models.json` as `{"<name>": "<id>"}`, separate from
+`state.json`.
+
+Not a field in `state.json`, which was the obvious place: that file is a
+snapshot of what was live at the last `cl stop`, and `cl start` consumes and
+deletes it. A preference kept there would be erased by the first stop/start
+cycle — and `cl new --model` names a session that has no state record yet.
+
+Keyed by name rather than session id because the name is what the user types
+and what stays stable; a session resumed into a new transcript keeps its name
+and should keep its model.
+
+**Forecloses:** two sessions with the same name across agents cannot hold
+different models — the same collision the rest of the tool already resolves
+with `--claude`/`--codex`, but here it resolves silently to one value.
+
+**Reverses by:** deleting `valid_model`/`model_for`/`model_flag`/`set_model`/
+`do_model`, the `model` dispatcher arm, the `--model` flag in `do_new`, the
+third argument to `resume_cmd`, and the two `model_flag` calls in `do_start`.
+The file itself can be left behind; nothing else reads it.
+
+## 2026-09-15 — the model charset is validated, and that makes the quoting untestable
+
+**Chose:** a model id must match `[A-Za-z0-9._:/-]+`, checked both when set and
+when read back, and is `printf %q`-quoted where it is spliced into a command
+string.
+
+**The honest part:** every value that passes the charset check is already
+shell-safe, so the quoting is a no-op and removing it leaves the test suite
+green. It is kept as the layer that matters if the charset is ever widened —
+a model id containing a space, say. Widening the charset without testing the
+quoting would be the actual mistake.
+
+**Forecloses:** model identifiers containing spaces, quotes, `@`, `+`, `=`, or
+`#`. No current agent uses such an id; a future one would need the charset
+widened deliberately, with a test for the quoting added at the same time.
+
+**Reverses by:** relaxing `valid_model` — and writing the quoting test that
+becomes possible at that moment.
+
 ## 2026-08-28 — Codex support is a per-session `agent` field, not a second script
 
 **Chose:** `discover()` emits a fifth column, `agent` (`claude` | `codex`), and
