@@ -218,6 +218,35 @@ and bind the `{slot}` placeholders (`{issue-tracker}`, `{chat}`, `{notes}`, …)
 to your own tools beneath the import. See [`framework/README.md`](framework/README.md).
 `--no-framework` skips this step.
 
+## Per-session model — `cl model`
+
+A session can remember which model it should start with. The choice is keyed by
+session **name**, so it survives the session being stopped, restarted, or
+resumed under a new transcript id.
+
+```bash
+cl model                          # what is remembered, per session
+cl model "API Work" opus          # this session starts with that model
+cl model "API Work" -             # forget it — back to the agent's default
+cl new --model opus "Scratch"     # remember it and use it from the first launch
+```
+
+The remembered model is applied at every launch path — `cl <name>`, `cl start`,
+the picker, and the tmux/cmux/iTerm variants of each. A session with no
+remembered model launches exactly as it did before: no flag is added.
+
+It becomes `--model <id>` for Claude and `-m <id>` for Codex. If
+`CL_CODEX_ARGS` already names a model, that explicit choice wins and the
+remembered one is skipped rather than passed as a second flag.
+
+Values are stored in `~/.config/claude-session/models.json` and are restricted
+to letters, digits and `. _ - : /` — enough for a plain id or a fully qualified
+cloud resource name, and not enough to act as shell syntax when the value is
+spliced into a launch command. A value that fails the check is refused when set,
+and ignored (with a warning) if one is hand-edited into the file.
+
+This file is yours and is never read from or written to the repository.
+
 ## start / stop
 
 `cl stop` / `cl start` tear down and rebuild your whole working set — for a
