@@ -39,8 +39,15 @@
 #                             #   Covers cmux-native sessions too: their claude
 #                             #   processes are killed and surfaces closed.
 #   claude-session start      # relaunch every session from the last stop
-#                             #   (skips any already live, else resumes by id).
+#                             #   (skips any already live, else resumes by id,
+#                             #   as the agent it was saved under).
 #                             #   In cmux: opens one workspace per session.
+#
+# stop/start cover Codex sessions THIS TOOL LAUNCHED, and nothing else: for
+# Codex an argv match is not a sound handle (app-server daemon, Desktop app,
+# --remote clients, and an npm launcher whose wrapper and native child both
+# match), so only the launch registry — a pid cl recorded with a start token —
+# is accepted on the kill path. Anything else is reported and left alone.
 #   claude-session restore    # restore state.json from the newest history
 #                             #   snapshot (add --list to pick; then run start)
 #
@@ -652,6 +659,24 @@ session_pid() { # sid [agent] [name]
 # has no parent shell to `fg` from (recovery requires kill -CONT). Shells still
 # get Ctrl-Z so job control works in normal panes. Applied here rather than
 # ~/.tmux.conf so cl is self-contained on any machine.
+# agent_live <agent> <sid> <name>: is something already working this session?
+#
+# Used by `cl start` only, where the bias is deliberately the opposite of the
+# kill path's: ANY sign of life means skip, because a false positive costs a
+# session that has to be reopened by hand, while a false negative starts a
+# SECOND client on one transcript. So this accepts signals that are not
+# kill-safe — an argv match for codex among them — precisely because nothing
+# here signals anything.
+agent_live() {
+  local agent="$1" sid="$2" name="$3"
+  if command -v tmux >/dev/null 2>&1 && tmux has-session -t "=$(tmux_name "$name" "$agent")" 2>/dev/null; then
+    return 0
+  fi
+  [ -n "$(session_pid "$sid" "$agent" "$name")" ] && return 0
+  [ "$agent" = "codex" ] && [ -n "$(registered_pid "$name" codex)" ] && return 0
+  return 1
+}
+
 tmux_setup() {
   command -v tmux >/dev/null 2>&1 || return 0
   tmux start-server 2>/dev/null
@@ -1000,12 +1025,36 @@ save_state() {
   local live first=1
   live="$(
     printf '['
-    # Claude only: the stop/start kill and relaunch logic is Claude-shaped, and a
-    # codex "live" marker is not a kill-safe signal (see session_pid). The
-    # agent field is recorded so a later reader can tell the two apart.
+    # What counts as "live" differs by agent, and the difference is the whole
+    # safety argument for Codex support.
+    #
+    #   claude: an argv match (`--resume <sid>`) is a sound handle — one process
+    #           per transcript, and stop verifies the start token before
+    #           signalling.
+    #   codex:  an argv match is NOT. Codex also runs threads through a shared
+    #           app-server daemon, the Desktop app and --remote clients, none of
+    #           which carry `resume <sid>` in argv, and the npm launcher is a
+    #           node wrapper plus a native child that BOTH match. So the only
+    #           sound handle is the launch registry: a pid cl itself recorded,
+    #           with a start token, under this exact agent and name.
+    #
+    # A Codex thread running somewhere cl did not launch is therefore not saved.
+    # Recording it would mean `cl start` later resuming a thread that is already
+    # open elsewhere — two clients on one transcript, which is the thing the
+    # duplicate-launch refusal exists to prevent.
     discover | while IFS=$'\t' read -r name sid cwd epoch agent; do
-      [ "$agent" = "claude" ] || continue
-      tmux has-session -t "$(tmux_name "$name")" 2>/dev/null || [ -n "$(session_pid "$sid" claude "$name")" ] || continue
+      # if/elif, not case: this runs inside a command substitution, and bash
+      # mis-parses a `case` whose arms carry nested $( ) there — it fails at
+      # PARSE time, so the whole state write dies rather than one row.
+      if [ "$agent" = "claude" ]; then
+        tmux has-session -t "$(tmux_name "$name" claude)" 2>/dev/null \
+          || [ -n "$(session_pid "$sid" claude "$name")" ] || continue
+      elif [ "$agent" = "codex" ]; then
+        tmux has-session -t "$(tmux_name "$name" codex)" 2>/dev/null \
+          || [ -n "$(registered_pid "$name" codex)" ] || continue
+      else
+        continue
+      fi
       [ "$first" -eq 1 ] && first=0 || printf ','
       jq -nc --arg name "$name" --arg sid "$sid" --arg cwd "$cwd" --arg agent "$agent" \
         '{name:$name, sid:$sid, cwd:$cwd, agent:$agent}'
@@ -1053,8 +1102,8 @@ do_stop() {
 
   local name t ans pid ptok rrc
   discover | while IFS=$'\t' read -r name sid cwd epoch agent; do
-    [ "$agent" = "claude" ] || continue   # codex lifecycle is out of scope here
-    t=$(tmux_name "$name")
+    case "$agent" in claude|codex) ;; *) continue ;; esac
+    t=$(tmux_name "$name" "$agent")
     if tmux has-session -t "=${t}" 2>/dev/null; then
       if session_busy "$t"; then
         printf '⏳ "%s" looks mid-task. Kill it anyway? [y/N] ' "$name" >&2
@@ -1074,10 +1123,24 @@ do_stop() {
       fi
       continue
     fi
-    # No tmux session — a cmux-native (or bare) claude: kill the process
-    # itself. SIGTERM is a clean shutdown (SessionEnd hooks fire), then the
-    # hosting surface (now a bare shell) is closed best-effort.
-    pid=$(session_pid "$sid" claude "$name"); [ -n "$pid" ] || continue
+    # No tmux session — a cmux-native (or bare) agent: kill the process itself.
+    # SIGTERM is a clean shutdown (SessionEnd hooks fire), then the hosting
+    # surface (now a bare shell) is closed best-effort.
+    #
+    # The handle differs by agent, and for Codex it is deliberately narrower:
+    # only a process THIS tool launched and still recognises. Everything else —
+    # a thread opened in the Desktop app, served by the app-server daemon, or
+    # attached over --remote — is reported and left alone rather than guessed
+    # at, because an argv match there can name an unrelated process.
+    if [ "$agent" = "codex" ]; then
+      pid=$(registered_pid "$name" codex)
+      if [ -z "$pid" ]; then
+        printf '⚠ leaving %s — cl has no launch record for this Codex session, so it has no safe way to identify the process. Close it in its own tab.\n' "$name" >&2
+        continue
+      fi
+    else
+      pid=$(session_pid "$sid" claude "$name"); [ -n "$pid" ] || continue
+    fi
     # Captured now: a dead process has no start time to read back, and without
     # it cleanup cannot tell this owner from a replacement that reused the pid.
     ptok=$(start_token "$pid")
@@ -1096,13 +1159,15 @@ do_stop() {
     case "$_pcomm" in
       tmux*) printf '⚠ skipping %s — owned by a tmux server not visible here\n' "$name" >&2; continue ;;
     esac
+    # claude_busy is process-level, not Claude-specific: a caffeinate child or
+    # sustained CPU. It reads the same way for either agent.
     if claude_busy "$pid"; then
       printf '⏳ "%s" looks mid-task (pid %s). Kill it anyway? [y/N] ' "$name" "$pid" >&2
       read -r ans </dev/tty
       case "$ans" in
         y|Y)  retire_process "$pid" "$ptok"; rrc=$?
               case "$rrc" in
-                0) printf '   killed %s\n' "$name" >&2; clear_launch "$name" claude "$pid" "$ptok"
+                0) printf '   killed %s\n' "$name" >&2; clear_launch "$name" "$agent" "$pid" "$ptok"
                    [ "$close_tabs" = "1" ] && close_iterm_tab "$t"; close_cmux_surface "$sid" "$name" ;;
                 2) printf '   signalled %s — still shutting down, leaving it registered\n' "$name" >&2
                    [ "$close_tabs" = "1" ] && close_iterm_tab "$t"; close_cmux_surface "$sid" "$name" ;;
@@ -1113,7 +1178,7 @@ do_stop() {
     else
       retire_process "$pid" "$ptok"; rrc=$?
       case "$rrc" in
-        0) printf '✓ killed %s\n' "$name" >&2; clear_launch "$name" claude "$pid" "$ptok"
+        0) printf '✓ killed %s\n' "$name" >&2; clear_launch "$name" "$agent" "$pid" "$ptok"
            [ "$close_tabs" = "1" ] && close_iterm_tab "$t"; close_cmux_surface "$sid" "$name" ;;
         2) printf '✓ signalled %s — still shutting down, leaving it registered\n' "$name" >&2
            [ "$close_tabs" = "1" ] && close_iterm_tab "$t"; close_cmux_surface "$sid" "$name" ;;
@@ -1131,16 +1196,22 @@ do_stop() {
 # per tab, which is markedly faster for a large working set. Returns non-zero if
 # the AppleScript fails (not in iTerm, automation denied) so the caller can fall
 # back to printing commands.
+# Arguments are "<agent>\t<name>" pairs. The agent selects the flag the tab's
+# command needs: `cl <name>` refuses a name held by both agents, so a Codex
+# session must be reopened as `cl --codex <name>` or the tab fails with an
+# ambiguity error instead of starting anything.
 open_iterm_tabs() {
-  local name esc script
+  local entry name agent flag esc script
   script='tell application "iTerm"
   tell current window
 '
-  for name in "$@"; do
+  for entry in "$@"; do
+    agent="${entry%%$'\t'*}"; name="${entry#*$'\t'}"
+    case "$agent" in codex) flag='--codex ' ;; *) flag='' ;; esac
     # Escape backslashes then double-quotes for embedding in the AppleScript string.
     esc="${name//\\/\\\\}"; esc="${esc//\"/\\\"}"
     script+='    create tab with default profile
-    tell current session to write text "cl \"'"$esc"'\""
+    tell current session to write text "cl '"$flag"'\"'"$esc"'\""
 '
   done
   script+='  end tell
@@ -1165,18 +1236,18 @@ do_start() {
     # cmux mode: one workspace per saved session, claude resumed tmux-free so
     # cmux's integration owns it. --focus false so eight restores don't fight
     # over focus. Live sessions (either kind) are left alone.
-    local name sid cwd i=0
-    while IFS=$'\t' read -r name sid cwd; do
-      if [ -n "$(session_pid "$sid")" ] \
-         || { command -v tmux >/dev/null 2>&1 && tmux has-session -t "=$(tmux_name "$name")" 2>/dev/null; }; then
+    local name sid cwd agent i=0
+    while IFS=$'\t' read -r name sid cwd agent; do
+      agent="${agent:-claude}"
+      if agent_live "$agent" "$sid" "$name"; then
         printf '● %s already live\n' "$name"
       else
         [ -d "$cwd" ] || cwd="$HOME"
         cmux new-workspace --name "$name" --cwd "$cwd" --focus false \
-            --command "$(claude_cmd) --resume $(printf '%q' "$sid") --dangerously-skip-permissions$(model_flag claude "$(model_for "$name")")" >/dev/null \
+            --command "$(resume_cmd "$agent" "$sid" "$name")" >/dev/null \
           && { printf '✓ opened %s  (%s)\n' "$name" "$cwd"; i=$((i+1)); }
       fi
-    done < <(jq -r '.[] | [.name, .sid, .cwd] | @tsv' "$STATE")
+    done < <(jq -r '.[] | [.name, .sid, .cwd, (.agent // "claude")] | @tsv' "$STATE")
     archive_state
     rm -f "$STATE"
     printf '\nopened %s cmux workspace(s).\n' "$i"
@@ -1188,16 +1259,17 @@ do_start() {
   #    tab still leaves a recoverable session. launch_session execs, so we
   #    replicate its create-detached form (incl. tmux_setup).
   use_tmux && tmux_setup
-  local name sid cwd t i=0 live_names=""
-  while IFS=$'\t' read -r name sid cwd; do
-    t=$(tmux_name "$name")
+  local name sid cwd agent t i=0 live_names=""
+  while IFS=$'\t' read -r name sid cwd agent; do
+    agent="${agent:-claude}"
+    t=$(tmux_name "$name" "$agent")
     [ -d "$cwd" ] || cwd="$HOME"
     if ! use_tmux; then
       # Without tmux there is nothing to pre-create: each tab's `cl <name>`
       # execs the agent itself. Record the live ones so no tab is opened for
       # them — `cl stop` leaves busy sessions running on purpose, and a tab
       # for one would start a SECOND agent on the same transcript.
-      if [ -n "$(session_pid "$sid" claude "$name")" ]; then
+      if agent_live "$agent" "$sid" "$name"; then
         printf '● %s already live\n' "$name"
         live_names="${live_names}${name}"$'\n'
       fi
@@ -1205,20 +1277,24 @@ do_start() {
       printf '● %s already live\n' "$name"
       live_names="${live_names}${name}"$'\n'
     else
-      tmux new-session -d -s "$t" -c "$cwd" "claude --resume $(printf '%q' "$sid") --dangerously-skip-permissions$(model_flag claude "$(model_for "$name")")" \
+      tmux new-session -d -s "$t" -c "$cwd" "$(resume_cmd "$agent" "$sid" "$name")" \
         && printf '✓ prepared %s  (%s)\n' "$name" "$cwd"
     fi
     i=$((i+1))
-  done < <(jq -r '.[] | [.name, .sid, .cwd] | @tsv' "$STATE")
+  done < <(jq -r '.[] | [.name, .sid, .cwd, (.agent // "claude")] | @tsv' "$STATE")
 
   # 2. Open a real iTerm tab per session (or fall back to printing commands).
   #    Read names into an array first so the STATE file can be cleared safely.
+  # Entries are "<agent>\t<name>": the tab runs `cl <name>`, and a name that
+  # exists for both agents is refused by that path unless it is told which —
+  # so the agent has to travel with the name, not be re-guessed in the tab.
   local -a names=()
-  while IFS= read -r name; do
+  while IFS= read -r line; do
+    name="${line#*$'\t'}"
     # Skip the ones reported live above: opening a tab for them duplicates.
     printf '%s' "$live_names" | grep -qxF -- "$name" && continue
-    names+=("$name")
-  done < <(jq -r '.[].name' "$STATE")
+    names+=("$line")
+  done < <(jq -r '.[] | [(.agent // "claude"), .name] | @tsv' "$STATE")
 
   # Snapshot consumed: archive a copy first (so a failed relaunch never loses the
   # list — restore from STATE_HISTORY_DIR), then clear for the next clean cycle.
@@ -1243,7 +1319,12 @@ do_start() {
     else
       printf '\n%s session(s) prepared. Not in iTerm (or no osascript) — open a tab and run:\n' "$i"
     fi
-    for name in "${names[@]}"; do printf '  cl "%s"\n' "$name"; done
+    for line in "${names[@]}"; do
+      case "$line" in
+        codex$'\t'*) printf '  cl --codex "%s"\n' "${line#*$'\t'}" ;;
+        *)            printf '  cl "%s"\n' "${line#*$'\t'}" ;;
+      esac
+    done
   fi
 }
 
