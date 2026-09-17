@@ -64,16 +64,17 @@ check "an empty store says so, and succeeds" "0" "$rc"
 case "$out" in *"no session models remembered"*) pass=$((pass+1)); printf '  ok   %s\n' "…naming how to set one" ;;
   *) fail=$((fail+1)); printf '  FAIL %s\n       got: %s\n' "…naming how to set one" "$out" ;; esac
 cl model Alpha some-model-id >/dev/null
-check "a remembered model is stored under its name" "some-model-id" "$(jq -r '.Alpha' "$MODELS")"
-cl model "Two Words" other-model >/dev/null
-check "…including a name with spaces" "other-model" "$(jq -r '."Two Words"' "$MODELS")"
+check "a remembered model is stored under its name" "some-model-id" "$(jq -r '.claude.Alpha' "$MODELS")"
+cl model --claude "Two Words" other-model >/dev/null
+check "…including a name with spaces" "other-model" "$(jq -r '.claude."Two Words"' "$MODELS")"
 check "listing shows both" "2" "$(cl model | grep -c 'model')"
+check "…with the agent named" "2" "$(cl model | grep -cE '^ +claude')"
 cl model Alpha replacement-id >/dev/null
-check "setting again replaces rather than appends" "replacement-id" "$(jq -r '.Alpha' "$MODELS")"
-check "…and does not disturb the other entry" "other-model" "$(jq -r '."Two Words"' "$MODELS")"
-cl model "Two Words" - >/dev/null
-check "'-' forgets one" "null" "$(jq -r '."Two Words" // "null"' "$MODELS")"
-check "…leaving the rest" "replacement-id" "$(jq -r '.Alpha' "$MODELS")"
+check "setting again replaces rather than appends" "replacement-id" "$(jq -r '.claude.Alpha' "$MODELS")"
+check "…and does not disturb the other entry" "other-model" "$(jq -r '.claude."Two Words"' "$MODELS")"
+cl model --claude "Two Words" - >/dev/null
+check "'-' forgets one" "null" "$(jq -r '.claude."Two Words" // "null"' "$MODELS")"
+check "…leaving the rest" "replacement-id" "$(jq -r '.claude.Alpha' "$MODELS")"
 
 printf 'a value that could act as shell syntax is refused\n'
 # The stored value ends up inside a command string. These are the shapes that
@@ -84,13 +85,13 @@ for bad in 'x; touch pwned' 'x$(id)' 'x`id`' 'x&&y' 'x|y' 'x y' '$HOME' ''; do
   check "refused: [$bad]" "1" "$rc"
   check "…store untouched" "same" "$([ "$before" = "$(cat "$MODELS")" ] && echo same || echo CHANGED)"
 done
-check "…and the good value is still there" "replacement-id" "$(jq -r '.Alpha' "$MODELS")"
+check "…and the good value is still there" "replacement-id" "$(jq -r '.claude.Alpha' "$MODELS")"
 check "…no side effect ran" "0" "$(ls "$FIX"/pwned "$FIX"/*/pwned 2>/dev/null | wc -l | tr -d ' ')"
 
 printf 'real model identifiers are accepted\n'
 for good in claude-sonnet-4-5 opus gpt-5 vendor.model-name:v1 provider/family:2024-10-01 a_b.c-d:e/f; do
   cl model Alpha "$good" >/dev/null 2>&1
-  check "accepted: $good" "$good" "$(jq -r '.Alpha' "$MODELS")"
+  check "accepted: $good" "$good" "$(jq -r '.claude.Alpha' "$MODELS")"
 done
 
 printf 'the model reaches the agent as separate argv elements\n'
@@ -144,7 +145,7 @@ printf 'a hand-edited store cannot smuggle a value onto a command line\n'
 # models.json is a plain file in the user's config dir. Validating only on the
 # way in would leave the read path trusting whatever is on disk.
 mkdir -p "$(dirname "$MODELS")"
-printf '{"Alpha": "evil; touch %s/pwned-read"}\n' "$FIX" > "$MODELS"
+printf '{"claude": {"Alpha": "evil; touch %s/pwned-read"}}\n' "$FIX" > "$MODELS"
 rm -f "$FIX/argv.claude"
 out=$(cl Alpha 2>&1 >/dev/null)
 check "the unsafe stored value is not used" "0" "$(grep -c '^--model$' "$FIX/argv.claude")"
@@ -161,7 +162,7 @@ STATE="$HOME/.config/claude-session/state.json"
 printf '[{"name":"Alpha","sid":"abc","cwd":"%s","agent":"claude"}]\n' "$FIX/work" > "$STATE"
 cl start >/dev/null 2>&1
 check "state.json was consumed by start" "0" "$([ -f "$STATE" ] && echo 1 || echo 0)"
-check "…but the remembered model is still there" "persistent-model" "$(jq -r '.Alpha' "$MODELS")"
+check "…but the remembered model is still there" "persistent-model" "$(jq -r '.claude.Alpha' "$MODELS")"
 
 printf 'cl new --model remembers and applies in one step\n'
 # Without a TTY `cl new` deliberately refuses to exec an agent, so this path
@@ -185,7 +186,7 @@ chmod +x "$FIX/tmuxbin/tmux"
 cl_tmux() { ( cd "$FIX" && env -i HOME="$HOME" CODEX_HOME="$CODEX_HOME" PATH="$FIX/tmuxbin:$BASEPATH" bash "$CL" "$@" ) ; }
 rm -f "$FIX/argv.tmux"
 cl_tmux new --model new-session-model "Fresh" "$FIX/work" >/dev/null 2>&1
-check "it is remembered for the name" "new-session-model" "$(jq -r '.Fresh' "$MODELS")"
+check "it is remembered for the name" "new-session-model" "$(jq -r '.claude.Fresh' "$MODELS")"
 TCMD="$(grep 'new-session' "$FIX/argv.tmux" 2>/dev/null | tail -1)"
 case "$TCMD" in *"--model new-session-model"*) pass=$((pass+1)); printf '  ok   %s\n' "…and used for the launch" ;;
   *) fail=$((fail+1)); printf '  FAIL %s\n       got: %s\n' "…and used for the launch" "$TCMD" ;; esac
@@ -193,7 +194,105 @@ case "$TCMD" in *"--name Fresh"*) pass=$((pass+1)); printf '  ok   %s\n' "…wit
   *) fail=$((fail+1)); printf '  FAIL %s\n       got: %s\n' "…without losing the name flag" "$TCMD" ;; esac
 out=$(cl new --model 'bad; id' "Fresh2" "$FIX/work" 2>&1 >/dev/null); rc=$?
 check "an unsafe --model refuses the whole launch" "1" "$rc"
-check "…and remembers nothing" "null" "$(jq -r '.Fresh2 // "null"' "$MODELS")"
+check "…and remembers nothing" "null" "$(jq -r '.claude.Fresh2 // "null"' "$MODELS")"
+
+printf 'the same name under two agents keeps two separate models\n'
+# The reason the store is keyed by agent AND name. A Claude session and a Codex
+# session can both be called Alpha; `cl --claude Alpha` resolves that ambiguity
+# for the LAUNCH, and a name-only store would still have handed it the other
+# agent's model — `claude --model <a-codex-model>`.
+printf '{"id":"%s","thread_name":"Alpha","updated_at":"2026-01-02T00:00:00Z"}\n' \
+  01cccccc-0000-7000-8000-0000000000cc >> "$CODEX_HOME/session_index.jsonl"
+printf '{"type":"session_meta","payload":{"id":"%s","cwd":"%s"}}\n' \
+  01cccccc-0000-7000-8000-0000000000cc "$FIX/work" \
+  > "$CODEX_HOME/sessions/2026/01/01/rollout-2026-01-02T00-00-00-01cccccc-0000-7000-8000-0000000000cc.jsonl"
+cl model --claude Alpha claude-side-model >/dev/null
+cl model --codex  Alpha codex-side-model  >/dev/null
+check "each agent stores its own" "claude-side-model|codex-side-model" \
+  "$(jq -r '"\(.claude.Alpha)|\(.codex.Alpha)"' "$MODELS")"
+rm -f "$FIX/argv.claude" "$FIX/argv.codex"
+cl --claude Alpha >/dev/null 2>&1
+check "the claude launch gets the claude model" "claude-side-model" \
+  "$(grep -A1 '^--model$' "$FIX/argv.claude" | tail -1)"
+cl --codex Alpha >/dev/null 2>&1
+check "the codex launch gets the codex model" "codex-side-model" \
+  "$(grep -A1 '^-m$' "$FIX/argv.codex" | tail -1)"
+
+printf 'a bare name that two agents share is refused, not guessed\n'
+out=$(cl model Alpha whatever 2>&1); rc=$?
+check "…exits non-zero" "1" "$rc"
+case "$out" in *"more than one agent"*) pass=$((pass+1)); printf '  ok   %s\n' "…naming both ways to disambiguate" ;;
+  *) fail=$((fail+1)); printf '  FAIL %s\n       got: %s\n' "…naming both ways to disambiguate" "$out" ;; esac
+check "…and nothing was written" "claude-side-model" "$(jq -r '.claude.Alpha' "$MODELS")"
+cl model --claude Alpha - >/dev/null; cl model --codex Alpha - >/dev/null
+
+printf 'a trailing --model fails with usage instead of hanging\n'
+# `shift 2 || true` with one argument left leaves the arguments untouched, so
+# the parser loop sees the same flag forever. It hung until it was killed.
+for args in "--model" "--codex --model" "--claude --model"; do
+  ( cl new $args >"$FIX/hang.out" 2>&1 & P=$!
+    ( sleep 5; kill -9 $P 2>/dev/null ) 2>/dev/null &
+    W=$!; wait $P 2>/dev/null; rc=$?; kill $W 2>/dev/null; echo "$rc" > "$FIX/hang.rc" ) 2>/dev/null
+  rc="$(cat "$FIX/hang.rc")"
+  check "cl new $args exits rather than looping" "1" "$rc"
+  case "$(cat "$FIX/hang.out")" in *usage:*) pass=$((pass+1)); printf '  ok   %s\n' "…with a usage message" ;;
+    *) fail=$((fail+1)); printf '  FAIL %s\n       got: %s\n' "…with a usage message" "$(cat "$FIX/hang.out")" ;; esac
+done
+
+printf 'every form of an explicit Codex model wins\n'
+# Codex parses with clap: -m V, -mV, --model V and --model=V are all valid.
+# Recognising only the spaced forms let two model options reach codex.
+cl model --codex T remembered-model >/dev/null
+for explicit in '-m explicit1' '--model explicit2' '--model=explicit3' '-mexplicit4'; do
+  rm -f "$FIX/argv.codex"
+  CLARGS="$explicit" cl --codex T >/dev/null 2>&1
+  check "[$explicit] leaves the remembered model out" "0" \
+    "$(grep -c '^remembered-model$' "$FIX/argv.codex")"
+done
+cl model --codex T - >/dev/null
+
+printf 'two writers do not lose each other\n'
+# An atomic rename keeps the file whole; it does not stop two shells reading the
+# same object and the later rename dropping the earlier edit.
+printf '{}\n' > "$MODELS"
+( cl model --claude WriterA model-a >/dev/null 2>&1 ) &
+( cl model --claude WriterB model-b >/dev/null 2>&1 ) &
+wait
+check "both entries survive" "model-a|model-b" \
+  "$(jq -r '"\(.claude.WriterA)|\(.claude.WriterB)"' "$MODELS")"
+check "…and no lock is left behind" "0" \
+  "$([ -e "$MODELS.lock" ] && echo 1 || echo 0)"
+
+# The above depends on two writers actually overlapping, which is timing. The
+# lock's contract is checked directly and deterministically here: a live holder
+# is waited for, a dead one is reclaimed — never the other way round, which is
+# how a lock either corrupts or wedges.
+printf 'the lock waits for a live holder and reclaims a dead one\n'
+MYTOK="$$:$(ps -o lstart= -p $$ 2>/dev/null | tr -s ' ' | tr ' ' '_')"
+ln -s "$MYTOK" "$MODELS.lock"
+out=$(cl model --claude Blocked nope 2>&1); rc=$?
+check "a live holder is not displaced" "1" "$rc"
+check "…its lock is byte-identical afterwards" "$MYTOK" "$(readlink "$MODELS.lock")"
+check "…and nothing was written" "null" "$(jq -r '.claude.Blocked // "null"' "$MODELS")"
+case "$out" in *"another process is updating"*) pass=$((pass+1)); printf '  ok   %s\n' "…and it says so" ;;
+  *) fail=$((fail+1)); printf '  FAIL %s\n       got: %s\n' "…and it says so" "$out" ;; esac
+rm -f "$MODELS.lock"
+# A pid that cannot be alive, with a token that therefore cannot match.
+ln -s "999999:Mon_Jan__1_00:00:00_2001" "$MODELS.lock"
+cl model --claude Reclaimed yes >/dev/null 2>&1
+check "a dead holder's lock is reclaimed" "yes" "$(jq -r '.claude.Reclaimed // "null"' "$MODELS")"
+check "…and released again" "0" "$([ -e "$MODELS.lock" ] && echo 1 || echo 0)"
+
+printf 'a create that cannot proceed leaves no preference behind\n'
+# `cl new --model X "Name" /missing` used to store X and then fail — a half-done
+# transaction presented as one step.
+printf '{}\n' > "$MODELS"
+out=$(cl new --model stored-too-early "Ghost" "$FIX/no-such-dir" 2>&1); rc=$?
+check "the create fails" "1" "$rc"
+check "…and nothing was remembered for it" "null" "$(jq -r '.claude.Ghost // "null"' "$MODELS")"
+out=$(cl new --model also-too-early "Ghost2" -d 2>&1); rc=$?
+check "an unset CL_DEFAULT_DIR fails too" "1" "$rc"
+check "…remembering nothing" "null" "$(jq -r '.claude.Ghost2 // "null"' "$MODELS")"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
