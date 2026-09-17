@@ -221,29 +221,46 @@ to your own tools beneath the import. See [`framework/README.md`](framework/READ
 ## Per-session model — `cl model`
 
 A session can remember which model it should start with. The choice is keyed by
-session **name**, so it survives the session being stopped, restarted, or
-resumed under a new transcript id.
+**agent and name** — the same identity the rest of the tool uses — so it
+survives the session being stopped, restarted, or resumed under a new
+transcript id, and a Claude session never picks up a Codex session's model
+because they happen to share a name.
 
 ```bash
-cl model                          # what is remembered, per session
+cl model                          # what is remembered, per agent and session
 cl model "API Work" opus          # this session starts with that model
+cl model --codex "API Work" gpt-5 # the Codex session of the same name
 cl model "API Work" -             # forget it — back to the agent's default
 cl new --model opus "Scratch"     # remember it and use it from the first launch
 ```
+
+The agent is inferred when the name belongs to exactly one session, and a name
+held by both is refused — `cl model <name> <id>` fails the same way
+`cl <name>` does, rather than guessing.
 
 The remembered model is applied at every launch path — `cl <name>`, `cl start`,
 the picker, and the tmux/cmux/iTerm variants of each. A session with no
 remembered model launches exactly as it did before: no flag is added.
 
 It becomes `--model <id>` for Claude and `-m <id>` for Codex. If
-`CL_CODEX_ARGS` already names a model, that explicit choice wins and the
+`CL_CODEX_ARGS` already names a model — in any form Codex accepts: `-m V`,
+`-mV`, `--model V` or `--model=V` — that explicit choice wins and the
 remembered one is skipped rather than passed as a second flag.
+
+`cl new --model` stores the choice only once the session is actually created:
+a run that refuses (no such directory, no `CL_DEFAULT_DIR`, no TTY and no tmux)
+leaves nothing behind.
 
 Values are stored in `~/.config/claude-session/models.json` and are restricted
 to letters, digits and `. _ - : /` — enough for a plain id or a fully qualified
 cloud resource name, and not enough to act as shell syntax when the value is
 spliced into a launch command. A value that fails the check is refused when set,
 and ignored (with a warning) if one is hand-edited into the file.
+
+Updates take a lock, so two shells setting different sessions cannot lose each
+other's change — an atomic rename keeps the file whole but does not prevent a
+lost update. The lock names its holder and is reclaimed only on proof that
+holder is gone.
 
 This file is yours and is never read from or written to the repository.
 

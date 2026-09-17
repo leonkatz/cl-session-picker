@@ -4,11 +4,18 @@ Form-factor choices that could have gone another way. Each entry records what
 was chosen, what it forecloses, and what would reverse it — so a later change
 is a deliberate reversal, not an accident.
 
-## 2026-09-15 — a remembered model is keyed by name, in its own file
+## 2026-09-15 — a remembered model is keyed by agent AND name, in its own file
 
-**Chose:** `cl model <name> <id>` stores the choice in
-`~/.config/claude-session/models.json` as `{"<name>": "<id>"}`, separate from
-`state.json`.
+**Chose:** `cl model [--codex|--claude] <name> <id>` stores the choice in
+`~/.config/claude-session/models.json` as `{"<agent>": {"<name>": "<id>"}}`,
+separate from `state.json`.
+
+Keyed by agent as well as name, corrected after review (2026-09-17). Name alone
+crossed the agent boundary: with a Claude and a Codex session both called
+`API`, `cl --claude API` resolves the ambiguity for the launch and would still
+have been handed the Codex model — `claude --model <a-codex-model>`. Session
+identity is `(agent, name)` everywhere else here; the store now matches, and a
+bare name that two agents share is refused rather than guessed.
 
 Not a field in `state.json`, which was the obvious place: that file is a
 snapshot of what was live at the last `cl stop`, and `cl start` consumes and
@@ -19,9 +26,8 @@ Keyed by name rather than session id because the name is what the user types
 and what stays stable; a session resumed into a new transcript keeps its name
 and should keep its model.
 
-**Forecloses:** two sessions with the same name across agents cannot hold
-different models — the same collision the rest of the tool already resolves
-with `--claude`/`--codex`, but here it resolves silently to one value.
+**Forecloses:** little now. A session must be discoverable for the agent to be
+inferred; otherwise the flag is required.
 
 **Reverses by:** deleting `valid_model`/`model_for`/`model_flag`/`set_model`/
 `do_model`, the `model` dispatcher arm, the `--model` flag in `do_new`, the
