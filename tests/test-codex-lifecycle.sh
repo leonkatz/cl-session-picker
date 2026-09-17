@@ -21,7 +21,15 @@ set -u
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 CL="$HERE/../bin/claude-session"
 FIX="$(mktemp -d "${TMPDIR:-/tmp}/cl-codex.XXXXXX")"
-cleanup() { [ -n "${VICTIM:-}" ] && kill "$VICTIM" 2>/dev/null; [ -n "${BYSTANDER:-}" ] && kill "$BYSTANDER" 2>/dev/null; rm -rf "$FIX"; }
+cleanup() {
+  local v
+  for v in "${VICTIM:-}" "${BYSTANDER:-}" "${LIVE:-}" "${OLDPROC:-}" "${NOTCODEX:-}" \
+           "${WRAP:-}" "${KID:-}" "${CSHARED:-}" "${XSHARED:-}" "${STILLUP:-}"; do
+    [ -n "$v" ] && kill "$v" 2>/dev/null
+  done
+  rm -rf "$FIX"
+  return 0
+}
 trap cleanup EXIT
 pass=0; fail=0
 check() { if [ "$2" = "$3" ]; then pass=$((pass+1)); printf '  ok   %s\n' "$1"; else fail=$((fail+1)); printf '  FAIL %s\n       expected [%s] got [%s]\n' "$1" "$2" "$3"; fi; }
@@ -31,11 +39,15 @@ command -v jq >/dev/null 2>&1 || setup_failed "jq is required by the code under 
 export HOME="$FIX/home"; export CODEX_HOME="$HOME/.codex"
 STATE="$HOME/.config/claude-session/state.json"
 PIDDIR="$HOME/.config/claude-session/pids"
-mkdir -p "$CODEX_HOME/sessions/2026/01/01" "$FIX/work" "$FIX/bin" "$PIDDIR" || setup_failed mkdir
+mkdir -p "$CODEX_HOME/sessions/2026/01/01" "$HOME/.claude/projects/p1" \
+         "$FIX/work" "$FIX/bin" "$PIDDIR" || setup_failed mkdir
 
 # Two discoverable Codex threads: Mine (cl launched it) and Theirs (it did not).
-mk_thread() { # <sid> <name>
-  printf '{"id":"%s","thread_name":"%s","updated_at":"2026-01-01T00:00:00Z"}\n' "$1" "$2" >> "$CODEX_HOME/session_index.jsonl"
+mk_thread() { # <sid> <name> [updated_at]
+  # The timestamp matters: discovery is newest-wins, so two threads sharing a
+  # name and a timestamp make "which one is current" ambiguous and every
+  # assertion downstream becomes a coin toss.
+  printf '{"id":"%s","thread_name":"%s","updated_at":"%s"}\n' "$1" "$2" "${3:-2026-01-01T00:00:00Z}" >> "$CODEX_HOME/session_index.jsonl"
   printf '{"type":"session_meta","payload":{"id":"%s","cwd":"%s"}}\n' "$1" "$FIX/work" \
     > "$CODEX_HOME/sessions/2026/01/01/rollout-2026-01-01T00-00-00-$1.jsonl"
 }
@@ -57,13 +69,20 @@ cl_iterm() { ( cd "$FIX" && env -i HOME="$HOME" CODEX_HOME="$CODEX_HOME" PATH="$
 # would have written when it launched it. Recording the START TOKEN is the whole
 # mechanism: it is what proves a pid has not been recycled into something else.
 reg_key() { printf '%s\037%s' "$2" "$1" | shasum -a 256 2>/dev/null | cut -c1-40; }
-register() { # name agent pid
+register() { # name agent pid [sid]
   local tok; tok=$(ps -o lstart= -p "$3" 2>/dev/null | tr -s ' ' | tr ' ' '_')
   [ -n "$tok" ] || setup_failed "could not read a start token for pid $3"
-  printf '%s\t%s\t%s\t%s\n' "$3" "$tok" "$2" "$1" > "$PIDDIR/$(reg_key "$1" "$2")"
+  # Five fields: the record binds the THREAD as well as the agent and name, so
+  # a newer same-named thread cannot be saved while the older one is killed.
+  printf '%s\t%s\t%s\t%s\t%s\n' "$3" "$tok" "$2" "$1" "${4:--}" > "$PIDDIR/$(reg_key "$1" "$2")"
 }
 
-sleep 600 & VICTIM=$!; disown "$VICTIM" 2>/dev/null || true
+# The stand-in has to LOOK like what it stands in for: stop now revalidates
+# that the pid is still running this agent immediately before signalling, so a
+# bare `sleep` is correctly refused. A fixture that ignores that tests nothing.
+/bin/sh -c 'exec -a "codex resume '"$SID_MINE"'" sleep 600' & VICTIM=$!
+disown "$VICTIM" 2>/dev/null || true
+sleep 0.5
 # The bystander's command line deliberately LOOKS like a codex resume of the
 # thread cl did not launch, so an implementation that fell back to matching argv
 # would find and signal it. A plain `sleep` here would survive either way, and
@@ -71,7 +90,7 @@ sleep 600 & VICTIM=$!; disown "$VICTIM" 2>/dev/null || true
 /bin/sh -c 'exec -a "codex resume '"$SID_THEIRS"'" sleep 600' & BYSTANDER=$!
 disown "$BYSTANDER" 2>/dev/null || true
 sleep 0.5
-register Mine codex "$VICTIM"
+register Mine codex "$VICTIM" "$SID_MINE"
 check "fixture: the launch record names the victim" "$VICTIM" \
   "$(cut -f1 "$PIDDIR/$(reg_key Mine codex)")"
 
@@ -149,8 +168,9 @@ case "$OSA" in *'cl \"Legacy\"'*) pass=$((pass+1)); printf '  ok   %s\n' "an age
   *) fail=$((fail+1)); printf '  FAIL %s\n       got: %s\n' "an agent-less row reopens as claude" "$OSA" ;; esac
 
 printf 'start: a session that is already live is not opened twice\n'
-sleep 600 & LIVE=$!; disown "$LIVE" 2>/dev/null || true
-register Live codex "$LIVE"
+/bin/sh -c 'exec -a "codex resume '"$SID_MINE"'" sleep 600' & LIVE=$!
+disown "$LIVE" 2>/dev/null || true
+register Live codex "$LIVE" "$SID_MINE"
 printf '[{"name":"Live","sid":"%s","cwd":"%s","agent":"codex"}]\n' "$SID_MINE" "$FIX/work" > "$STATE"
 rm -f "$FIX/osa.txt"
 out=$(cl start 2>&1)
@@ -159,6 +179,168 @@ case "$out" in *"Live already live"*) pass=$((pass+1)); printf '  ok   %s\n' "st
 check "…and opens no tab for it" "0" \
   "$([ -s "$FIX/osa.txt" ] && echo 1 || echo 0)"
 kill "$LIVE" 2>/dev/null
+
+printf 'the launch record names the THREAD, not just the name\n'
+# Codex display names are not unique over time: a newer thread with the same
+# name wins discovery. A name-only record let stop signal the OLDER thread's
+# process while save recorded the NEWER thread's id — stopped process and
+# restored transcript would be different sessions.
+SID_NEW=01dddddd-0000-7000-8000-0000000000dd
+mk_thread "$SID_NEW" Mine 2026-06-01T00:00:00Z   # same display name, NEWER thread
+check "fixture: discovery now reports the newer thread for that name" "$SID_NEW" \
+  "$(cl --discover 2>/dev/null | awk -F'\t' '$1=="Mine" && $5=="codex" {print $2}' | head -1)"
+/bin/sh -c 'exec -a "codex resume '"$SID_MINE"'" sleep 600' & OLDPROC=$!
+disown "$OLDPROC" 2>/dev/null || true
+sleep 0.5
+register Mine codex "$OLDPROC" "$SID_MINE"    # record bound to the OLD thread
+rm -f "$STATE"
+out=$(cl stop --keep-tabs 2>&1)
+sleep 1
+check "the old thread's process is not signalled" "alive" \
+  "$(kill -0 "$OLDPROC" 2>/dev/null && echo alive || echo dead)"
+check "…and the newer thread is not saved on the strength of that record" "" \
+  "$(jq -r '.[] | select(.name=="Mine") | .sid' "$STATE" 2>/dev/null)"
+kill "$OLDPROC" 2>/dev/null
+# Restore a single "Mine" so the sections below are not testing ambiguity.
+grep -v "$SID_NEW" "$CODEX_HOME/session_index.jsonl" > "$FIX/idx.tmp" && mv "$FIX/idx.tmp" "$CODEX_HOME/session_index.jsonl"
+
+printf 'a pid that is no longer this agent is not signalled\n'
+# The start token proves the pid was not recycled — to the second that ps
+# prints. It does not prove what the process IS: a launcher can exec something
+# else without changing pid or start time, and the record stays "valid".
+rm -f "$PIDDIR"/* "$STATE"
+sleep 600 & NOTCODEX=$!                      # a valid pid, wrong program
+disown "$NOTCODEX" 2>/dev/null || true
+sleep 0.5
+register Mine codex "$NOTCODEX" "$SID_MINE"
+out=$(cl stop --keep-tabs 2>&1)
+sleep 1
+check "a pid running something else survives" "alive" \
+  "$(kill -0 "$NOTCODEX" 2>/dev/null && echo alive || echo dead)"
+case "$out" in *"no longer running codex"*) pass=$((pass+1)); printf '  ok   %s\n' "…and stop says why" ;;
+  *) fail=$((fail+1)); printf '  FAIL %s\n       got: %s\n' "…and stop says why" "$out" ;; esac
+kill "$NOTCODEX" 2>/dev/null
+
+printf 'a surviving child means the stop is reported incomplete\n'
+# The npm launcher is a node wrapper plus a native child. If the wrapper does
+# not replace itself, SIGTERM removes the wrapper and the client keeps the
+# transcript open — reporting "killed" hands back an untracked session.
+rm -f "$PIDDIR"/* "$STATE"
+cat > "$FIX/wrapper.sh" <<WRAP
+#!/bin/sh
+( exec -a "codex child of wrapper" sleep 600 ) &
+echo \$! > "$FIX/child.pid"
+exec -a "codex wrapper resume $SID_MINE" sleep 600
+WRAP
+chmod +x "$FIX/wrapper.sh"
+"$FIX/wrapper.sh" & WRAP=$!
+disown "$WRAP" 2>/dev/null || true
+sleep 1
+KID="$(cat "$FIX/child.pid" 2>/dev/null)"
+check "fixture: the child is a child of the registered pid" "1" \
+  "$(pgrep -P "$WRAP" 2>/dev/null | grep -c "^${KID}$")"
+register Mine codex "$WRAP" "$SID_MINE"
+out=$(cl stop --keep-tabs 2>&1)
+sleep 1
+check "the wrapper is gone" "dead" "$(kill -0 "$WRAP" 2>/dev/null && echo alive || echo dead)"
+check "…the child is still up" "alive" "$(kill -0 "$KID" 2>/dev/null && echo alive || echo dead)"
+case "$out" in *"child of it is still running"*) pass=$((pass+1)); printf '  ok   %s\n' "…so stop reports it incomplete, not killed" ;;
+  *) fail=$((fail+1)); printf '  FAIL %s\n       got: %s\n' "…so stop reports it incomplete, not killed" "$out" ;; esac
+case "$out" in *"killed Mine"*) fail=$((fail+1)); printf '  FAIL %s\n' "…and never claims it killed it" ;;
+  *) pass=$((pass+1)); printf '  ok   %s\n' "…and never claims it killed it" ;; esac
+check "…keeping ownership so a retry can finish it" "1" \
+  "$([ -e "$PIDDIR/$(reg_key Mine codex)" ] && echo 1 || echo 0)"
+kill "$KID" 2>/dev/null
+
+printf 'a tmux session cl did not create is never killed\n'
+# A tmux session NAME is derived from the display name and the derivation
+# collides, so name equality is not proof of ownership. Only cl's own stamp is.
+rm -f "$PIDDIR"/* "$STATE"
+mkdir -p "$FIX/tmuxbin"
+cat > "$FIX/tmuxbin/tmux" <<TMUXEOF
+#!/bin/sh
+printf '%s\n' "\$*" >> "$FIX/tmux.calls"
+case "\$1" in
+  has-session)  exit 0 ;;                        # something IS sitting there
+  show-option)  [ -f "$FIX/stamped" ] || exit 0  # unstamped: print nothing
+                # `tmux show-option -qv -t <target> <option>`: the option name
+                # is the FIFTH argument, not the fourth (that is the target).
+                case "\$5" in @cl_agent) echo codex ;; @cl_sid) echo "$SID_MINE" ;; esac ;;
+esac
+exit 0
+TMUXEOF
+chmod +x "$FIX/tmuxbin/tmux"
+cl_tmux() { ( cd "$FIX" && env -i HOME="$HOME" CODEX_HOME="$CODEX_HOME" \
+              PATH="$FIX/tmuxbin:$BASEPATH" bash "$CL" "$@" ) ; }
+rm -f "$FIX/tmux.calls" "$FIX/stamped"
+out=$(cl_tmux stop --keep-tabs 2>&1)
+check "an unstamped tmux session is not killed" "0" \
+  "$(grep -c 'kill-session' "$FIX/tmux.calls" 2>/dev/null)"
+case "$out" in *"no cl ownership stamp"*) pass=$((pass+1)); printf '  ok   %s\n' "…and stop says why it left it" ;;
+  *) fail=$((fail+1)); printf '  FAIL %s\n       got: %s\n' "…and stop says why it left it" "$out" ;; esac
+# …and one cl did stamp, for this thread, is killed as before.
+rm -f "$FIX/tmux.calls" "$STATE"; touch "$FIX/stamped"
+out=$(cl_tmux stop --keep-tabs 2>&1)
+check "a stamped session IS killed" "1" \
+  "$(grep -c 'kill-session' "$FIX/tmux.calls" 2>/dev/null)"
+rm -f "$FIX/stamped"
+
+printf 'same-named Claude and Codex sessions both survive a stop\n'
+# The launcher made agent part of session identity; the state union grouped by
+# name alone and silently dropped one of them.
+rm -f "$PIDDIR"/* "$STATE" "$FIX/tmux.calls"
+printf '{"cwd":"%s"}\n{"customTitle":"Shared"}\n' "$FIX/work" > "$HOME/.claude/projects/p1/c-shared.jsonl"
+SID_SHARED=01eeeeee-0000-7000-8000-0000000000ee
+mk_thread "$SID_SHARED" Shared
+/bin/sh -c 'exec -a "claude --resume shared-claude-sid" sleep 600' & CSHARED=$!
+/bin/sh -c 'exec -a "codex resume '"$SID_SHARED"'" sleep 600' & XSHARED=$!
+disown "$CSHARED" 2>/dev/null || true; disown "$XSHARED" 2>/dev/null || true
+sleep 0.5
+register Shared claude "$CSHARED"
+register Shared codex  "$XSHARED" "$SID_SHARED"
+cl stop --keep-tabs >/dev/null 2>&1
+sleep 1
+check "both rows are in the snapshot" "claude|codex" \
+  "$(jq -r '[.[] | select(.name=="Shared") | .agent] | sort | join("|")' "$STATE" 2>/dev/null)"
+check "…and both processes were stopped" "dead|dead" \
+  "$(kill -0 "$CSHARED" 2>/dev/null && printf alive || printf dead)|$(kill -0 "$XSHARED" 2>/dev/null && printf alive || printf dead)"
+kill "$CSHARED" "$XSHARED" 2>/dev/null
+
+printf 'start keeps the rows it skipped instead of consuming them\n'
+# agent_live is deliberately optimistic, so a stale signal can drop a session
+# from the restart set. Deleting the whole file treated "skipped" as "handled",
+# and recovery then required knowing to run cl restore.
+rm -f "$PIDDIR"/*
+/bin/sh -c 'exec -a "codex resume '"$SID_MINE"'" sleep 600' & STILLUP=$!
+disown "$STILLUP" 2>/dev/null || true
+sleep 0.5
+register Live codex "$STILLUP" "$SID_MINE"
+printf '[{"name":"Live","sid":"%s","cwd":"%s","agent":"codex"},{"name":"Gone","sid":"zzz","cwd":"%s","agent":"claude"}]\n' \
+  "$SID_MINE" "$FIX/work" "$FIX/work" > "$STATE"
+out=$(cl_iterm start 2>&1)
+check "the live row is kept for next time" "Live" \
+  "$(jq -r '.[].name' "$STATE" 2>/dev/null | tr '\n' ' ' | sed 's/ $//')"
+case "$out" in *"left in"*) pass=$((pass+1)); printf '  ok   %s\n' "…and start says so" ;;
+  *) fail=$((fail+1)); printf '  FAIL %s\n       got: %s\n' "…and start says so" "$out" ;; esac
+kill "$STILLUP" 2>/dev/null
+# When nothing is skipped the file is consumed exactly as before.
+printf '[{"name":"Gone2","sid":"yyy","cwd":"%s","agent":"claude"}]\n' "$FIX/work" > "$STATE"
+cl_iterm start >/dev/null 2>&1
+check "a fully-handled start still clears the file" "0" \
+  "$([ -f "$STATE" ] && echo 1 || echo 0)"
+
+printf 'a stored thread with nothing running is not reported at all\n'
+# discover() lists every Codex thread ever named, not the running ones. Warning
+# per row means dozens of alarms about history that has no process and no tab —
+# the noise that makes a real warning unreadable.
+mk_thread 01ffffff-0000-7000-8000-0000000000ff Historical
+rm -f "$STATE"
+out=$(cl stop --keep-tabs 2>&1)
+case "$out" in *Historical*) fail=$((fail+1)); printf '  FAIL %s\n       got: %s\n' "a dormant thread produces no warning" "$out" ;;
+  *) pass=$((pass+1)); printf '  ok   %s\n' "a dormant thread produces no warning" ;; esac
+check "…and it is not saved either" "" \
+  "$(jq -r '.[] | select(.name=="Historical") | .name' "$STATE" 2>/dev/null)"
+
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

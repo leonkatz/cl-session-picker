@@ -27,7 +27,23 @@ because its two failure directions are not symmetric. A false positive costs a
 tab reopened by hand; a false negative starts a second client on a live session.
 
 **Forecloses:** a one-command teardown of a Codex session started outside cl.
-That remains manual, and says so on screen.
+That remains manual, and says so on screen — when there is any sign it is
+running. A stored thread with no process is not mentioned at all; `discover`
+lists every thread ever named, and a warning per row would bury the real ones.
+
+**Sharpened after review (2026-09-17):** the record binds the THREAD as well as
+the agent and name, because a newer same-named thread wins discovery and a
+name-only record could stop one session while saving another. A tmux session is
+killed only if it carries cl's own `@cl_agent`/`@cl_sid` stamp — a matching name
+is not proof, since the derivation collides. The pid is re-checked to still be
+running that agent immediately before the signal (a start token is
+second-resolution, and a launcher can `exec` something else without changing
+either), and children captured before the signal are checked after it, so a
+surviving native client is reported instead of being called "killed".
+
+**Known gap, stated rather than hidden:** the same tmux name-equality hazard
+exists for Claude, which predates this and is unchanged here. Claude's bare-mode
+path is covered by the registry; its tmux path still trusts the name.
 
 **Reverses by:** deleting `agent_live`, restoring the `[ "$agent" = "claude" ] ||
 continue` filters in `save_state` and `do_stop`, dropping the `agent` column

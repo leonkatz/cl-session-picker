@@ -553,7 +553,10 @@ reg_file() { # name [agent]
 # The caller must capture the token BEFORE killing: it cannot be read back out
 # of a dead process.
 clear_launch() { # name agent expected-pid expected-token
-  local f lock me rpid rtok ragent rname
+  # Five fields since the record binds the sid: `read` gives the remainder to
+  # the LAST variable, so reading four made rname absorb "name<TAB>sid", the
+  # ownership comparison never matched, and a retired record was left behind.
+  local f lock me rpid rtok ragent rname rsid
   [ -n "${3:-}" ] && [ -n "${4:-}" ] || return 0
   f=$(reg_file "$1" "${2:-claude}"); lock="${f}.lock"
   [ -r "$f" ] || return 0
@@ -562,7 +565,7 @@ clear_launch() { # name agent expected-pid expected-token
   # one and tell the user to delete a perfectly valid lock.
   me=$(claim_token); case "$me" in *:) return 0 ;; esac
   ln -s "$me" "$lock" 2>/dev/null || return 0
-  IFS=$(printf '\t') read -r rpid rtok ragent rname < "$f" 2>/dev/null
+  IFS=$(printf '\t') read -r rpid rtok ragent rname rsid < "$f" 2>/dev/null
   if [ "$rpid" = "$3" ] && [ "$rtok" = "$4" ] \
      && [ "$ragent" = "${2:-claude}" ] && [ "$rname" = "$1" ]; then
     rm -f "$f" 2>/dev/null
@@ -592,14 +595,20 @@ claim_token() { printf '%s:%s' "$$" "$(start_token $$)"; }
 # agent untracked and duplicable. A stale record is harmless — every reader
 # validates before trusting, and acquire_launch overwrites it while holding the
 # lock — so nothing here mutates.
-registered_pid() { # name [agent] -> live pid we launched, or nothing
-  local f pid started ragent rname now
+registered_pid() { # name [agent] [expected-sid] -> live pid we launched, or nothing
+  local f pid started ragent rname rsid now
   f=$(reg_file "$1" "${2:-claude}")
   [ -r "$f" ] || return 0
-  IFS=$(printf '\t') read -r pid started ragent rname < "$f" || return 0
+  IFS=$(printf '\t') read -r pid started ragent rname rsid < "$f" || return 0
   case "$pid" in ''|*[!0-9]*) return 0 ;; esac
   # A record must prove it is about THIS session before a kill path sees it.
   [ "$ragent" = "${2:-claude}" ] && [ "$rname" = "$1" ] || return 0
+  # …and about this THREAD, when the caller knows which one it means. An
+  # unbound record ("-", or one written before sids were recorded) can never
+  # satisfy that, so it is not a stop handle.
+  if [ -n "${3:-}" ]; then
+    [ -n "$rsid" ] && [ "$rsid" != "-" ] && [ "$rsid" = "$3" ] || return 0
+  fi
   now=$(start_token "$pid")
   # Gone, or the pid was recycled into a different process: the record is a
   # lie, so report nothing — but leave it for the lock holder to replace.
@@ -620,10 +629,23 @@ registered_pid() { # name [agent] -> live pid we launched, or nothing
 # still shutting down (SessionEnd hooks can take a moment). A caller must NOT
 # retire the ownership record in that case: until the process is really gone,
 # that record is the only thing stopping a second agent from launching.
-retire_process() { # pid token [exit-wait-tries]
-  local i=0 max="${3:-30}"
+# retire_process pid token [exit-wait-tries] [expected-command-substring]
+#
+# The token proves the pid was not recycled, but only to the resolution ps
+# prints — and a launcher can exec something else without changing either pid
+# or start time, so the record stays "valid" while naming a different program.
+# When the caller knows what should be running, that is checked too, at the
+# last moment before the signal.
+retire_process() {
+  local i=0 max="${3:-30}" want="${4:-}"
   [ -n "$1" ] && [ -n "$2" ] || return 1
   [ "$(start_token "$1")" = "$2" ] || return 1     # not the process we meant
+  if [ -n "$want" ]; then
+    case "$(ps -o command= -p "$1" 2>/dev/null)" in
+      *"$want"*) ;;
+      *) return 3 ;;                                # the pid is someone else now
+    esac
+  fi
   kill "$1" 2>/dev/null || return 1
   while [ "$(start_token "$1")" = "$2" ]; do
     i=$((i+1)); [ "$i" -gt "$max" ] && return 2
@@ -717,7 +739,14 @@ acquire_launch() {
   # that is about to replace this shell. Written, then read back: a record that
   # did not land means the session would be unidentifiable, which is the whole
   # failure this registry exists to prevent — so that fails closed too.
-  if ! printf '%s\t%s\t%s\t%s\n' "$$" "$me" "${2:-claude}" "$1" > "$f" 2>/dev/null; then
+  # The SID is part of the record, not just an argument. Without it the record
+  # proves only that SOME process was launched under this agent and name — and
+  # names are not unique over time: a newer Codex thread with the same display
+  # name wins discovery, so stop could signal the older thread's process while
+  # save recorded the newer thread's id. Stopped process and restored transcript
+  # would then be different sessions. "-" marks a launch with no id yet (a fresh
+  # unnamed Codex thread); such a record is never accepted as a stop handle.
+  if ! printf '%s\t%s\t%s\t%s\t%s\n' "$$" "$me" "${2:-claude}" "$1" "${3:--}" > "$f" 2>/dev/null; then
     rm -f "$f" "$lock" 2>/dev/null
     echo "claude-session: cannot write the ownership record in $PID_DIR — refusing to launch untracked" >&2
     return 2
@@ -751,6 +780,65 @@ session_pid() { # sid [agent] [name]
 # has no parent shell to `fg` from (recovery requires kill -CONT). Shells still
 # get Ctrl-Z so job control works in normal panes. Applied here rather than
 # ~/.tmux.conf so cl is self-contained on any machine.
+# agent_hint <agent>: the substring a process running this agent must contain.
+# Deliberately loose — it has to match `claude`, `cmux claude-teams`, `codex`
+# and `cmux codex-teams` alike. It is a check that the pid is still the KIND of
+# thing we launched, never a way to find a process.
+agent_hint() { case "$1" in codex) printf 'codex' ;; *) printf 'claude' ;; esac; }
+
+# surviving_children <hint> <pid-list>: those still alive and still this agent.
+#
+# Signalling the process cl launched does not prove the client is gone. The npm
+# launcher is a node wrapper plus a native child; if the wrapper does not
+# replace itself, SIGTERM removes the wrapper and the child keeps the
+# transcript open. Reporting "killed" then hands back an untracked client.
+# Children are captured BEFORE the kill — afterwards they are reparented and
+# `pgrep -P` can no longer find them.
+surviving_children() {
+  local hint="$1" k out=""
+  shift
+  for k in "$@"; do
+    kill -0 "$k" 2>/dev/null || continue
+    case "$(ps -o command= -p "$k" 2>/dev/null)" in
+      *"$hint"*) out="$out $k" ;;
+    esac
+  done
+  printf '%s' "${out# }"
+}
+
+# tmux_start_and_attach <t> <cwd> <cmd> <agent> [sid]: create, stamp, attach.
+#
+# Split from the old single `new-session -A` so the ownership stamp is written
+# by the same code path that creates the session — every creation site goes
+# through here, so none can quietly skip it.
+tmux_start_and_attach() {
+  tmux new-session -d -A -s "$1" -c "$2" "$3" && tmux_claim "$1" "$4" "${5:--}"
+  exec tmux attach-session -t "=$1"
+}
+
+# tmux_claim <tmux-session> <agent> <sid>: stamp a session cl just created.
+#
+# A tmux session NAME is not proof cl created it: the name is derived from the
+# display name, the derivation collides ("A B" and "A.B" map to one identity),
+# and anything may already be sitting at it. A user option is proof — nothing
+# but this function writes it.
+tmux_claim() {
+  tmux set-option -t "=$1" "@cl_agent" "$2" >/dev/null 2>&1 || return 0
+  tmux set-option -t "=$1" "@cl_sid" "${3:--}" >/dev/null 2>&1 || return 0
+  return 0
+}
+
+# tmux_owned <tmux-session> <agent> [sid]: did cl create this one, for this
+# thread? Used on the KILL path only, where a wrong answer ends someone's work.
+tmux_owned() {
+  local a s2
+  a=$(tmux show-option -qv -t "=$1" "@cl_agent" 2>/dev/null)
+  s2=$(tmux show-option -qv -t "=$1" "@cl_sid" 2>/dev/null)
+  [ "$a" = "$2" ] || return 1
+  [ -n "${3:-}" ] || return 0
+  [ -n "$s2" ] && [ "$s2" != "-" ] && [ "$s2" = "$3" ]
+}
+
 # agent_live <agent> <sid> <name>: is something already working this session?
 #
 # Used by `cl start` only, where the bias is deliberately the opposite of the
@@ -867,7 +955,7 @@ launch_session() { # name sid cwd [agent]
   in_iterm && tag_iterm_session "$t"
   if use_tmux; then
     tmux_setup
-    exec tmux new-session -A -s "$t" -c "$cwd" "$cmd"
+    tmux_start_and_attach "$t" "$cwd" "$cmd" "$agent" "$sid"
   else
     pid=$(acquire_launch "$name" "$agent" "$sid"); local arc=$?
     if [ "$arc" -eq 1 ]; then
@@ -892,7 +980,7 @@ launch_new() { # cwd [agent]
   t="$agent-$(basename "$cwd")"
   if use_tmux; then
     tmux_setup
-    exec tmux new-session -A -s "$t" -c "$cwd" "$cmd"
+    tmux_start_and_attach "$t" "$cwd" "$cmd" "$agent"
   else
     drop_cmux_env; cd "$cwd" || exit 1; eval "exec $cmd"
   fi
@@ -926,7 +1014,7 @@ launch_named() { # name cwd [agent]
   in_iterm && tag_iterm_session "$t"
   if use_tmux; then
     tmux_setup
-    exec tmux new-session -A -s "$t" -c "$cwd" "$cmd"
+    tmux_start_and_attach "$t" "$cwd" "$cmd" "$agent"
   else
     local owner arc
     owner=$(acquire_launch "$name" "$agent"); arc=$?
@@ -1160,7 +1248,7 @@ save_state() {
           || [ -n "$(session_pid "$sid" claude "$name")" ] || continue
       elif [ "$agent" = "codex" ]; then
         tmux has-session -t "$(tmux_name "$name" codex)" 2>/dev/null \
-          || [ -n "$(registered_pid "$name" codex)" ] || continue
+          || [ -n "$(registered_pid "$name" codex "$sid")" ] || continue
       else
         continue
       fi
@@ -1176,8 +1264,11 @@ save_state() {
   local prior="[]"
   [ -r "$STATE" ] && prior="$(jq -c '.' "$STATE" 2>/dev/null || printf '[]')"
   local tmp="$STATE.tmp.$$"
+  # Grouped by AGENT AND NAME. Grouping on the name alone silently dropped a
+  # row when a Claude and a Codex session shared one — and since stop kills
+  # both, start could then restore only one of them.
   if printf '%s\n%s\n' "$prior" "$live" \
-      | jq -s 'add | group_by(.name) | map(.[-1])' > "$tmp" 2>/dev/null; then
+      | jq -s 'add | group_by([(.agent // "claude"), .name]) | map(.[-1])' > "$tmp" 2>/dev/null; then
     mv "$tmp" "$STATE"
     archive_state   # bank this known-good snapshot into the rotating history
   else
@@ -1214,6 +1305,14 @@ do_stop() {
     case "$agent" in claude|codex) ;; *) continue ;; esac
     t=$(tmux_name "$name" "$agent")
     if tmux has-session -t "=${t}" 2>/dev/null; then
+      # For Codex, a matching tmux NAME is not authority to kill — only cl's own
+      # ownership stamp is. Without it the session belongs to someone else, or
+      # to a collision in the name derivation, and killing it would break the
+      # exact promise this path advertises.
+      if [ "$agent" = "codex" ] && ! tmux_owned "$t" codex "$sid"; then
+        printf '⚠ leaving %s — a tmux session sits at %s but carries no cl ownership stamp for this thread; not cl'"'"'s to kill.\n' "$name" "$t" >&2
+        continue
+      fi
       if session_busy "$t"; then
         printf '⏳ "%s" looks mid-task. Kill it anyway? [y/N] ' "$name" >&2
         read -r ans </dev/tty
@@ -1242,9 +1341,16 @@ do_stop() {
     # attached over --remote — is reported and left alone rather than guessed
     # at, because an argv match there can name an unrelated process.
     if [ "$agent" = "codex" ]; then
-      pid=$(registered_pid "$name" codex)
+      pid=$(registered_pid "$name" codex "$sid")
       if [ -z "$pid" ]; then
-        printf '⚠ leaving %s — cl has no launch record for this Codex session, so it has no safe way to identify the process. Close it in its own tab.\n' "$name" >&2
+        # discover() lists every STORED Codex thread, not the running ones. A
+        # warning per row would mean dozens of alarms about history that has no
+        # process and no tab to close. Say something only when there is at least
+        # weak evidence of a live client — an argv match is enough to justify a
+        # warning, though never a kill.
+        if [ -n "$(session_pid "$sid" codex "$name")" ]; then
+          printf '⚠ leaving %s — something looks like it is running this Codex thread, but cl has no launch record for it and cannot identify the process safely. Close it in its own tab.\n' "$name" >&2
+        fi
         continue
       fi
     else
@@ -1253,6 +1359,10 @@ do_stop() {
     # Captured now: a dead process has no start time to read back, and without
     # it cleanup cannot tell this owner from a replacement that reused the pid.
     ptok=$(start_token "$pid")
+    _hint=$(agent_hint "$agent")
+    # Captured before the signal: after it, these are reparented to launchd and
+    # `pgrep -P "$pid"` returns nothing, so a surviving client would be invisible.
+    _kids=$(pgrep -P "$pid" 2>/dev/null | tr '\n' ' ')
     # Safety: a claude whose PARENT is a tmux server belongs to tmux — if we
     # can't see that server (different socket/user context), it is not ours
     # to process-kill. This branch only ever touches cmux/bare claudes.
@@ -1274,23 +1384,35 @@ do_stop() {
       printf '⏳ "%s" looks mid-task (pid %s). Kill it anyway? [y/N] ' "$name" "$pid" >&2
       read -r ans </dev/tty
       case "$ans" in
-        y|Y)  retire_process "$pid" "$ptok"; rrc=$?
+        y|Y)  retire_process "$pid" "$ptok" 30 "$_hint"; rrc=$?
               case "$rrc" in
-                0) printf '   killed %s\n' "$name" >&2; clear_launch "$name" "$agent" "$pid" "$ptok"
-                   [ "$close_tabs" = "1" ] && close_iterm_tab "$t"; close_cmux_surface "$sid" "$name" ;;
+                0) _surv=$(surviving_children "$_hint" $_kids)
+                   if [ -n "$_surv" ]; then
+                     printf '⚠ signalled %s, but a child of it is still running (pid%s %s) — keeping ownership so a retry can finish it\n' "$name" "$( [ "${_surv# *}" = "$_surv" ] && printf '' || printf 's')" "$_surv" >&2
+                   else
+                     printf '   killed %s\n' "$name" >&2; clear_launch "$name" "$agent" "$pid" "$ptok"
+                     [ "$close_tabs" = "1" ] && close_iterm_tab "$t"; close_cmux_surface "$sid" "$name"
+                   fi ;;
                 2) printf '   signalled %s — still shutting down, leaving it registered\n' "$name" >&2
                    [ "$close_tabs" = "1" ] && close_iterm_tab "$t"; close_cmux_surface "$sid" "$name" ;;
+                3) printf '⚠ %s: pid %s is no longer running %s — not signalling it\n' "$name" "$pid" "$_hint" >&2 ;;
                 *) printf '⚠ %s exited while stop was deciding — not signalling anything\n' "$name" >&2 ;;
               esac ;;
         *)    printf '   left %s running — re-run cl stop later to close it\n' "$name" >&2 ;;
       esac
     else
-      retire_process "$pid" "$ptok"; rrc=$?
+      retire_process "$pid" "$ptok" 30 "$_hint"; rrc=$?
       case "$rrc" in
-        0) printf '✓ killed %s\n' "$name" >&2; clear_launch "$name" "$agent" "$pid" "$ptok"
-           [ "$close_tabs" = "1" ] && close_iterm_tab "$t"; close_cmux_surface "$sid" "$name" ;;
+        0) _surv=$(surviving_children "$_hint" $_kids)
+           if [ -n "$_surv" ]; then
+             printf '⚠ signalled %s, but a child of it is still running (pid %s) — keeping ownership so a retry can finish it\n' "$name" "$_surv" >&2
+           else
+             printf '✓ killed %s\n' "$name" >&2; clear_launch "$name" "$agent" "$pid" "$ptok"
+             [ "$close_tabs" = "1" ] && close_iterm_tab "$t"; close_cmux_surface "$sid" "$name"
+           fi ;;
         2) printf '✓ signalled %s — still shutting down, leaving it registered\n' "$name" >&2
            [ "$close_tabs" = "1" ] && close_iterm_tab "$t"; close_cmux_surface "$sid" "$name" ;;
+        3) printf '⚠ %s: pid %s is no longer running %s — not signalling it\n' "$name" "$pid" "$_hint" >&2 ;;
         *) printf '⚠ %s exited before stop could signal it\n' "$name" >&2 ;;
       esac
     fi
@@ -1345,11 +1467,13 @@ do_start() {
     # cmux mode: one workspace per saved session, claude resumed tmux-free so
     # cmux's integration owns it. --focus false so eight restores don't fight
     # over focus. Live sessions (either kind) are left alone.
-    local name sid cwd agent i=0
+    local name sid cwd agent i=0 _skipped
+    _skipped="$STATE.skipped.$$"; : > "$_skipped"
     while IFS=$'\t' read -r name sid cwd agent; do
       agent="${agent:-claude}"
       if agent_live "$agent" "$sid" "$name"; then
         printf '● %s already live\n' "$name"
+        printf '%s\t%s\n' "$agent" "$name" >> "$_skipped"
       else
         [ -d "$cwd" ] || cwd="$HOME"
         cmux new-workspace --name "$name" --cwd "$cwd" --focus false \
@@ -1357,8 +1481,7 @@ do_start() {
           && { printf '✓ opened %s  (%s)\n' "$name" "$cwd"; i=$((i+1)); }
       fi
     done < <(jq -r '.[] | [.name, .sid, .cwd, (.agent // "claude")] | @tsv' "$STATE")
-    archive_state
-    rm -f "$STATE"
+    consume_state "$(cat "$_skipped")"; rm -f "$_skipped"
     printf '\nopened %s cmux workspace(s).\n' "$i"
     exit 0
   fi
@@ -1380,14 +1503,14 @@ do_start() {
       # for one would start a SECOND agent on the same transcript.
       if agent_live "$agent" "$sid" "$name"; then
         printf '● %s already live\n' "$name"
-        live_names="${live_names}${name}"$'\n'
+        live_names="${live_names}${agent}"$'\t'"${name}"$'\n'
       fi
     elif tmux has-session -t "=${t}" 2>/dev/null; then
       printf '● %s already live\n' "$name"
-      live_names="${live_names}${name}"$'\n'
+      live_names="${live_names}${agent}"$'\t'"${name}"$'\n'
     else
       tmux new-session -d -s "$t" -c "$cwd" "$(resume_cmd "$agent" "$sid" "$name")" \
-        && printf '✓ prepared %s  (%s)\n' "$name" "$cwd"
+        && { tmux_claim "$t" "$agent" "$sid"; printf '✓ prepared %s  (%s)\n' "$name" "$cwd"; }
     fi
     i=$((i+1))
   done < <(jq -r '.[] | [.name, .sid, .cwd, (.agent // "claude")] | @tsv' "$STATE")
@@ -1399,16 +1522,16 @@ do_start() {
   # so the agent has to travel with the name, not be re-guessed in the tab.
   local -a names=()
   while IFS= read -r line; do
-    name="${line#*$'\t'}"
     # Skip the ones reported live above: opening a tab for them duplicates.
-    printf '%s' "$live_names" | grep -qxF -- "$name" && continue
+    # Matched on the whole "<agent><TAB><name>" line, not on the name alone:
+    # one agent's "Review" being live must not suppress the other agent's tab.
+    printf '%s' "$live_names" | grep -qxF -- "$line" && continue
     names+=("$line")
   done < <(jq -r '.[] | [(.agent // "claude"), .name] | @tsv' "$STATE")
 
   # Snapshot consumed: archive a copy first (so a failed relaunch never loses the
   # list — restore from STATE_HISTORY_DIR), then clear for the next clean cycle.
-  archive_state
-  rm -f "$STATE"
+  consume_state "$live_names"
 
   # Open tabs only when THIS shell is iTerm-hosted (in_iterm). Inside a tmux
   # pane TERM_PROGRAM reads "tmux", so in_iterm is false there — cl start then
@@ -1434,6 +1557,36 @@ do_start() {
         *)            printf '  cl "%s"\n' "${line#*$'\t'}" ;;
       esac
     done
+  fi
+}
+
+# consume_state <live-lines>: archive the snapshot, then keep only the rows
+# start did NOT act on.
+#
+# Deleting the whole file treated "skipped because it looked live" as
+# successfully handled. It is not: `agent_live` is deliberately optimistic, so a
+# stale signal could drop a session from the restart set and the only way back
+# was knowing to run `cl restore`. Rows that were skipped stay in the file, so
+# the next `cl start` picks them up once they really are gone.
+consume_state() {
+  local kept line
+  archive_state
+  if [ -z "$1" ]; then rm -f "$STATE"; return 0; fi
+  kept="$(printf '%s' "$1" | jq -R -s 'split("\n") | map(select(length > 0))
+            | map(split("\t")) | map({agent: .[0], name: .[1]})' 2>/dev/null)" || kept=""
+  if [ -z "$kept" ] \
+     || ! jq --argjson keep "$kept" \
+            '[ .[] | select( . as $r | $keep | any(.agent == ($r.agent // "claude") and .name == $r.name) ) ]' \
+            "$STATE" > "$STATE.tmp.$$" 2>/dev/null; then
+    rm -f "$STATE.tmp.$$"; rm -f "$STATE"          # never leave a half-written list
+    return 0
+  fi
+  if [ "$(jq 'length' "$STATE.tmp.$$" 2>/dev/null || echo 0)" = "0" ]; then
+    rm -f "$STATE.tmp.$$" "$STATE"
+  else
+    mv "$STATE.tmp.$$" "$STATE"
+    printf '\n%s session(s) left in %s — they looked live, so nothing was opened for them.\n' \
+      "$(printf '%s' "$1" | grep -c .)" "$STATE"
   fi
 }
 

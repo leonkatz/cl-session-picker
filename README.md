@@ -299,8 +299,26 @@ native child that *both* match. Signalling on that basis can hit an unrelated
 process.
 
 So `cl stop` uses only the launch registry: a pid `cl` itself recorded, with a
-process start token, under that exact agent and name. A Codex session it has no
-record for is reported and left running, with its own tab to close:
+process start token, under that exact agent, name **and thread id** — names are
+not unique over time, and a newer thread with the same name wins discovery, so
+a name-only record could have stopped one session while saving another.
+
+Before signalling, it re-checks that the pid is still running that agent: a
+start token is second-resolution and a launcher can `exec` something else
+without changing pid or start time. Afterwards it checks that no child of the
+process survived — the npm launcher is a wrapper plus a native child, and
+killing the wrapper alone would leave a client on the transcript. If one
+survives, the stop is reported incomplete and ownership is kept so a retry can
+finish it.
+
+A tmux-hosted Codex session is only killed if it carries `cl`'s own ownership
+stamp (`@cl_agent` / `@cl_sid`, set when `cl` creates the session). A matching
+tmux *name* is not proof: the name is derived from the display name and the
+derivation collides.
+
+A Codex session it has no record for is reported and left running, with its own
+tab to close — but only when something suggests it is actually being served.
+Stored threads with no process produce no warning at all:
 
 ```
 ⚠ leaving Review — cl has no launch record for this Codex session, so it has
@@ -313,7 +331,9 @@ clients on one transcript.
 
 `cl start` is the reverse case and uses the looser test on purpose: any sign of
 life means skip. A false positive costs a tab you reopen by hand; a false
-negative starts a second client on a live transcript.
+negative starts a second client on a live transcript. Rows skipped that way stay
+in `state.json` rather than being consumed, so the next `cl start` picks them up
+once they really are gone — you do not have to know to run `cl restore`.
 
 ### State history (recovery)
 
