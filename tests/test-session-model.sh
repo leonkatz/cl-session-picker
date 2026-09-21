@@ -54,7 +54,7 @@ mk_fake codex  "$FIX/argv.codex"
 # thing under test rather than a tmux command string.
 BASEPATH="$FIX/bin:/usr/bin:/bin"
 
-cl() { ( cd "$FIX" && env -i HOME="$HOME" CODEX_HOME="$CODEX_HOME" PATH="$BASEPATH" \
+cl() { ( cd "$FIX" && env -i HOME="$HOME" CODEX_HOME="$CODEX_HOME" PATH="${CLPATH:-$BASEPATH}" \
          ${CLARGS:+CL_CODEX_ARGS="$CLARGS"} bash "$CL" "$@" ) ; }
 argv() { paste -sd'|' - < "$1" 2>/dev/null; }
 
@@ -261,7 +261,7 @@ wait
 check "both entries survive" "model-a|model-b" \
   "$(jq -r '"\(.claude.WriterA)|\(.claude.WriterB)"' "$MODELS")"
 check "…and no lock is left behind" "0" \
-  "$([ -e "$MODELS.lock" ] && echo 1 || echo 0)"
+  "$([ -L "$MODELS.lock" ] && echo 1 || echo 0)"
 
 # The above depends on two writers actually overlapping, which is timing. The
 # lock's contract is checked directly and deterministically here: a live holder
@@ -277,11 +277,32 @@ check "…and nothing was written" "null" "$(jq -r '.claude.Blocked // "null"' "
 case "$out" in *"another process is updating"*) pass=$((pass+1)); printf '  ok   %s\n' "…and it says so" ;;
   *) fail=$((fail+1)); printf '  FAIL %s\n       got: %s\n' "…and it says so" "$out" ;; esac
 rm -f "$MODELS.lock"
-# A pid that cannot be alive, with a token that therefore cannot match.
+# A dead holder's lock is REPORTED, never reclaimed automatically. Validating a
+# symlink and then removing its pathname are two operations, and between them
+# another waiter can acquire — that delete would then destroy a live claim and
+# put two writers inside the transaction. Same rule, same reason, as the launch
+# lock. Two concurrent reclaimers cannot race when nobody reclaims.
 ln -s "999999:Mon_Jan__1_00:00:00_2001" "$MODELS.lock"
+out=$(cl model --claude Reclaimed yes 2>&1); rc=$?
+check "a dead holder's lock is NOT silently reclaimed" "1" "$rc"
+check "…and nothing was written" "null" "$(jq -r '.claude.Reclaimed // "null"' "$MODELS")"
+check "…the lock is left for a person to clear" "1" "$([ -L "$MODELS.lock" ] && echo 1 || echo 0)"
+case "$out" in *"rm -f"*) pass=$((pass+1)); printf '  ok   %s\n' "…with the exact command to clear it" ;;
+  *) fail=$((fail+1)); printf '  FAIL %s\n       got: %s\n' "…with the exact command to clear it" "$out" ;; esac
+rm -f "$MODELS.lock"
+# …and once cleared by hand, the write goes through.
 cl model --claude Reclaimed yes >/dev/null 2>&1
-check "a dead holder's lock is reclaimed" "yes" "$(jq -r '.claude.Reclaimed // "null"' "$MODELS")"
-check "…and released again" "0" "$([ -e "$MODELS.lock" ] && echo 1 || echo 0)"
+check "after clearing it by hand, the write succeeds" "yes" "$(jq -r '.claude.Reclaimed // "null"' "$MODELS")"
+
+# Fail closed on our own identity: a lock created from an empty token publishes
+# a weak "PID:" holder that the next writer would read as stale.
+mkdir -p "$FIX/noident"
+printf '#!/bin/sh\nexit 1\n' > "$FIX/noident/ps"; chmod +x "$FIX/noident/ps"
+before="$(cat "$MODELS")"
+out=$(CLPATH="$FIX/noident:$BASEPATH" cl model --claude Unowned x 2>&1); rc=$?
+check "a writer that cannot identify itself does not take the lock" "1" "$rc"
+check "…and writes nothing" "same" "$([ "$before" = "$(cat "$MODELS")" ] && echo same || echo CHANGED)"
+check "…leaving no lock behind" "0" "$([ -L "$MODELS.lock" ] && echo 1 || echo 0)"
 
 printf 'a create that cannot proceed leaves no preference behind\n'
 # `cl new --model X "Name" /missing` used to store X and then fail — a half-done
@@ -293,6 +314,62 @@ check "…and nothing was remembered for it" "null" "$(jq -r '.claude.Ghost // "
 out=$(cl new --model also-too-early "Ghost2" -d 2>&1); rc=$?
 check "an unset CL_DEFAULT_DIR fails too" "1" "$rc"
 check "…remembering nothing" "null" "$(jq -r '.claude.Ghost2 // "null"' "$MODELS")"
+
+printf 'a create that the backend refuses remembers nothing\n'
+# The earlier tests covered validation failures (missing directory, unset
+# default). These are the ones that get past validation and are refused by the
+# backend — where the model was still being stored because the write happened
+# before the hand-off, not after acceptance.
+printf '{}\n' > "$MODELS"
+mkdir -p "$FIX/tmuxbin2"
+# A tmux that reports the session ALREADY EXISTS: `new-session -A` would have
+# attached it, and attaching is not creating.
+cat > "$FIX/tmuxbin2/tmux" <<TMUX2
+#!/bin/sh
+printf '%s\n' "\$*" >> "$FIX/tmux2.calls"
+case "\$1" in has-session) exit 0 ;; esac
+exit 0
+TMUX2
+chmod +x "$FIX/tmuxbin2/tmux"
+rm -f "$FIX/tmux2.calls"
+CLPATH="$FIX/tmuxbin2:$BASEPATH" cl new --model attached-not-created "Existing" "$FIX/work" >/dev/null 2>&1
+check "attaching an existing session stores nothing" "null" \
+  "$(jq -r '.claude.Existing // "null"' "$MODELS")"
+check "…creating nothing new" "0" \
+  "$(grep -c 'new-session' "$FIX/tmux2.calls" 2>/dev/null)"
+# Without a TTY this is the DETACHED branch, which reports "already exists"
+# rather than attaching. The interactive branch (launch_named) attaches instead,
+# and is the one `new-session -A` used to hide; it cannot be exercised here
+# because it needs a terminal, so its guard is asserted by the tmux call
+# pattern above rather than end to end.
+
+# And when the session does NOT exist, it is created and the model is stored.
+cat > "$FIX/tmuxbin2/tmux" <<TMUX3
+#!/bin/sh
+printf '%s\n' "\$*" >> "$FIX/tmux2.calls"
+case "\$1" in has-session) exit 1 ;; esac
+exit 0
+TMUX3
+rm -f "$FIX/tmux2.calls"
+CLPATH="$FIX/tmuxbin2:$BASEPATH" cl new --model really-created "Fresh3" "$FIX/work" >/dev/null 2>&1
+check "a real creation stores the model" "really-created" "$(jq -r '.claude.Fresh3 // "null"' "$MODELS")"
+check "…having actually created a session" "1" \
+  "$(grep -c 'new-session' "$FIX/tmux2.calls" 2>/dev/null)"
+
+# The backend ACCEPTING is the condition, not the backend being reached. A
+# new-session that fails must leave no preference behind — this is the case
+# that distinguishes "write then create" from "create then write".
+cat > "$FIX/tmuxbin2/tmux" <<TMUX4
+#!/bin/sh
+printf '%s
+' "\$*" >> "$FIX/tmux2.calls"
+case "\$1" in has-session) exit 1 ;; new-session) exit 1 ;; esac
+exit 0
+TMUX4
+rm -f "$FIX/tmux2.calls"
+CLPATH="$FIX/tmuxbin2:$BASEPATH" cl new --model create-failed "Doomed" "$FIX/work" >/dev/null 2>&1
+check "a failed create stores nothing" "null" "$(jq -r '.claude.Doomed // "null"' "$MODELS")"
+check "…having tried" "1" "$(grep -c 'new-session' "$FIX/tmux2.calls" 2>/dev/null)"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

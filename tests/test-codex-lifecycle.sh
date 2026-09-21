@@ -278,12 +278,33 @@ check "an unstamped tmux session is not killed" "0" \
   "$(grep -c 'kill-session' "$FIX/tmux.calls" 2>/dev/null)"
 case "$out" in *"no cl ownership stamp"*) pass=$((pass+1)); printf '  ok   %s\n' "…and stop says why it left it" ;;
   *) fail=$((fail+1)); printf '  FAIL %s\n       got: %s\n' "…and stop says why it left it" "$out" ;; esac
+# Not killing it is only half. Saving it would put a restart row in state for a
+# session cl does not own — and `cl start` would then resume that thread beside
+# whatever is already serving it.
+check "…and it is not saved either" "" \
+  "$(jq -r '.[] | select(.name=="Mine") | .name' "$STATE" 2>/dev/null)"
 # …and one cl did stamp, for this thread, is killed as before.
 rm -f "$FIX/tmux.calls" "$STATE"; touch "$FIX/stamped"
 out=$(cl_tmux stop --keep-tabs 2>&1)
 check "a stamped session IS killed" "1" \
   "$(grep -c 'kill-session' "$FIX/tmux.calls" 2>/dev/null)"
 rm -f "$FIX/stamped"
+
+printf 'launching into a name someone else holds does not stamp it\n'
+# The stamp is the kill path's only authority, so the launch path must never
+# write one onto a session it merely found. `new-session -A` did exactly that:
+# it attached an existing session and the helper stamped the result, turning a
+# name collision into ownership a later stop would act on.
+rm -f "$PIDDIR"/* "$STATE" "$FIX/tmux.calls" "$FIX/stamped"
+out=$(cl_tmux --codex Mine 2>&1 || true)
+check "no ownership stamp is written" "0" \
+  "$(grep -c 'set-option' "$FIX/tmux.calls" 2>/dev/null)"
+check "…and nothing new is created" "0" \
+  "$(grep -c 'new-session' "$FIX/tmux.calls" 2>/dev/null)"
+check "…it attaches what is already there" "1" \
+  "$(grep -c 'attach-session' "$FIX/tmux.calls" 2>/dev/null)"
+case "$out" in *"cl did not create it"*) pass=$((pass+1)); printf '  ok   %s\n' "…and says so rather than pretending" ;;
+  *) fail=$((fail+1)); printf '  FAIL %s\n       got: %s\n' "…and says so rather than pretending" "$out" ;; esac
 
 printf 'same-named Claude and Codex sessions both survive a stop\n'
 # The launcher made agent part of session identity; the state union grouped by
@@ -328,6 +349,49 @@ printf '[{"name":"Gone2","sid":"yyy","cwd":"%s","agent":"claude"}]\n' "$FIX/work
 cl_iterm start >/dev/null 2>&1
 check "a fully-handled start still clears the file" "0" \
   "$([ -f "$STATE" ] && echo 1 || echo 0)"
+
+printf 'a start that fails keeps its row, and a filter failure keeps the file\n'
+# Two ways a restart list was lost: a row whose create FAILED was consumed as
+# though handled, and a failure while working out what to keep deleted the file
+# outright — with archive_state explicitly best-effort, that was the only copy.
+rm -f "$PIDDIR"/*
+printf '[{"name":"WillFail","sid":"aaa","cwd":"%s","agent":"claude"}]\n' "$FIX/work" > "$STATE"
+mkdir -p "$FIX/failbin"
+cat > "$FIX/failbin/tmux" <<'TMUXF'
+#!/bin/sh
+case "$1" in has-session) exit 1 ;; new-session) exit 1 ;; esac
+exit 0
+TMUXF
+chmod +x "$FIX/failbin/tmux"
+( cd "$FIX" && env -i HOME="$HOME" CODEX_HOME="$CODEX_HOME" PATH="$FIX/failbin:$BASEPATH" \
+    CL_TMUX=1 bash "$CL" start >/dev/null 2>&1 )
+check "a row whose create failed is kept" "WillFail" \
+  "$(jq -r '.[].name' "$STATE" 2>/dev/null | tr '\n' ' ' | sed 's/ $//')"
+
+# A failure while working out WHICH rows to keep must not take the list with
+# it. Targeted: this jq works for everything except consume_state's own filter,
+# so the rest of start behaves normally and only that step fails.
+REALJQ="$(command -v jq)"
+mkdir -p "$FIX/badjq"
+cat > "$FIX/badjq/jq" <<JQF
+#!/bin/sh
+case "\$*" in *'as \$r'*) exit 1 ;; esac
+exec "$REALJQ" "\$@"
+JQF
+chmod +x "$FIX/badjq/jq"
+/bin/sh -c 'exec -a "codex resume '"$SID_MINE"'" sleep 600' & KEEPALIVE=$!
+disown "$KEEPALIVE" 2>/dev/null || true
+sleep 0.5
+register Precious codex "$KEEPALIVE" "$SID_MINE"
+printf '[{"name":"Precious","sid":"%s","cwd":"%s","agent":"codex"}]\n' "$SID_MINE" "$FIX/work" > "$STATE"
+before="$(cat "$STATE")"
+out=$( cd "$FIX" && env -i HOME="$HOME" CODEX_HOME="$CODEX_HOME" PATH="$FIX/badjq:$BASEPATH" \
+       bash "$CL" start 2>&1 )
+check "the restart list survives a filter failure" "same" \
+  "$([ -f "$STATE" ] && [ "$before" = "$(cat "$STATE")" ] && echo same || echo LOST)"
+case "$out" in *"leaving $STATE as it was"*) pass=$((pass+1)); printf '  ok   %s\n' "…and says it left the file alone" ;;
+  *) fail=$((fail+1)); printf '  FAIL %s\n       got: %s\n' "…and says it left the file alone" "$out" ;; esac
+kill "$KEEPALIVE" 2>/dev/null
 
 printf 'a stored thread with nothing running is not reported at all\n'
 # discover() lists every Codex thread ever named, not the running ones. Warning

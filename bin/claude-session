@@ -380,29 +380,67 @@ model_flag() {
 # reclaimed only on PROOF the holder is gone (its start token no longer
 # matches), never on age.
 models_lock() {
-  local lock="$MODELS.lock" holder hpid i=0
+  local lock="$MODELS.lock" holder hpid me i=0
+  # Fail closed on our own identity FIRST: a lock created from an empty token
+  # publishes a weak "PID:" holder that the next writer reads as stale.
+  me=$(claim_token)
+  case "$me" in
+    *:) echo "claude-session: cannot read this process's start time — refusing to update $MODELS unowned" >&2
+        return 1 ;;
+  esac
   while [ "$i" -lt 100 ]; do
-    ln -s "$(claim_token)" "$lock" 2>/dev/null && return 0
+    ln -s "$me" "$lock" 2>/dev/null && return 0
     holder=$(readlink "$lock" 2>/dev/null) || { i=$((i+1)); sleep 0.05; continue; }
     hpid=${holder%%:*}
+    # A stale lock is NEVER unlinked automatically — the same rule, and the
+    # same reason, as acquire_launch. Validating the symlink and then removing
+    # its PATHNAME are two operations: between them another waiter can reclaim
+    # and establish a live claim, and this delete would destroy THAT claim,
+    # putting two writers inside the read-modify-write together. The start-token
+    # proof authenticates the object read, not the object later unlinked, and
+    # portable shell has no compare-and-swap to close the gap.
+    #
+    # I implemented the rejected pattern here while the analysis rejecting it
+    # sat forty lines above (caught in review, 2026-09-21). Report it and let a
+    # person clear it; a writer has to die inside a few-millisecond window to
+    # leave one.
     case "$hpid" in
-      ''|*[!0-9]*)                       # not a lock we can reason about
-        [ "$(readlink "$lock" 2>/dev/null)" = "$holder" ] && rm -f "$lock" ;;
-      *)
-        if [ "$(start_token "$hpid")" != "${holder#*:}" ]; then
-          [ "$(readlink "$lock" 2>/dev/null)" = "$holder" ] && rm -f "$lock"
-        else
-          sleep 0.05
-        fi ;;
+      ''|*[!0-9]*)
+        echo "claude-session: $lock is malformed — clear it, then retry:" >&2
+        echo "  rm -f $(printf '%q' "$lock")" >&2
+        return 1 ;;
     esac
+    if [ "$(start_token "$hpid")" != "${holder#*:}" ]; then
+      echo "claude-session: a previous writer (pid $hpid) died holding the model lock — clear it, then retry:" >&2
+      echo "  rm -f $(printf '%q' "$lock")" >&2
+      return 1
+    fi
+    sleep 0.05
     i=$((i+1))
   done
   echo "claude-session: another process is updating $MODELS — try again" >&2
   return 1
 }
+# Releasing is safe where reclaiming is not: this unlinks only while the link
+# still names US, so it cannot delete a successor's lock.
 models_unlock() {
   local lock="$MODELS.lock"
   [ "$(readlink "$lock" 2>/dev/null)" = "$(claim_token)" ] && rm -f "$lock"
+  return 0
+}
+
+# commit_pending_model <agent> <name>: store a model chosen on THIS command
+# line, now that the backend has accepted the session.
+#
+# CL_PENDING_MODEL carries it from `cl new --model` through to whichever launch
+# path actually creates something. It is deliberately not stored earlier: the
+# paths below can still refuse (an existing owner, a claim that cannot be taken,
+# a tmux session already at that name which is attached rather than created),
+# and a preference recorded for a session that was never made is a lie the next
+# launch acts on.
+commit_pending_model() {
+  [ -n "${CL_PENDING_MODEL:-}" ] || return 0
+  set_model "${1:-claude}" "$2" "$CL_PENDING_MODEL" >/dev/null 2>&1 || return 0
   return 0
 }
 
@@ -811,9 +849,29 @@ surviving_children() {
 # Split from the old single `new-session -A` so the ownership stamp is written
 # by the same code path that creates the session — every creation site goes
 # through here, so none can quietly skip it.
-tmux_start_and_attach() {
-  tmux new-session -d -A -s "$1" -c "$2" "$3" && tmux_claim "$1" "$4" "${5:--}"
-  exec tmux attach-session -t "=$1"
+tmux_start_and_attach() { # t cwd cmd agent [sid] [display-name]
+  local t="$1" cwd="$2" cmd="$3" agent="$4" sid="${5:--}"
+  # `-A` is gone, and its absence is the point. It folded two outcomes into one
+  # command: CREATE, or silently ATTACH whatever already sits at that name. The
+  # helper then stamped the result as cl-owned either way — which manufactured
+  # the very proof the stamp exists to provide, and a later `cl stop` would
+  # accept it and kill an unrelated workload. A name collision is not ownership.
+  #
+  # So: an existing session is attached, never stamped, and never treated as
+  # something this invocation made.
+  if tmux has-session -t "=${t}" 2>/dev/null; then
+    if tmux_owned "$t" "$agent" "$sid"; then
+      exec tmux attach-session -t "=${t}"
+    fi
+    printf 'attaching the existing tmux session "%s" — cl did not create it, so it is not stamped as cl-owned%s\n' \
+      "$t" "$( [ -n "${CL_PENDING_MODEL:-}" ] && printf ' and --model was not stored' )" >&2
+    exec tmux attach-session -t "=${t}"
+  fi
+  if tmux new-session -d -s "$t" -c "$cwd" "$cmd"; then
+    tmux_claim "$t" "$agent" "$sid"
+    commit_pending_model "$agent" "${6:-}"
+  fi
+  exec tmux attach-session -t "=${t}"
 }
 
 # tmux_claim <tmux-session> <agent> <sid>: stamp a session cl just created.
@@ -853,7 +911,9 @@ agent_live() {
     return 0
   fi
   [ -n "$(session_pid "$sid" "$agent" "$name")" ] && return 0
-  [ "$agent" = "codex" ] && [ -n "$(registered_pid "$name" codex)" ] && return 0
+  # Qualified by sid like every other registry question: a live process for an
+  # OLDER same-named thread must not suppress the restart of the saved one.
+  [ "$agent" = "codex" ] && [ -n "$(registered_pid "$name" codex "$sid")" ] && return 0
   return 1
 }
 
@@ -955,7 +1015,7 @@ launch_session() { # name sid cwd [agent]
   in_iterm && tag_iterm_session "$t"
   if use_tmux; then
     tmux_setup
-    tmux_start_and_attach "$t" "$cwd" "$cmd" "$agent" "$sid"
+    tmux_start_and_attach "$t" "$cwd" "$cmd" "$agent" "$sid" "$name"
   else
     pid=$(acquire_launch "$name" "$agent" "$sid"); local arc=$?
     if [ "$arc" -eq 1 ]; then
@@ -980,7 +1040,7 @@ launch_new() { # cwd [agent]
   t="$agent-$(basename "$cwd")"
   if use_tmux; then
     tmux_setup
-    tmux_start_and_attach "$t" "$cwd" "$cmd" "$agent"
+    tmux_start_and_attach "$t" "$cwd" "$cmd" "$agent" "-" ""
   else
     drop_cmux_env; cd "$cwd" || exit 1; eval "exec $cmd"
   fi
@@ -998,7 +1058,12 @@ launch_named() { # name cwd [agent]
   local name="$1" cwd="$2" agent="${3:-claude}" t qname cmd mf
   [ -d "$cwd" ] || cwd="$HOME"
   qname=$(printf '%q' "$name")
-  mf=$(model_flag "$agent" "$(model_for "$name" "$agent")")
+  # CL_PENDING_MODEL is a model chosen on THIS command line that is not stored
+  # yet. It is used for the launch either way; it is committed only where the
+  # backend has accepted, below.
+  if [ -n "${CL_PENDING_MODEL:-}" ]; then mf=$(model_flag "$agent" "$CL_PENDING_MODEL")
+  else                                    mf=$(model_flag "$agent" "$(model_for "$name" "$agent")"); fi
+
   case "$agent" in
     codex)
       cmd="$(codex_cmd) $(codex_args)$mf"
@@ -1008,13 +1073,15 @@ launch_named() { # name cwd [agent]
   esac
   if in_cmux; then
     cmux rename-tab "$name" >/dev/null 2>&1
-    cd "$cwd" || exit 1; eval "exec $cmd"
+    cd "$cwd" || exit 1
+    commit_pending_model "$agent" "$name"
+    eval "exec $cmd"
   fi
   t=$(tmux_name "$name" "$agent")
   in_iterm && tag_iterm_session "$t"
   if use_tmux; then
     tmux_setup
-    tmux_start_and_attach "$t" "$cwd" "$cmd" "$agent"
+    tmux_start_and_attach "$t" "$cwd" "$cmd" "$agent" "-" "$name"
   else
     local owner arc
     owner=$(acquire_launch "$name" "$agent"); arc=$?
@@ -1024,7 +1091,9 @@ launch_named() { # name cwd [agent]
     elif [ "$arc" -ne 0 ]; then
       exit 1
     fi
-    drop_cmux_env; cd "$cwd" || exit 1; eval "exec $cmd"
+    drop_cmux_env; cd "$cwd" || exit 1
+    commit_pending_model "$agent" "$name"
+    eval "exec $cmd"
   fi
 }
 
@@ -1083,6 +1152,11 @@ do_new() {
   # remember_model: called at each point where creation is committed, so a run
   # that refuses to create anything leaves no preference behind.
   remember_model() { [ -n "$model" ] && set_model "$agent" "$name" "$model" >/dev/null; return 0; }
+  # The interactive paths do not call this: they hand off to launch_named,
+  # which can still refuse (an existing owner, a claim it cannot take) and which
+  # attaches rather than creates when a tmux session is already there. It
+  # persists for itself, after the last refusal and immediately before exec.
+  export CL_PENDING_MODEL="$model"
   case "$agent" in
     codex) cmd="$(codex_cmd) $(codex_args)$mf"
            echo "note: codex cannot be named at launch — run /rename $qname inside codex so cl can find it." >&2 ;;
@@ -1091,7 +1165,6 @@ do_new() {
 
   if in_cmux; then
     if [ -t 1 ] && [ -t 0 ]; then
-      remember_model
       launch_named "$name" "$cwd" "$agent"
     else
       # no TTY (script / Claude Bash call): open a fresh cmux workspace so the
@@ -1104,7 +1177,6 @@ do_new() {
 
   if [ -t 1 ] && [ -t 0 ]; then
     # interactive: create + attach, like the picker
-    remember_model
     launch_named "$name" "$cwd" "$agent"
   elif ! use_tmux; then
     # No TTY and nothing to detach into. Say so rather than exec a TTY-less
@@ -1247,8 +1319,18 @@ save_state() {
         tmux has-session -t "$(tmux_name "$name" claude)" 2>/dev/null \
           || [ -n "$(session_pid "$sid" claude "$name")" ] || continue
       elif [ "$agent" = "codex" ]; then
-        tmux has-session -t "$(tmux_name "$name" codex)" 2>/dev/null \
-          || [ -n "$(registered_pid "$name" codex "$sid")" ] || continue
+        # The tmux arm has to demand the SAME proof the kill path does. Accepting
+        # a session by name alone saved an unstamped collision as if cl had
+        # launched it; stop then (correctly) refused to kill it, leaving a
+        # restart row that would later resume a second client on that thread.
+        if tmux has-session -t "$(tmux_name "$name" codex)" 2>/dev/null \
+           && tmux_owned "$(tmux_name "$name" codex)" codex "$sid"; then
+          :
+        elif [ -n "$(registered_pid "$name" codex "$sid")" ]; then
+          :
+        else
+          continue
+        fi
       else
         continue
       fi
@@ -1476,9 +1558,16 @@ do_start() {
         printf '%s\t%s\n' "$agent" "$name" >> "$_skipped"
       else
         [ -d "$cwd" ] || cwd="$HOME"
-        cmux new-workspace --name "$name" --cwd "$cwd" --focus false \
-            --command "$(resume_cmd "$agent" "$sid" "$name")" >/dev/null \
-          && { printf '✓ opened %s  (%s)\n' "$name" "$cwd"; i=$((i+1)); }
+        # A row is consumed only when its session actually exists. A failed
+        # create that vanished from the list was a session lost to a best-effort
+        # archive nobody knows to look in.
+        if cmux new-workspace --name "$name" --cwd "$cwd" --focus false \
+             --command "$(resume_cmd "$agent" "$sid" "$name")" >/dev/null; then
+          printf '✓ opened %s  (%s)\n' "$name" "$cwd"; i=$((i+1))
+        else
+          printf '⚠ could not open %s — keeping it for the next start\n' "$name" >&2
+          printf '%s\t%s\n' "$agent" "$name" >> "$_skipped"
+        fi
       fi
     done < <(jq -r '.[] | [.name, .sid, .cwd, (.agent // "claude")] | @tsv' "$STATE")
     consume_state "$(cat "$_skipped")"; rm -f "$_skipped"
@@ -1509,8 +1598,13 @@ do_start() {
       printf '● %s already live\n' "$name"
       live_names="${live_names}${agent}"$'\t'"${name}"$'\n'
     else
-      tmux new-session -d -s "$t" -c "$cwd" "$(resume_cmd "$agent" "$sid" "$name")" \
-        && { tmux_claim "$t" "$agent" "$sid"; printf '✓ prepared %s  (%s)\n' "$name" "$cwd"; }
+      if tmux new-session -d -s "$t" -c "$cwd" "$(resume_cmd "$agent" "$sid" "$name")"; then
+        tmux_claim "$t" "$agent" "$sid"
+        printf '✓ prepared %s  (%s)\n' "$name" "$cwd"
+      else
+        printf '⚠ could not prepare %s — keeping it for the next start\n' "$name" >&2
+        live_names="${live_names}${agent}"$'\t'"${name}"$'\n'
+      fi
     fi
     i=$((i+1))
   done < <(jq -r '.[] | [.name, .sid, .cwd, (.agent // "claude")] | @tsv' "$STATE")
@@ -1578,7 +1672,13 @@ consume_state() {
      || ! jq --argjson keep "$kept" \
             '[ .[] | select( . as $r | $keep | any(.agent == ($r.agent // "claude") and .name == $r.name) ) ]' \
             "$STATE" > "$STATE.tmp.$$" 2>/dev/null; then
-    rm -f "$STATE.tmp.$$"; rm -f "$STATE"          # never leave a half-written list
+    # KEEP the state file. Deleting it here meant a disk-full, a permissions
+    # problem or a jq failure erased the only restart list — and archive_state
+    # is explicitly best-effort, so "there is a snapshot" is not a guarantee.
+    # A stale list costs one duplicate skip on the next start; no list costs
+    # the sessions.
+    rm -f "$STATE.tmp.$$"
+    echo "claude-session: could not work out which rows to keep — leaving $STATE as it was" >&2
     return 0
   fi
   if [ "$(jq 'length' "$STATE.tmp.$$" 2>/dev/null || echo 0)" = "0" ]; then

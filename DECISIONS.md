@@ -41,6 +41,15 @@ second-resolution, and a launcher can `exec` something else without changing
 either), and children captured before the signal are checked after it, so a
 surviving native client is reported instead of being called "killed".
 
+**Sharpened again after review (2026-09-21):** `new-session -A` was creating
+OR attaching, and the helper stamped the result either way — manufacturing the
+ownership proof the stamp exists to provide, on a session cl had merely found.
+Create and attach are now separate calls; an existing session is attached,
+reported as not-ours, and never stamped. `save_state` demands the same stamp the
+kill path does, so an unstamped collision is no longer saved as a restart row.
+A row is consumed only once its session exists, and a failure while filtering
+leaves the restart list untouched rather than deleting the only copy.
+
 **Known gap, stated rather than hidden:** the same tmux name-equality hazard
 exists for Claude, which predates this and is unchanged here. Claude's bare-mode
 path is covered by the registry; its tmux path still trusts the name.
@@ -98,6 +107,27 @@ widened deliberately, with a test for the quoting added at the same time.
 
 **Reverses by:** relaxing `valid_model` — and writing the quoting test that
 becomes possible at that moment.
+
+## 2026-09-21 — the model lock refuses a stale lock rather than reclaiming it
+
+**Chose:** `models_lock` reports a dead holder's lock and exits, printing the
+`rm -f` to clear it. It never unlinks one automatically.
+
+Validating a symlink and then removing its pathname are two operations, and
+between them another waiter can acquire — the delete would then destroy a live
+claim and put two writers inside the read-modify-write together. The
+start-token proof authenticates the object read, not the object later unlinked,
+and portable shell has no compare-and-swap.
+
+`acquire_launch` reached this conclusion first and documents it; I implemented
+the pattern it rejects, forty lines below the paragraph rejecting it. Caught in
+review 2026-09-21.
+
+**Forecloses:** unattended recovery from a writer that died inside a
+few-millisecond window. The trade is the same one the launch lock already makes.
+
+**Reverses by:** finding a primitive with atomic ownership transfer — at which
+point both locks should change together, not just this one.
 
 ## 2026-08-28 — Codex support is a per-session `agent` field, not a second script
 
