@@ -373,26 +373,49 @@ model_flag() {
 # reclaimed only on PROOF the holder is gone (its start token no longer
 # matches), never on age.
 models_lock() {
-  local lock="$MODELS.lock" holder hpid i=0
+  local lock="$MODELS.lock" holder hpid me i=0
+  # Fail closed on our own identity FIRST: a lock created from an empty token
+  # publishes a weak "PID:" holder that the next writer reads as stale.
+  me=$(claim_token)
+  case "$me" in
+    *:) echo "claude-session: cannot read this process's start time — refusing to update $MODELS unowned" >&2
+        return 1 ;;
+  esac
   while [ "$i" -lt 100 ]; do
-    ln -s "$(claim_token)" "$lock" 2>/dev/null && return 0
+    ln -s "$me" "$lock" 2>/dev/null && return 0
     holder=$(readlink "$lock" 2>/dev/null) || { i=$((i+1)); sleep 0.05; continue; }
     hpid=${holder%%:*}
+    # A stale lock is NEVER unlinked automatically — the same rule, and the
+    # same reason, as acquire_launch. Validating the symlink and then removing
+    # its PATHNAME are two operations: between them another waiter can reclaim
+    # and establish a live claim, and this delete would destroy THAT claim,
+    # putting two writers inside the read-modify-write together. The start-token
+    # proof authenticates the object read, not the object later unlinked, and
+    # portable shell has no compare-and-swap to close the gap.
+    #
+    # I implemented the rejected pattern here while the analysis rejecting it
+    # sat forty lines above (caught in review, 2026-09-21). Report it and let a
+    # person clear it; a writer has to die inside a few-millisecond window to
+    # leave one.
     case "$hpid" in
-      ''|*[!0-9]*)                       # not a lock we can reason about
-        [ "$(readlink "$lock" 2>/dev/null)" = "$holder" ] && rm -f "$lock" ;;
-      *)
-        if [ "$(start_token "$hpid")" != "${holder#*:}" ]; then
-          [ "$(readlink "$lock" 2>/dev/null)" = "$holder" ] && rm -f "$lock"
-        else
-          sleep 0.05
-        fi ;;
+      ''|*[!0-9]*)
+        echo "claude-session: $lock is malformed — clear it, then retry:" >&2
+        echo "  rm -f $(printf '%q' "$lock")" >&2
+        return 1 ;;
     esac
+    if [ "$(start_token "$hpid")" != "${holder#*:}" ]; then
+      echo "claude-session: a previous writer (pid $hpid) died holding the model lock — clear it, then retry:" >&2
+      echo "  rm -f $(printf '%q' "$lock")" >&2
+      return 1
+    fi
+    sleep 0.05
     i=$((i+1))
   done
   echo "claude-session: another process is updating $MODELS — try again" >&2
   return 1
 }
+# Releasing is safe where reclaiming is not: this unlinks only while the link
+# still names US, so it cannot delete a successor's lock.
 models_unlock() {
   local lock="$MODELS.lock"
   [ "$(readlink "$lock" 2>/dev/null)" = "$(claim_token)" ] && rm -f "$lock"
@@ -885,7 +908,16 @@ launch_named() { # name cwd [agent]
   local name="$1" cwd="$2" agent="${3:-claude}" t qname cmd mf
   [ -d "$cwd" ] || cwd="$HOME"
   qname=$(printf '%q' "$name")
-  mf=$(model_flag "$agent" "$(model_for "$name" "$agent")")
+  # CL_PENDING_MODEL is a model chosen on THIS command line that is not stored
+  # yet. It is used for the launch either way; it is committed only where the
+  # backend has accepted, below.
+  if [ -n "${CL_PENDING_MODEL:-}" ]; then mf=$(model_flag "$agent" "$CL_PENDING_MODEL")
+  else                                    mf=$(model_flag "$agent" "$(model_for "$name" "$agent")"); fi
+  commit_pending_model() {
+    [ -n "${CL_PENDING_MODEL:-}" ] || return 0
+    set_model "$agent" "$name" "$CL_PENDING_MODEL" >/dev/null || return 0
+    return 0
+  }
   case "$agent" in
     codex)
       cmd="$(codex_cmd) $(codex_args)$mf"
@@ -895,13 +927,26 @@ launch_named() { # name cwd [agent]
   esac
   if in_cmux; then
     cmux rename-tab "$name" >/dev/null 2>&1
-    cd "$cwd" || exit 1; eval "exec $cmd"
+    cd "$cwd" || exit 1
+    commit_pending_model
+    eval "exec $cmd"
   fi
   t=$(tmux_name "$name" "$agent")
   in_iterm && tag_iterm_session "$t"
   if use_tmux; then
     tmux_setup
-    exec tmux new-session -A -s "$t" -c "$cwd" "$cmd"
+    # `new-session -A` folded two different outcomes into one command: it
+    # CREATES, or it silently ATTACHES an existing session. Attaching is not
+    # creating, and a model chosen on this command line must not be recorded
+    # for a session this invocation did not make. Splitting them also makes the
+    # attach visible rather than inferred.
+    if tmux has-session -t "=${t}" 2>/dev/null; then
+      printf 'attaching the existing "%s" — nothing was created%s\n' "$name" \
+        "$( [ -n "${CL_PENDING_MODEL:-}" ] && printf ', and --model was not stored' )" >&2
+      exec tmux attach-session -t "=${t}"
+    fi
+    commit_pending_model
+    exec tmux new-session -s "$t" -c "$cwd" "$cmd"
   else
     local owner arc
     owner=$(acquire_launch "$name" "$agent"); arc=$?
@@ -911,7 +956,9 @@ launch_named() { # name cwd [agent]
     elif [ "$arc" -ne 0 ]; then
       exit 1
     fi
-    drop_cmux_env; cd "$cwd" || exit 1; eval "exec $cmd"
+    drop_cmux_env; cd "$cwd" || exit 1
+    commit_pending_model
+    eval "exec $cmd"
   fi
 }
 
@@ -970,6 +1017,11 @@ do_new() {
   # remember_model: called at each point where creation is committed, so a run
   # that refuses to create anything leaves no preference behind.
   remember_model() { [ -n "$model" ] && set_model "$agent" "$name" "$model" >/dev/null; return 0; }
+  # The interactive paths do not call this: they hand off to launch_named,
+  # which can still refuse (an existing owner, a claim it cannot take) and which
+  # attaches rather than creates when a tmux session is already there. It
+  # persists for itself, after the last refusal and immediately before exec.
+  export CL_PENDING_MODEL="$model"
   case "$agent" in
     codex) cmd="$(codex_cmd) $(codex_args)$mf"
            echo "note: codex cannot be named at launch — run /rename $qname inside codex so cl can find it." >&2 ;;
@@ -978,7 +1030,6 @@ do_new() {
 
   if in_cmux; then
     if [ -t 1 ] && [ -t 0 ]; then
-      remember_model
       launch_named "$name" "$cwd" "$agent"
     else
       # no TTY (script / Claude Bash call): open a fresh cmux workspace so the
@@ -991,7 +1042,6 @@ do_new() {
 
   if [ -t 1 ] && [ -t 0 ]; then
     # interactive: create + attach, like the picker
-    remember_model
     launch_named "$name" "$cwd" "$agent"
   elif ! use_tmux; then
     # No TTY and nothing to detach into. Say so rather than exec a TTY-less

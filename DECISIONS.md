@@ -53,6 +53,27 @@ widened deliberately, with a test for the quoting added at the same time.
 **Reverses by:** relaxing `valid_model` — and writing the quoting test that
 becomes possible at that moment.
 
+## 2026-09-21 — the model lock refuses a stale lock rather than reclaiming it
+
+**Chose:** `models_lock` reports a dead holder's lock and exits, printing the
+`rm -f` to clear it. It never unlinks one automatically.
+
+Validating a symlink and then removing its pathname are two operations, and
+between them another waiter can acquire — the delete would then destroy a live
+claim and put two writers inside the read-modify-write together. The
+start-token proof authenticates the object read, not the object later unlinked,
+and portable shell has no compare-and-swap.
+
+`acquire_launch` reached this conclusion first and documents it; I implemented
+the pattern it rejects, forty lines below the paragraph rejecting it. Caught in
+review 2026-09-21.
+
+**Forecloses:** unattended recovery from a writer that died inside a
+few-millisecond window. The trade is the same one the launch lock already makes.
+
+**Reverses by:** finding a primitive with atomic ownership transfer — at which
+point both locks should change together, not just this one.
+
 ## 2026-08-28 — Codex support is a per-session `agent` field, not a second script
 
 **Chose:** `discover()` emits a fifth column, `agent` (`claude` | `codex`), and
