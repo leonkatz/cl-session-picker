@@ -87,8 +87,10 @@ session state. Open a new terminal afterward so the `cl` alias stops resolving.
 - `cl new --codex "Name" [dir|-d]` — start a fresh Codex CLI session (see [Codex CLI sessions](#codex-cli-sessions))
 - `cl --list` — print discovered sessions (`--codex` / `--claude` first to filter)
 - `cl --codex "Name"` — resume a Codex session when the same name exists for both agents
-- `cl stop` — snapshot live sessions, kill them, and close their iTerm tabs (`--keep-tabs` to leave tabs open)
+- `cl stop` — ask each Claude session for a handoff, then snapshot live sessions, kill them, and close their iTerm tabs (`--keep-tabs` to leave tabs open, `--no-handoff` to skip the handoff step, `--dry-run` to preview)
 - `cl start` — relaunch every session from the last `stop`
+- `cl start --fresh "Name" [--dry-run]` — hand off and retire one named session, then launch a **new** claude under the same name/dir whose first message is to read the handoff and continue (see [Handoff and fresh start](docs/handoff.md))
+- The handoff instruction is replaceable: put your own in `~/.config/claude-session/handoff-prompt.txt`
 - `cl restore` — restore `state.json` from the newest history snapshot (then `cl start`)
 
 ## Creating a new session — `cl new`
@@ -224,10 +226,16 @@ to your own tools beneath the import. See [`framework/README.md`](framework/READ
 reboot, or to pick up a new Claude version (a running session keeps the version
 it launched with; only a fresh launch upgrades).
 
-- **`cl stop`** writes the live sessions to `~/.config/claude-session/state.json`
-  (one record per session: name, session id, cwd), then kills them. Before
-  killing a session that looks **mid-task**, it asks `Kill it anyway? [y/N]`;
-  answer no and that session is left running while the rest are killed. Re-run
+- **`cl stop`** first asks each live Claude session, in its own pane, to write
+  a handoff (`<handoff dir>/<Name>.md`) — see
+  [Handoff and fresh start](docs/handoff.md) for the mechanism, how to replace
+  the instruction with your own, and the fallback path. `--no-handoff` skips that step;
+  `--dry-run` previews everything without sending, killing, or writing
+  anything. It then writes the live sessions to
+  `~/.config/claude-session/state.json` (one record per session: name, session
+  id, cwd), and kills them. Before killing a session that still looks
+  **mid-task** after the handoff wait, it asks `Kill it anyway? [y/N]`; answer
+  no and that session is left running while the rest are killed. Re-run
   `cl stop` once it's idle to catch it. Needs `jq`.
   - **Closes the iTerm tab too.** Each tab `cl` opens is tagged with an iTerm
     user variable (`user.clSession`, via an OSC 1337 escape), so `stop` can find
@@ -240,6 +248,22 @@ it launched with; only a fresh launch upgrades).
   already live, else creates the tmux session and resumes the pinned
   conversation by id. Then attach with `tmux attach` (or `tmux -CC attach` in
   iTerm for native tabs).
+- **`cl start --fresh "Name"`** retires just that one session (same handoff as
+  `cl stop`) and launches a brand-new claude process under the same name and
+  directory, told to read the handoff and continue — for a session whose
+  context has grown expensive (see [Rotation hint](#rotation-hint) below).
+  The old session id is never lost — see
+  [Handoff and fresh start](docs/handoff.md#2-cl-start---fresh-name).
+
+### Rotation hint
+
+`cl --list` shows an approximate current context size per Claude session (last
+known `input + cache_read + cache_creation` tokens from its transcript) and
+flags a session `rotate` when that's over ~250k tokens or the transcript is
+over ~7 days old — both the point past which `cl start` (full resume) costs
+noticeably more per call than `cl start --fresh` (see
+[docs/handoff.md](docs/handoff.md#3-rotation-hint-on-cl---list)). Codex rows
+are left blank — their rollout format has no comparable usage figure.
 
 ### State history (recovery)
 

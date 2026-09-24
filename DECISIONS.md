@@ -394,3 +394,111 @@ path.
 tmux server?" guard compared the parent's whole command line against `*tmux*`,
 so any parent whose arguments merely mentioned tmux silently skipped the kill.
 It now compares the parent's executable name.
+
+## 2026-09-23 — Handoff is a typed-in-the-pane prompt + a per-request nonce poll, not a scraped reply
+
+**Chose:** `request_handoff` sends one literal, single-line instruction into
+the live pane (`tmux send-keys -l` at `"=name:"`, iTerm `write text` to the
+tagged session, or `cmux send` + a separate `cmux send-key enter`), then
+polls the handoff file for a fresh, per-request nonce token
+(`handoff_nonce`) for `CL_HANDOFF_TIMEOUT` seconds. It never reads the pane
+back. (Updated across three review rounds, 2026-09-23: the mechanism started
+as an mtime poll against a guessed `cmux send-text`; round 1 fixed the tmux
+target and the real cmux `send`/`send-key` contract; round 3 replaced the
+mtime/content-hash completion check with the nonce, after both a same-second
+atomic rewrite and a stale-but-byte-identical handoff proved a hash alone
+isn't a valid completion signal — see `docs/handoff.md`'s round-by-round
+sections for the full history.)
+
+**Forecloses:** any handoff signal that depends on parsing Claude's own
+terminal output.
+
+**Reverses by:** adding a scraped/ack-based confirmation instead of (or beside)
+the file check, if the file-poll proves unreliable in practice.
+
+**Why:** Claude's TUI runs on the alt-screen buffer, so `tmux capture-pane`
+already can't see it — this is the same reason `session_busy`/`claude_busy`
+inspect the process tree instead. The handoff FILE is the one externally
+observable outcome that actually matters, so that's what's polled.
+
+**Not chosen:** a SendMessage-style channel. `cl` has no agent-to-agent
+messaging primitive of its own, and building one only for this would duplicate
+what typing into the pane already achieves with tools `cl` already uses
+elsewhere (`close_iterm_tab`, `open_iterm_tabs`).
+
+## 2026-09-23 — A missed or timed-out handoff always falls back to a plain stop, never blocks one
+
+**Chose:** `request_handoff` returning non-zero (no reachable pane, or the
+timeout elapsed) changes nothing about `do_stop`'s existing kill logic — the
+same busy-check-and-prompt, same tmux/process kill, same tab/surface cleanup
+runs either way. `--no-handoff` skips the request outright.
+
+**Forecloses:** a handoff failure ever being the reason a stop doesn't happen.
+
+**Why:** the whole point is to reduce cost, not to add a new way for `cl stop`
+to strand a session running. A partial/failed handoff is a worse outcome than
+before this feature (no handoff, same as always) — never a worse outcome than
+"stop didn't happen."
+
+## 2026-09-24 — The tool supplies the mechanism; the prompt is yours
+
+**Chose:** `cl` ships a default instruction that asks for a handoff and the
+completion token, and nothing else. Anything further — tidying a task list,
+trimming notes, house rules about what may be archived — comes from
+`~/.config/claude-session/handoff-prompt.txt` (and `resume-prompt.txt` for a
+fresh session's first message), with `{{handoff}}`, `{{nonce}}`, `{{name}}` and
+`{{store}}` substituted literally and never evaluated.
+
+The first version of this feature had one person's note-keeping rules typed
+into the script: a specific file layout, a line-count target, archive-age
+rules, and a named person to escalate to. That is instantiation, not
+mechanism, and this repo is public. The same change moved the default storage
+off a hardcoded notes-app path onto `~/.local/state/claude-session/handoff`,
+so someone who installs this gets a working default instead of a warning about
+a directory they have never heard of.
+
+**Forecloses:** the tool prescribing what a good handoff contains beyond the
+token it has to check for.
+
+**Reverses by:** moving the default text back inline — which would also mean
+deciding, for everyone, what a session owes its successor.
+
+## 2026-09-23 — Configured dir first, local fallback, announced; one resolution point
+
+**Chose:** `handoff_root()` is the only place that decides between
+`CL_HANDOFF_DIR` and the local fallback — probed by an actual write, not just
+`[ -d ]` (a File Provider dataless directory `stat`s fine and fails every
+`open()`, a failure mode seen in practice with sync clients). Every handoff
+path goes through it, and a fallback is logged every time, not once.
+
+**Forecloses:** a handoff or board trim ever silently landing nowhere durable
+because the directory was mid-sync.
+
+**Reverses by:** dropping the fallback and failing the handoff instead, if a
+non-durable write is judged worse than a missed handoff.
+
+## 2026-09-23 — `cl start --fresh` is Claude-only, and old sessions are never a dead end
+
+**Chose:** `do_fresh_start`/`request_handoff` require `agent == claude`,
+matching the existing `cl stop`/`cl start` Codex exclusion (see 2026-08-28
+above). The retired session's id is both appended to
+`~/.config/claude-session/fresh-history.json` and printed as a direct
+`claude --resume <id>` command — in a file *and* on screen.
+
+**Forecloses:** a Codex `cl start --fresh` (no thread-status interface exists
+to know if the old thread is safely retireable) and a "fresh start" that loses
+the prior conversation.
+
+**Unblocking condition (Codex):** same as the existing exclusion — a Codex CLI
+interface that reports session status.
+
+## 2026-09-23 — `cl --list` name vs `SendMessage` name: documented, not fixed
+
+**Known limitation, not addressed by this change.** Some `cl`-launched
+sessions (observed for cmux-teams workspaces) register for `SendMessage`/
+`ListAgents` under an auto-generated `<dir>-<hex>` name instead of the
+`--name` title `cl` passed. That assignment happens in the cmux/Agent-Teams
+layer, which `bin/claude-session` doesn't control — `cl` only ever passes
+`--name` to `claude` — and reproducing the behavior well enough to patch
+around it blind risked masking the actual bug. See `docs/handoff.md` and
+`topics/claude-session-tool.md` (2026-09-23 entry) for the observed mapping.
