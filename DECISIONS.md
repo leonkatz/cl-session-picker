@@ -474,6 +474,14 @@ the cost is one directory.
 
 ## 2026-09-24 — `cl stop` fails closed, and `cl handoff` is the way out
 
+> **REVERSED 2026-09-25**, one day old, by "`cl stop` stops" below. The
+> `cl handoff` half survives; the fail-closed default does not. What the
+> entry below got wrong: it treated "no handoff" as a loss worth blocking on,
+> when by its own design a missing handoff costs only the optimisation. It
+> also under-counted the cost — attempts × timeout × sessions, not per
+> session — and refused hardest on exactly the wedged session a user most
+> needs stopped before a reboot.
+
 **Chose:** a session whose handoff never lands (after `CL_HANDOFF_ATTEMPTS`
 tries) is left RUNNING rather than stopped. `cl handoff`, run inside a
 session, writes one by hand and is marked as hand-written so `cl stop` honours
@@ -495,6 +503,105 @@ and keeps both options open.
 **Not chosen:** refusing with no route out. A fail-closed check that cannot be
 satisfied is a wedge, so the refusal names both ways forward, and `cl handoff`
 exists to make the first one real.
+
+## 2026-09-25 — A handoff is usable only if its LAST line is a valid marker
+
+**Chose:** every handoff ends with `<!-- cl:clho:… -->` (answering a stop) or
+`<!-- cl:manual:… -->` (written by `cl handoff`), and that marker must be the
+file's last non-empty line. `cl stop` confirms by matching its own nonce
+*there*, not anywhere in the file; `cl start` rotates only from a file that has
+one, and moves anything else to `<store>/incomplete/` with a loud message.
+
+**Forecloses:** treating presence as sufficient. The invariant is now presence
+AND completeness.
+
+**Reverses by:** a handoff format where a trailing line is not available (a
+strict schema owned by something else), which would need a sidecar file instead.
+
+**Why:** a handoff is meant to be written temp-file-then-rename, so a complete
+one appears whole. But an agent that writes straight to the target and is
+killed mid-write leaves a real, readable, TRUNCATED file — plausible prose cut
+off mid-sentence, no marker, because the marker is written last. Presence alone
+cannot tell that from a good handoff, and the replacement session is then seeded
+from a lie and does not know it. Reproduced 2026-09-25: a file ending
+`...currently ha` rotated a session. A partially-synced file from a shared store
+fails identically. The same rule fixes the reverse error, where a genuine
+handoff whose prose *mentions* a marker was classified by that mention.
+
+**Not chosen:** deleting an incomplete handoff. It is real work and it is the
+evidence of what went wrong, so it is filed, not destroyed. Leaving it in place
+was also rejected: it would be re-examined and re-rejected on every start.
+
+## 2026-09-25 — A handoff is spent only when a replacement is running: claim, then commit or roll back
+
+**Chose:** rotating moves the handoff into `<store>/.claims/` first; it is
+committed to `consumed/` only once the launch is accepted, and rolled back to
+the active path if it is refused. Where "accepted" is decided depends on the
+shape: under tmux/cmux the launching process sees the backend answer, so it
+commits; without tmux the agent is started by the tab, so the tab claims it
+after `acquire_launch` grants ownership of the name. A session whose launch was
+refused keeps its row in the restart list.
+
+**Forecloses:** treating a handoff as spent at the moment a rotation is
+*decided*.
+
+**Reverses by:** a launch path that can report acceptance synchronously in
+every shape, which would let one process own the whole transaction.
+
+**Why:** consuming first and launching second meant a failed launch left the
+session with no active handoff AND — once `cl start` cleared the list — no
+restart row, recoverable only through `cl restore`. That is a hole in the
+"always falls back to a plain resume" floor the design claims. The claim is a
+`rename`, so it is also the concurrency answer: two starts racing for one
+handoff produce exactly one rotation and one ordinary resume.
+
+**Not chosen:** a lock file. `rename` already gives atomic hand-over with no
+stale-lock problem and no reclamation policy to get wrong.
+
+## 2026-09-25 — A hand-written handoff is stamped with the session that wrote it
+
+**Chose:** `cl handoff` writes `<!-- cl:manual:<ts>@<sid> -->`, and a rotation
+refuses a handoff whose stamped id is not the session being replaced. Markers
+without an id predate the stamp and are accepted for any occupant.
+
+**Forecloses:** a name alone identifying a handoff's author.
+
+**Reverses by:** handoffs becoming per-session-id files rather than per-name,
+which would make the stamp redundant.
+
+**Why:** a `cl handoff` that starts writing before a rotation and finishes
+after it renames the PREVIOUS occupant's notes into the freshly-emptied active
+path, and the next start seeds a replacement from them. The name is stable
+across rotations, so only the id distinguishes them.
+
+**Note:** the separator is `@`, not `:`. A first implementation read "after the
+last colon", which pulled `00Z` out of an ISO-8601 timestamp and rejected every
+unstamped marker as foreign.
+
+## 2026-09-25 — `cl stop` stops; rotation is requested, not required
+
+**Chose:** `cl stop` asks for a handoff within a stop-wide budget
+(`CL_HANDOFF_BUDGET`, default 300s total, not per session), reports failure
+prominently, and then stops the session regardless — `cl start` resumes it.
+`--require-handoff` (alias `--rotate`) opts into failing closed and exits
+non-zero if anything is left running. `--no-handoff` now also *clears* any
+pending handoff, so its promise of "resume it as-is" is actually true.
+
+**Forecloses:** `cl stop` guaranteeing a rotation without a flag.
+
+**Reverses by:** silent downgrades proving costly in practice despite the
+warning, which would make `--require-handoff` the default.
+
+**Why:** rotation is the optimisation and resume is the floor — stated in the
+design, then contradicted by a default that blocked on the optimisation.
+`cl stop` is what you run before a reboot or a version upgrade, and the session
+least able to answer a handoff request is the wedged one you most need gone.
+A global budget replaces attempts × timeout × sessions, which could hold an
+eight-session stop for over half an hour and still leave sessions running.
+
+**Not chosen:** keeping fail-closed with a bounded deadline. It keeps the
+wedge for a benefit the warning already delivers; the loud message plus a
+non-zero exit makes the downgrade visible, which was the actual concern.
 
 ## 2026-09-24 — The tool supplies the mechanism; the prompt is yours
 

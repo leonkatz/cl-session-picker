@@ -87,8 +87,8 @@ session state. Open a new terminal afterward so the `cl` alias stops resolving.
 - `cl new --codex "Name" [dir|-d]` — start a fresh Codex CLI session (see [Codex CLI sessions](#codex-cli-sessions))
 - `cl --list` — print discovered sessions (`--codex` / `--claude` first to filter)
 - `cl --codex "Name"` — resume a Codex session when the same name exists for both agents
-- `cl stop` — ask each Claude session for a handoff, then snapshot live sessions, kill them, and close their iTerm tabs. A session whose handoff never lands is left running (`--keep-tabs` to leave tabs open, `--no-handoff` to skip the handoff step and stop regardless, `--dry-run` to preview)
-- `cl start` — relaunch every session from the last `stop`; any session with a waiting handoff starts **fresh** under the same name, seeded with it, instead of resuming (see [Handoff and rotation](docs/handoff.md))
+- `cl stop` — ask each Claude session for a handoff, then snapshot live sessions, kill them, and close their iTerm tabs. A session whose handoff never lands is stopped anyway and resumes instead of rotating (`--require-handoff` to fail closed, `--keep-tabs` to leave tabs open, `--no-handoff` to skip the request and clear any pending handoff, `--dry-run` to preview)
+- `cl start` — relaunch every session from the last `stop`; any session with a **complete** waiting handoff starts **fresh** under the same name, seeded with it, instead of resuming (see [Handoff and rotation](docs/handoff.md))
 - `cl handoff` — run inside a session to write its handoff by hand
 - `cl start --fresh "Name" [--dry-run]` — rotate one **live** session now, without stopping anything else
 - The handoff instruction is replaceable: put your own in `~/.config/claude-session/handoff-prompt.txt`
@@ -232,9 +232,13 @@ it launched with; only a fresh launch upgrades).
   [Handoff and rotation](docs/handoff.md) for the mechanism, how to replace
   the instruction with your own, and the fallback path. `--no-handoff` skips that step;
   `--dry-run` previews everything without sending, killing, or writing
-  anything. **A session whose handoff never lands is left running** rather than
-  stopped without one — write it by hand with `cl handoff` from inside that
-  session, or `cl stop --no-handoff` to stop it deliberately. It then writes the live sessions to
+  anything. **A session whose handoff never lands is still stopped** — it comes
+  back by resuming rather than rotating, and says so loudly. Pass
+  `--require-handoff` (alias `--rotate`) to fail closed instead; that exits
+  non-zero if any session is left running. `--no-handoff` also clears any
+  pending handoff, so the session really does come back as-is. The whole stop
+  shares one handoff budget (`CL_HANDOFF_BUDGET`, default 300s total — not per
+  session). It then writes the live sessions to
   `~/.config/claude-session/state.json` (one record per session: name, session
   id, cwd), and kills them. Before killing a session that still looks
   **mid-task** after the handoff wait, it asks `Kill it anyway? [y/N]`; answer
@@ -248,12 +252,20 @@ it launched with; only a fresh launch upgrades).
     terminals can't be scripted this way) and best-effort; pass `--keep-tabs`
     to leave all tabs open.
 - **`cl start`** reads the state file and, for each session, reattaches if it's
-  already live. Otherwise **the handoff decides how it comes back**: if one is
-  waiting, that session starts *fresh* under the same name and directory, told
-  to read the handoff and continue (and the used handoff moves to
-  `consumed/`); if there is no handoff, it resumes the pinned conversation by
-  id, exactly as before. So a skipped or failed handoff costs you the rotation,
-  never the session. Then attach with `tmux attach` (or `tmux -CC attach` in
+  already live. Otherwise **the handoff decides how it comes back**: if a
+  *complete* one is waiting, that session starts *fresh* under the same name and
+  directory, told to read the handoff and continue; otherwise it resumes the
+  pinned conversation by id, exactly as before. A handoff counts as complete
+  only when its last line is the marker `cl` asked for — a file cut off
+  mid-write has none, so it is filed under `incomplete/` and the session
+  resumes rather than continuing from a truncation. So a skipped, failed or
+  half-written handoff costs you the rotation, never the session.
+  - A handoff is **spent only once a replacement is actually running**: it is
+    claimed, then committed to `consumed/` on acceptance or rolled back to
+    where it was on refusal. A session whose launch is refused keeps its row in
+    the restart list, so `cl start` just retries it, and the command exits
+    non-zero. Claiming is a `rename`, so two starts racing for one handoff give
+    exactly one rotation and one ordinary resume. Then attach with `tmux attach` (or `tmux -CC attach` in
   iTerm for native tabs).
 - **`cl handoff`** — run *inside* a session to write its handoff by hand; the
   way out when a pane can't be reached. Pipe the text in (`cl handoff < notes.md`)
