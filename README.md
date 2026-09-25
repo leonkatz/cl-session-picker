@@ -87,9 +87,10 @@ session state. Open a new terminal afterward so the `cl` alias stops resolving.
 - `cl new --codex "Name" [dir|-d]` — start a fresh Codex CLI session (see [Codex CLI sessions](#codex-cli-sessions))
 - `cl --list` — print discovered sessions (`--codex` / `--claude` first to filter)
 - `cl --codex "Name"` — resume a Codex session when the same name exists for both agents
-- `cl stop` — ask each Claude session for a handoff, then snapshot live sessions, kill them, and close their iTerm tabs (`--keep-tabs` to leave tabs open, `--no-handoff` to skip the handoff step, `--dry-run` to preview)
-- `cl start` — relaunch every session from the last `stop`
-- `cl start --fresh "Name" [--dry-run]` — hand off and retire one named session, then launch a **new** claude under the same name/dir whose first message is to read the handoff and continue (see [Handoff and fresh start](docs/handoff.md))
+- `cl stop` — ask each Claude session for a handoff, then snapshot live sessions, kill them, and close their iTerm tabs. A session whose handoff never lands is left running (`--keep-tabs` to leave tabs open, `--no-handoff` to skip the handoff step and stop regardless, `--dry-run` to preview)
+- `cl start` — relaunch every session from the last `stop`; any session with a waiting handoff starts **fresh** under the same name, seeded with it, instead of resuming (see [Handoff and rotation](docs/handoff.md))
+- `cl handoff` — run inside a session to write its handoff by hand
+- `cl start --fresh "Name" [--dry-run]` — rotate one **live** session now, without stopping anything else
 - The handoff instruction is replaceable: put your own in `~/.config/claude-session/handoff-prompt.txt`
 - `cl restore` — restore `state.json` from the newest history snapshot (then `cl start`)
 
@@ -228,10 +229,12 @@ it launched with; only a fresh launch upgrades).
 
 - **`cl stop`** first asks each live Claude session, in its own pane, to write
   a handoff (`<handoff dir>/<Name>.md`) — see
-  [Handoff and fresh start](docs/handoff.md) for the mechanism, how to replace
+  [Handoff and rotation](docs/handoff.md) for the mechanism, how to replace
   the instruction with your own, and the fallback path. `--no-handoff` skips that step;
   `--dry-run` previews everything without sending, killing, or writing
-  anything. It then writes the live sessions to
+  anything. **A session whose handoff never lands is left running** rather than
+  stopped without one — write it by hand with `cl handoff` from inside that
+  session, or `cl stop --no-handoff` to stop it deliberately. It then writes the live sessions to
   `~/.config/claude-session/state.json` (one record per session: name, session
   id, cwd), and kills them. Before killing a session that still looks
   **mid-task** after the handoff wait, it asks `Kill it anyway? [y/N]`; answer
@@ -245,15 +248,20 @@ it launched with; only a fresh launch upgrades).
     terminals can't be scripted this way) and best-effort; pass `--keep-tabs`
     to leave all tabs open.
 - **`cl start`** reads the state file and, for each session, reattaches if it's
-  already live, else creates the tmux session and resumes the pinned
-  conversation by id. Then attach with `tmux attach` (or `tmux -CC attach` in
+  already live. Otherwise **the handoff decides how it comes back**: if one is
+  waiting, that session starts *fresh* under the same name and directory, told
+  to read the handoff and continue (and the used handoff moves to
+  `consumed/`); if there is no handoff, it resumes the pinned conversation by
+  id, exactly as before. So a skipped or failed handoff costs you the rotation,
+  never the session. Then attach with `tmux attach` (or `tmux -CC attach` in
   iTerm for native tabs).
-- **`cl start --fresh "Name"`** retires just that one session (same handoff as
-  `cl stop`) and launches a brand-new claude process under the same name and
-  directory, told to read the handoff and continue — for a session whose
-  context has grown expensive (see [Rotation hint](#rotation-hint) below).
+- **`cl handoff`** — run *inside* a session to write its handoff by hand; the
+  way out when a pane can't be reached. Pipe the text in (`cl handoff < notes.md`)
+  or run it bare to be told where to write.
+- **`cl start --fresh "Name"`** rotates just that one *live* session now,
+  without stopping anything else (see [Rotation hint](#rotation-hint) below).
   The old session id is never lost — see
-  [Handoff and fresh start](docs/handoff.md#2-cl-start---fresh-name).
+  [Handoff and rotation](docs/handoff.md#2-rotation-on-cl-start).
 
 ### Rotation hint
 

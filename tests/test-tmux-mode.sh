@@ -215,7 +215,12 @@ printf 'cl stop kills the intended process and closes its tab\n'
 # "tmux". While that check matched the whole command line it skipped the kill.
 kill -0 "$LIVE" 2>/dev/null || setup_failed "fixture agent died before the stop case"
 : > "$FIX/osascript.log"
-out=$(env -i HOME="$HOME" PATH="$PATHF" TERM_PROGRAM=iTerm.app bash "$CL" stop </dev/null 2>&1)
+# --no-handoff, because this case is about the KILL and the tab close, not
+# about handoffs: a plain `cl stop` now leaves a session running when no
+# handoff arrives, so without this the fixture would survive on purpose and
+# the assertion below would be testing the wrong contract. That a satisfied
+# handoff is followed by the kill is asserted in test-handoff.sh.
+out=$(env -i HOME="$HOME" PATH="$PATHF" TERM_PROGRAM=iTerm.app bash "$CL" stop --no-handoff </dev/null 2>&1)
 sleep 0.5
 check "the intended fixture process is gone" "dead" "$(kill -0 "$LIVE" 2>/dev/null && echo alive || echo dead)"
 has   "cl stop reported killing it" "$out" "killed Solo"

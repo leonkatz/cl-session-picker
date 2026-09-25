@@ -23,6 +23,16 @@ had become expensive without opening it.
 
 ## Design
 
+The handoff is the **hinge between two runs**: `cl stop` writes it, and the
+next `cl start` rotates off it. One invariant carries the whole design:
+
+> **At most one unconsumed handoff per session.**
+
+So the mere presence of `<store>/<Name>.md` means "written, and not yet used" —
+there is no mtime comparison, no staleness heuristic, and no second source of
+truth to drift from the files. Whatever uses a handoff moves it to
+`<store>/consumed/`; whatever is about to request one sweeps a leftover first.
+
 ### 1. Handoff on `cl stop`
 
 Before a live session is killed, `cl stop` asks it — in its own pane — to write
@@ -47,37 +57,76 @@ an mtime without this request's handoff having landed at all. The instruction
 asks for a token to be written verbatim into the file; `cl` waits for that
 exact token.
 
-**A handoff never blocks a stop.** If no pane is reachable, or the wait times
-out, or no durable location exists, `cl stop` proceeds exactly as it did before
-this feature existed — same busy-check, same kill, same cleanup. `--no-handoff`
-skips the request outright. The feature exists to reduce cost, not to add a new
-way for a stop to strand a session.
+The request is made up to `CL_HANDOFF_ATTEMPTS` times (default 3) with a fresh
+nonce each round, because a session mid-task may not read the first one.
 
-### 2. `cl start --fresh "Name"`
+**A session whose handoff never lands is left running.** It is not killed. The
+reasoning: `cl start` decides how a session comes back by whether a handoff is
+there, so stopping one without a handoff silently turns a rotation into a plain
+resume. Leaving it alive costs a tab and keeps both options open. The two ways
+forward are printed rather than implied — write the handoff by hand from inside
+the session (§3), or `cl stop --no-handoff` to stop it deliberately.
 
-Retires one named session — same handoff mechanism and timeout as `cl stop` —
-and launches a **new** agent process that registers under the **same name**, in
-the same directory, through the same wrapper selection, so `cl "Name"` and
+An unreachable pane fails on the first attempt rather than burning the rest:
+retrying cannot fix "there is nothing to type into".
+
+### 2. Rotation on `cl start`
+
+`cl start` brings back everything in the last snapshot. Per session, the
+presence of an unconsumed handoff decides how:
+
+| | |
+|---|---|
+| **handoff present** | consume it, start a **new** agent under the **same name**, in the same directory, through the same wrapper selection, and hand it the file as its first message |
+| **no handoff** | `--resume <sid>`, exactly as before |
+
+That second row is what makes every failure above safe. A skipped handoff, an
+unreachable session, a crash — all of them simply leave no file, and the
+session comes back whole. **Rotation is the optimisation; resuming is the
+floor.** Nothing in this feature can cost you a session.
+
+Because the name, directory and reachability survive, `cl "Name"` and
 cross-session messaging keep resolving to the current occupant of that name.
-Its first message tells it to read the handoff and continue.
 
 **The old session is never a dead end.** The previous session id is appended to
 `~/.config/claude-session/fresh-history.json` with the name, directory and
 timestamp, and the direct recovery command is printed to the terminal — in a
 file *and* on screen, not just one or the other.
 
-**Plain `cl start` is unchanged.** Bulk resume of everything in `state.json`
-stays the default; a fresh start is a deliberate, one-name-at-a-time choice,
-not something to put a whole working set through unseen.
+`cl start --fresh "Name"` remains as the way to rotate **one live session now**
+without stopping anything else: it asks, retires and relaunches in a single
+command, and fails closed if the handoff does not arrive.
 
 Claude only, matching the existing `cl stop`/`cl start` lifecycle boundary.
 
-### 3. Rotation hint on `cl --list`
+### 3. `cl handoff` — writing one by hand
+
+Run *inside* a session. It is the way out when text injection cannot reach a
+pane at all, and it is the reason `cl stop` can afford to refuse: declining to
+stop a session is only reasonable if there is a way to satisfy the requirement.
+
+```
+cl handoff < notes.md     # write it, atomically, with the marker appended
+cl handoff                # print where to write and what to include
+cl handoff --path         # just the path
+```
+
+The session name comes from `CL_SESSION_NAME`, which every launch path sets, so
+inside a session this needs no argument. An empty handoff is refused — an empty
+file satisfies every existence check while saying nothing.
+
+A hand-written handoff is marked as such, and `cl stop` treats it as an
+**answer** rather than a leftover: it is honoured instead of swept, and its age
+is printed, because the one real hazard is acting on something written weeks
+ago and forgotten.
+
+### 4. Rotation hint on `cl --list`
 
 `cl --list` shows an approximate current context size per Claude session and
-flags one `rotate` when it passes a threshold or the transcript gets old —
-the point past which a full resume costs noticeably more per call than a fresh
-start. Thresholds are overridable via `CL_ROTATE_CTX_THRESHOLD` and
+flags one `rotate` when it passes a threshold or the transcript gets old — the
+point past which a full resume costs noticeably more per call than a fresh
+start. With rotation now happening on every stop/start cycle, this is mostly a
+prompt to rotate a session that has been running a long time *without* one. Thresholds are overridable via `CL_ROTATE_CTX_THRESHOLD` and
 `CL_ROTATE_AGE_DAYS`. Codex rows are left blank: that rollout format carries no
 comparable usage figure, and guessing one would be worse than showing nothing.
 

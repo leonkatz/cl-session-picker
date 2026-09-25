@@ -428,6 +428,12 @@ elsewhere (`close_iterm_tab`, `open_iterm_tabs`).
 
 ## 2026-09-23 — A missed or timed-out handoff always falls back to a plain stop, never blocks one
 
+> **REVERSED 2026-09-24** by "The handoff is the hinge between two runs" below.
+> The reasoning here was sound while a handoff was only read inside a single
+> `start --fresh` command. Once `cl start` began deciding how a session comes
+> back *by whether a handoff exists*, "stop it anyway" stopped being the cheap
+> option and became a silent downgrade from rotation to plain resume.
+
 **Chose:** `request_handoff` returning non-zero (no reachable pane, or the
 timeout elapsed) changes nothing about `do_stop`'s existing kill logic — the
 same busy-check-and-prompt, same tmux/process kill, same tab/surface cleanup
@@ -439,6 +445,56 @@ runs either way. `--no-handoff` skips the request outright.
 to strand a session running. A partial/failed handoff is a worse outcome than
 before this feature (no handoff, same as always) — never a worse outcome than
 "stop didn't happen."
+
+## 2026-09-24 — The handoff is the hinge between two runs, and there is at most one unconsumed per session
+
+**Chose:** `cl stop` writes a handoff; `cl start` decides per session how to
+bring it back — an unconsumed handoff means start a NEW agent under the same
+name seeded with that file, no handoff means `--resume <sid>` as before.
+Whatever uses a handoff moves it to `<store>/consumed/`; whatever is about to
+request one sweeps a leftover first. So the presence of `<store>/<Name>.md`
+means exactly "written, not yet used".
+
+**Forecloses:** any second source of truth about which handoffs have been used
+(a consumed-sid list in state, a timestamp comparison). The filesystem is the
+record.
+
+**Reverses by:** sessions needing more than one live handoff at a time — a
+per-request file keyed by nonce rather than by name would replace this.
+
+**Why:** rotation only pays off if it happens every cycle, and it can only
+happen every cycle if `cl start` is the thing that decides. Keying on presence
+and consuming on use is the smallest rule that makes that safe: without
+consumption, every subsequent start would rotate off the same ever-staler file
+and `--no-handoff` would quietly stop meaning anything.
+
+**Not chosen:** deleting a consumed handoff. It is moved instead — a rotation
+that turns out badly is still recoverable from the file that produced it, and
+the cost is one directory.
+
+## 2026-09-24 — `cl stop` fails closed, and `cl handoff` is the way out
+
+**Chose:** a session whose handoff never lands (after `CL_HANDOFF_ATTEMPTS`
+tries) is left RUNNING rather than stopped. `cl handoff`, run inside a
+session, writes one by hand and is marked as hand-written so `cl stop` honours
+it instead of sweeping it. `cl stop --no-handoff` still stops regardless.
+
+**Forecloses:** `cl stop` being guaranteed to stop everything in one pass
+without a flag.
+
+**Reverses by:** the refusal proving more annoying in practice than the silent
+downgrade it prevents — in which case the fail-open behaviour above returns,
+with rotation made conditional on something other than file presence.
+
+**Why:** under the entry above, stopping a session without a handoff is not a
+neutral act — it decides that the session will come back with its whole
+expensive transcript. That is exactly what the feature exists to avoid, and it
+is invisible at the moment it happens. Leaving the session alive costs a tab
+and keeps both options open.
+
+**Not chosen:** refusing with no route out. A fail-closed check that cannot be
+satisfied is a wedge, so the refusal names both ways forward, and `cl handoff`
+exists to make the first one real.
 
 ## 2026-09-24 — The tool supplies the mechanism; the prompt is yours
 

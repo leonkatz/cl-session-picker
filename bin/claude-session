@@ -30,17 +30,27 @@
 #                             #   the tab only until you /rename inside codex
 #   claude-session --list     # print discovered sessions (--codex/--claude to filter)
 #   claude-session stop       # ask each Claude session for a handoff (written to
-#                             #   <handoff dir>/handoff/<Name>.md, or a local
-#                             #   fallback if that is unreachable), then snapshot live
+#                             #   <handoff dir>/<Name>.md, or a local fallback if
+#                             #   that is unreachable), then snapshot live
 #                             #   sessions, kill them, and close their iTerm tabs.
+#                             #   A session whose handoff never lands is LEFT
+#                             #   RUNNING rather than stopped without one.
 #                             #   --keep-tabs leaves tabs open; --no-handoff skips
-#                             #   the handoff step (plain stop); --dry-run prints
-#                             #   what would happen. Asks before killing anything
-#                             #   still mid-task after the handoff wait, leaving
-#                             #   those open. Covers cmux-native sessions too.
-#   claude-session start      # relaunch every session from the last stop
-#                             #   (skips any already live, else resumes by id).
-#                             #   In cmux: opens one workspace per session.
+#                             #   the handoff step (and stops it regardless);
+#                             #   --dry-run prints what would happen. Asks before
+#                             #   killing anything still mid-task. Covers
+#                             #   cmux-native sessions too.
+#   claude-session handoff    # write THIS session's handoff by hand, from inside
+#                             #   it — the way out when a pane can't be reached.
+#                             #   Pipe the text in, or run it bare to be told
+#                             #   where to write. --path prints just the path.
+#   claude-session start      # relaunch every session from the last stop.
+#                             #   Per session: an unconsumed handoff means START
+#                             #   FRESH under the same name, seeded with that
+#                             #   handoff (the used file moves to consumed/);
+#                             #   no handoff means resume by id, exactly as
+#                             #   before. Skips any already live. In cmux: one
+#                             #   workspace per session.
 #   claude-session start --fresh "Name" [--dry-run]
 #                             # hand off + retire ONE named session, then launch
 #                             #   a NEW claude under the SAME name/dir whose first
@@ -48,7 +58,9 @@
 #                             #   continue. The old
 #                             #   session id is kept (recovery command printed +
 #                             #   logged) — nothing is lost, only re-read once.
-#                             #   Claude only. Plain `cl start` is unaffected.
+#                             #   Claude only. Use it to rotate ONE live session
+#                             #   without stopping anything else; plain
+#                             #   `cl start` is what rotates a whole working set.
 #   claude-session restore    # restore state.json from the newest history
 #                             #   snapshot (add --list to pick; then run start)
 #
@@ -72,7 +84,7 @@ STATE_HISTORY_KEEP=10
 # --- handoff / fresh-start config --------------------------------------------
 # Where handoffs are written. Local state by default, because that is the only
 # location this tool can assume exists on someone else's machine. Point
-# CL_HANDOFF_DIR at a synced folder (a notes vault, a shared drive) if you want
+# CL_HANDOFF_DIR at a synced folder (a notes tree, a shared drive) if you want
 # handoffs to follow you between machines — that is exactly why the fallback
 # below exists: a synced directory can be slow to appear, partially hydrated,
 # or briefly absent, and every path is resolved through handoff_root(), which
@@ -89,6 +101,13 @@ CL_RESUME_PROMPT_FILE="${CL_RESUME_PROMPT_FILE:-$HOME/.config/claude-session/res
 # How long `cl stop` waits for a requested handoff to land before falling back
 # to a plain stop. Generous by default: writing a good handoff is real work.
 CL_HANDOFF_TIMEOUT="${CL_HANDOFF_TIMEOUT:-90}"
+# How many times to ASK before giving up. A session that is mid-task may not
+# read the first request; re-sending gives it another chance. Because `cl stop`
+# now fails CLOSED (a session whose handoff never lands is left running rather
+# than killed unhandoffed), the cost of exhausting these is a session still
+# alive, not a lost handoff — so the default is deliberately small: the whole
+# sequence can take ATTEMPTS × TIMEOUT before a stop moves on.
+CL_HANDOFF_ATTEMPTS="${CL_HANDOFF_ATTEMPTS:-3}"
 # Record of session names started fresh, with the OLD session id, so a fresh
 # start is never a dead end — the prior conversation stays resumable even
 # though its name now points at the new session.
@@ -101,57 +120,52 @@ FRESH_HISTORY="$HOME/.config/claude-session/fresh-history.json"
 # than one sync client). Prints a one-line notice on stderr when it falls
 # back, so the fallback is never silent.
 _CL_HANDOFF_ROOT=""
-# Resolves to a Sessions dir that ALREADY HAS handoff/ and archive/ beneath
-# it — round 2 of Codex review found that the handoff_root of round 1 only
-# mkdir'd Sessions itself, so a freshly-selected fallback could pass the
-# write-probe here and still fail on its first real write, since nothing had
-# ever created `<root>/handoff` or `<root>/archive`. Both are created (and
-# the probe still targets Sessions itself, the write-probe's original job:
-# catching a File Provider dataless dir that `stat`s fine but fails `open()`).
-# _ensure_session_dirs <base>: create <base>/handoff and <base>/archive and
-# CONFIRM all three (base itself too) really are directories afterward —
-# `mkdir -p`'s own exit status doesn't prove this: it can report success
-# against a path component that's actually a plain FILE in some edge cases,
-# and round 2 of this function discarded the status entirely. Round 3 of
-# Codex review reproduced both: a regular file sitting at `Sessions/handoff`
-# and a regular file sitting at the fallback base, both silently accepted as
-# a usable root. Nothing here is accepted as usable without this check.
-# Just the directory itself. Handoffs land directly in CL_HANDOFF_DIR so the
-# variable means what its name says — an earlier layout added a `handoff/`
-# subdirectory inside a directory already called handoff, and a separate
-# `archive/` for one person's note-keeping convention. Point CL_HANDOFF_DIR at
-# a subfolder if you are aiming it into a shared notes tree; a custom prompt
-# that wants more structure can name any path under {{store}} and create it.
+# _ensure_session_dirs <base>: create the store, then CONFIRM it really is a
+# directory. `mkdir -p`'s own exit status does not prove that — it can report
+# success against a path component that is actually a plain FILE, and a
+# regular file sitting at the configured path was silently accepted as a
+# usable root until this check existed.
+#
+# Handoffs land directly in CL_HANDOFF_DIR, so the variable means what its
+# name says. The one piece of structure this tool imposes beneath it is
+# `consumed/`, where used handoffs are moved (see consume_handoff). Point
+# CL_HANDOFF_DIR at a subfolder if you are aiming it into a shared notes tree.
 _ensure_session_dirs() {
   mkdir -p "$1" 2>/dev/null
   [ -d "$1" ]
 }
 
-# handoff_root: resolves to a Sessions dir with handoff/ and archive/ beneath
-# it, preferring the configured dir and falling back to a local one. Returns
-# NON-ZERO (and prints nothing to stdout) only in the — expected to be rare —
-# case where NEITHER the handoff dir NOR the fallback can be made usable; callers
-# (request_handoff) must check this rather than assume a root was resolved.
+# handoff_root: the store — CL_HANDOFF_DIR when usable, else
+# CL_HANDOFF_FALLBACK_BASE. Returns NON-ZERO (and prints nothing to stdout)
+# only in the — expected to be rare — case where NEITHER can be made usable;
+# callers (request_handoff, do_start) must check this rather than assume a root
+# was resolved.
+# usable_root <dir>: can we actually WRITE here? Both candidates get the same
+# question. The fallback used to get only `[ -d ]`, so an existing but
+# unwritable or dataless fallback was accepted, the prompt was sent toward a
+# path that could never be written, and the caller waited out its whole
+# timeout — the exact File Provider failure the primary probe exists to catch,
+# unhandled on the path taken precisely when the primary has already failed.
+usable_root() {
+  local base="$1" probe
+  mkdir -p "$base" 2>/dev/null || return 1
+  [ -d "$base" ] || return 1
+  probe="$base/.cl-write-probe.$$"
+  ( printf '' > "$probe" ) 2>/dev/null || return 1
+  rm -f "$probe" 2>/dev/null
+  return 0
+}
+
 handoff_root() {
   [ -n "$_CL_HANDOFF_ROOT" ] && { printf '%s\n' "$_CL_HANDOFF_ROOT"; return 0; }
-  local base="$CL_HANDOFF_DIR" probe ok=0
-  if mkdir -p "$base" 2>/dev/null; then
-    probe="$base/.cl-write-probe.$$"
-    if ( printf '' > "$probe" ) 2>/dev/null; then
-      rm -f "$probe" 2>/dev/null
-      _ensure_session_dirs "$base" && ok=1
-    fi
-  fi
-  if [ "$ok" = "1" ]; then
-    _CL_HANDOFF_ROOT="$base"; printf '%s\n' "$base"; return 0
+  if usable_root "$CL_HANDOFF_DIR"; then
+    _CL_HANDOFF_ROOT="$CL_HANDOFF_DIR"; printf '%s\n' "$CL_HANDOFF_DIR"; return 0
   fi
   echo "claude-session: handoff dir unusable at $CL_HANDOFF_DIR — using fallback $CL_HANDOFF_FALLBACK_BASE" >&2
-  base="$CL_HANDOFF_FALLBACK_BASE"
-  mkdir -p "$base" 2>/dev/null
-  if _ensure_session_dirs "$base"; then
-    _CL_HANDOFF_ROOT="$base"; printf '%s\n' "$base"; return 0
+  if usable_root "$CL_HANDOFF_FALLBACK_BASE"; then
+    _CL_HANDOFF_ROOT="$CL_HANDOFF_FALLBACK_BASE"; printf '%s\n' "$CL_HANDOFF_FALLBACK_BASE"; return 0
   fi
-  echo "claude-session: fallback $base is also unusable — no durable handoff location available" >&2
+  echo "claude-session: fallback $CL_HANDOFF_FALLBACK_BASE is also unusable — no durable handoff location available" >&2
   return 1
 }
 
@@ -169,6 +183,85 @@ handoff_root() {
 # value through every path built for that operation. These helpers are now
 # pure functions of (root, name); they never call handoff_root themselves.
 handoff_path() { printf '%s/%s.md' "$1" "$(name_component "$2")"; }
+
+# ---------------------------------------------------------------------------
+# Handoff lifecycle. The invariant the whole feature rests on:
+#
+#   AT MOST ONE UNCONSUMED HANDOFF PER SESSION.
+#
+# So the mere PRESENCE of <root>/<Name>.md means "written, and not yet used" —
+# no mtime comparison, no staleness heuristic, no second source of truth to
+# drift from the files. `cl start` consumes what it uses; `cl stop` sweeps a
+# superseded leftover before asking for a new one. Everything consumed moves
+# to <root>/consumed/ rather than being deleted, so a rotation that turns out
+# badly is still recoverable from the file that produced it.
+CONSUMED_SUBDIR="consumed"
+
+# A handoff says how it was produced, in a trailing marker:
+#
+#   <!-- cl:clho:… -->      written in answer to a stop request (carries that
+#                           request's nonce, which is how the stop confirms it)
+#   <!-- cl:manual:<ts> --> written by hand via `cl handoff`
+#
+# The distinction is what lets a manual handoff serve as the escape hatch for
+# an unreachable pane: a nonce handoff found sitting unconsumed has already
+# been superseded (a skipped stop, a crash between rotate and consume) and is
+# swept, but a manual one is an ANSWER and is honoured instead.
+MANUAL_MARKER_PREFIX='<!-- cl:manual:'
+handoff_is_manual() { [ -f "$1" ] && grep -qF -- "$MANUAL_MARKER_PREFIX" "$1" 2>/dev/null; }
+
+# consume_handoff <root> <name> [reason]: move this session's unconsumed
+# handoff into <root>/consumed/. Prints the new path on STDOUT so it composes
+# with the caller that needs to read the file afterwards.
+#
+#   0  consumed — the path it moved to is on stdout
+#   1  there was nothing to consume
+#   2  a handoff is there but could NOT be moved
+#
+# 2 is kept distinct from 0 on purpose. A caller must not rotate off a handoff
+# it failed to clear: the file would still be sitting there next time and the
+# session would rotate again, forever, off an ever-staler file. Declining to
+# rotate degrades to a plain resume, which loses nothing.
+consume_handoff() {
+  local root="$1" name="$2" reason="${3:-}" hp dest stamp
+  hp=$(handoff_path "$root" "$name")
+  [ -f "$hp" ] || return 1
+  stamp=$(date +%Y%m%d-%H%M%S 2>/dev/null || echo unknown)
+  dest="$root/$CONSUMED_SUBDIR/$(name_component "$name")-$stamp.md"
+  if mkdir -p "$root/$CONSUMED_SUBDIR" 2>/dev/null && mv "$hp" "$dest" 2>/dev/null; then
+    printf 'ℹ consumed handoff for "%s"%s → %s\n' "$name" "${reason:+ ($reason)}" "$dest" >&2
+    printf '%s\n' "$dest"
+    return 0
+  fi
+  printf '⚠ could not move the handoff for "%s" out of %s — not rotating it (it would rotate again every start); move or delete it by hand\n' \
+    "$name" "$hp" >&2
+  return 2
+}
+
+# plan_rotation <root> <name>: decide whether this session rotates on start,
+# and if so consume its handoff and print the consumed path. Non-zero means
+# "resume it as it was" — the safe direction, taken whenever there is no
+# handoff, no store, or a handoff that could not be cleared.
+plan_rotation() {
+  local root="$1" name="$2"
+  [ -n "$root" ] || return 1
+  consume_handoff "$root" "$name" "rotating on start"
+}
+
+# handoff_age_human <path>: "3 minutes"/"19 days" for a file, or "" if unknown.
+# Used when a manual handoff is honoured — the age is the one thing that makes
+# an old hand-written handoff obvious before it is acted on.
+handoff_age_human() {
+  local f="$1" mt now d
+  mt=$(stat -f %m "$f" 2>/dev/null) || return 0
+  now=$(date +%s 2>/dev/null || echo 0)
+  d=$(( now - mt )); [ "$d" -lt 0 ] && d=0
+  if   [ "$d" -lt 90 ];    then printf '%s seconds' "$d"
+  elif [ "$d" -lt 5400 ];  then printf '%s minutes' "$(( d / 60 ))"
+  elif [ "$d" -lt 172800 ]; then printf '%s hours'  "$(( d / 3600 ))"
+  else                          printf '%s days'    "$(( d / 86400 ))"
+  fi
+}
 
 # name_component <display-name> -> one safe, COLLISION-FREE path component.
 #
@@ -246,8 +339,21 @@ name_component() {
 # this rarely bites — a handoff dir that has been used before already exists —
 # but it means a --dry-run preview against a genuinely brand-new handoff dir
 # path can undersell what a real run would do.
+# Mirrors handoff_root's DECISION without mutating anything. A dry run cannot
+# prove future creatability, but it must not assert the fallback for the most
+# common first-use case either: a configured directory that does not exist yet,
+# whose nearest existing ancestor is writable, is exactly what a real run
+# creates and uses. Announcing the fallback there told a new user their
+# configured path was unusable when it was about to work.
+_creatable() {
+  local d="$1"
+  while [ -n "$d" ] && [ ! -e "$d" ]; do
+    case "$d" in */*) d=${d%/*}; [ -z "$d" ] && d=/ ;; *) d=. ;; esac
+  done
+  [ -d "$d" ] && [ -w "$d" ]
+}
 handoff_root_preview() {
-  if [ -d "$CL_HANDOFF_DIR" ] 2>/dev/null && [ -w "$CL_HANDOFF_DIR" ] 2>/dev/null; then
+  if { [ -d "$CL_HANDOFF_DIR" ] && [ -w "$CL_HANDOFF_DIR" ]; } || _creatable "$CL_HANDOFF_DIR"; then
     printf '%s\n' "$CL_HANDOFF_DIR"
   else
     # Announce the fallback here too — logging is not a mutation, and a dry
@@ -495,6 +601,28 @@ resume_cmd() {
     codex) printf '%s %s resume %s' "$(codex_cmd)" "$(codex_args)" "$(printf '%q' "$2")" ;;
     *)     printf '%s --resume %s --dangerously-skip-permissions' "$(claude_cmd)" "$(printf '%q' "$2")" ;;
   esac
+}
+
+# CL_SESSION_NAME tells `cl handoff`, run INSIDE a session, which session it is
+# without being told. It reaches the agent two different ways, because the two
+# launch shapes are genuinely different:
+#
+#   pane command  — tmux/cmux run the command string in a NEW shell that does
+#                   not inherit this one's environment, so the assignment has
+#                   to be part of the string. That is env_prefix.
+#   exec          — `exec VAR=x cmd` is not valid shell (exec would take the
+#                   assignment as the command name), so those paths export it
+#                   into this shell first; an export survives exec.
+env_prefix() { printf 'CL_SESSION_NAME=%s ' "$(printf '%q' "$1")"; }
+
+# fresh_cmd <name> <initial_prompt>: the shell command string that starts a NEW
+# claude registered under an EXISTING name, with the prompt as its first
+# message. The twin of resume_cmd, and for the same reason: `cl start` has to
+# put this into a detached tmux pane or a cmux workspace, where it cannot exec.
+# launch_fresh builds its command from here too, so the two cannot drift.
+fresh_cmd() {
+  printf '%s --name %s --dangerously-skip-permissions %s' \
+    "$(claude_cmd)" "$(printf '%q' "$1")" "$(printf '%q' "$2")"
 }
 
 # session_pid <sid> [agent]: pid of a local process that resumed this session,
@@ -829,6 +957,7 @@ launch_session() { # name sid cwd [agent]
   local name="$1" sid="$2" cwd="$3" agent="${4:-claude}" t pid cmd
   t=$(tmux_name "$name" "$agent"); [ -d "$cwd" ] || cwd="$HOME"
   cmd=$(resume_cmd "$agent" "$sid")
+  export CL_SESSION_NAME="$name"
   # `tmux new-session -A` attaches instead of duplicating; nothing does that
   # for us otherwise, so a second launch has to be refused here. cmux keeps the
   # plain check (it owns its own workspace lifecycle); the bare path below uses
@@ -847,7 +976,7 @@ launch_session() { # name sid cwd [agent]
   in_iterm && tag_iterm_session "$t"
   if use_tmux; then
     tmux_setup
-    exec tmux new-session -A -s "$t" -c "$cwd" "$cmd"
+    exec tmux new-session -A -s "$t" -c "$cwd" "$(env_prefix "$name")$cmd"
   else
     pid=$(acquire_launch "$name" "$agent" "$sid"); local arc=$?
     if [ "$arc" -eq 1 ]; then
@@ -889,6 +1018,7 @@ launch_new() { # cwd [agent]
 launch_named() { # name cwd [agent]
   local name="$1" cwd="$2" agent="${3:-claude}" t qname cmd
   [ -d "$cwd" ] || cwd="$HOME"
+  export CL_SESSION_NAME="$name"
   qname=$(printf '%q' "$name")
   case "$agent" in
     codex)
@@ -905,7 +1035,7 @@ launch_named() { # name cwd [agent]
   in_iterm && tag_iterm_session "$t"
   if use_tmux; then
     tmux_setup
-    exec tmux new-session -A -s "$t" -c "$cwd" "$cmd"
+    exec tmux new-session -A -s "$t" -c "$cwd" "$(env_prefix "$name")$cmd"
   else
     local owner arc
     owner=$(acquire_launch "$name" "$agent"); arc=$?
@@ -930,10 +1060,10 @@ launch_named() { # name cwd [agent]
 # in terms of the handoff file, and only Claude sessions write one (see
 # request_handoff).
 launch_fresh() {
-  local name="$1" cwd="$2" prompt="$3" t qname qprompt cmd
+  local name="$1" cwd="$2" prompt="$3" t cmd
   [ -d "$cwd" ] || cwd="$HOME"
-  qname=$(printf '%q' "$name"); qprompt=$(printf '%q' "$prompt")
-  cmd="$(claude_cmd) --name $qname --dangerously-skip-permissions $qprompt"
+  cmd=$(fresh_cmd "$name" "$prompt")
+  export CL_SESSION_NAME="$name"
   if in_cmux; then
     cmux rename-tab "$name" >/dev/null 2>&1
     cd "$cwd" || exit 1; eval "exec $cmd"
@@ -942,7 +1072,7 @@ launch_fresh() {
   in_iterm && tag_iterm_session "$t"
   if use_tmux; then
     tmux_setup
-    exec tmux new-session -A -s "$t" -c "$cwd" "$cmd"
+    exec tmux new-session -A -s "$t" -c "$cwd" "$(env_prefix "$name")$cmd"
   else
     local owner arc
     owner=$(acquire_launch "$name" claude); arc=$?
@@ -1204,56 +1334,88 @@ retire_claude_session() {
 # can arrive mid-edit. (An earlier version wrote the handoff first; its mtime
 # then advanced before the rest of the work had started — which is also why
 # completion is a per-request nonce rather than an mtime. See handoff_nonce.)
-# build_resume_prompt <handoff-path>: the first message a fresh session gets.
+# --- prompt construction ------------------------------------------------------
 #
-# Overridable for the same reason the handoff prompt is — what a new session
-# should read before continuing is a workflow, not a property of this tool.
-# Placeholder: {{handoff}}. Newlines flattened; typed as claude's first message.
+# Two rules govern everything below.
+#
+# ONE LITERAL LINE. The text is typed into a live agent's pane. A newline
+# submits it; under cmux a carriage return does too, and a tab is a real Tab
+# keystroke. So every C0 control and DEL is folded to a space AFTER placeholder
+# expansion — flattening only the template would miss a CRLF file (tr removes
+# the LF and leaves the CR) and would not touch a session name or a configured
+# path that carries one.
+#
+# SUBSTITUTED LITERALLY. Sequential ${var//} passes are not literal: each pass
+# scans what the previous one inserted, so a session named "Review {{store}}"
+# ends up carrying the store path, and a configured path containing {{nonce}}
+# gets rewritten into the request nonce — the agent is then told to write
+# somewhere other than the path being polled. Placeholders are therefore mapped
+# to per-call random sentinels first, and only then replaced by values, so no
+# inserted value is ever scanned as a template.
+_prompt_flatten() { LC_ALL=C tr '\000-\037\177' '    ' ; }
+
+_prompt_expand() { # template handoff nonce name store
+  local tmpl="$1" hp="$2" nonce="$3" name="$4" store="$5" tag
+  tag="clph$$${RANDOM}${RANDOM}"
+  tmpl=${tmpl//\{\{handoff\}\}/${tag}H}
+  tmpl=${tmpl//\{\{nonce\}\}/${tag}N}
+  tmpl=${tmpl//\{\{name\}\}/${tag}A}
+  tmpl=${tmpl//\{\{store\}\}/${tag}S}
+  tmpl=${tmpl//${tag}H/$hp}
+  tmpl=${tmpl//${tag}N/$nonce}
+  tmpl=${tmpl//${tag}A/$name}
+  tmpl=${tmpl//${tag}S/$store}
+  printf '%s' "$tmpl" | _prompt_flatten
+}
+
+# read_prompt_file <path>: the template, or nothing when absent/unusable.
+read_prompt_file() {
+  local raw
+  [ -r "$1" ] || return 1
+  raw=$(cat "$1" 2>/dev/null) || return 1
+  [ -n "${raw//[[:space:]]/}" ] || return 1
+  printf '%s' "$raw"
+}
+
+# build_resume_prompt <handoff-path>: the first message a fresh session gets.
 build_resume_prompt() {
-  local hp="$1" custom
-  if [ -r "$CL_RESUME_PROMPT_FILE" ]; then
-    custom=$(tr '\n' ' ' < "$CL_RESUME_PROMPT_FILE" 2>/dev/null)
-    if [ -n "${custom// /}" ]; then
-      printf '%s' "${custom//\{\{handoff\}\}/$hp}"
-      return 0
-    fi
+  local hp="$1" tmpl
+  if tmpl=$(read_prompt_file "$CL_RESUME_PROMPT_FILE"); then
+    _prompt_expand "$tmpl" "$hp" "" "" ""
+    return 0
   fi
-  printf 'Read your handoff at "%s", then continue.' "$hp"
+  printf 'Read your handoff at "%s", then continue.' "$hp" | _prompt_flatten
 }
 
 build_handoff_prompt() { # root name nonce
-  local root="$1" name="$2" nonce="$3" hp custom
+  local root="$1" name="$2" nonce="$3" hp tmpl out
   hp=$(handoff_path "$root" "$name")
 
-  # A custom prompt is the supported way to ask for more than a handoff. The
-  # default below asks for the handoff and nothing else, because that is the
-  # only thing this tool can define for everyone: what else is worth tidying
-  # before a session ends — a board, a task list, a journal — is a workflow,
-  # and workflows belong to the person, not to a shared script. The original
-  # version of this feature had one person's board rules typed into it.
-  #
-  # Placeholders, substituted literally (never eval'd): {{handoff}} {{nonce}}
-  # {{name}} {{store}}. Newlines are flattened to spaces because this is typed
-  # into a live TUI, where a newline submits.
-  if [ -r "$CL_HANDOFF_PROMPT_FILE" ]; then
-    custom=$(tr '\n' ' ' < "$CL_HANDOFF_PROMPT_FILE" 2>/dev/null)
-    if [ -n "${custom// /}" ]; then
-      custom=${custom//\{\{handoff\}\}/$hp}
-      custom=${custom//\{\{nonce\}\}/$nonce}
-      custom=${custom//\{\{name\}\}/$name}
-      custom=${custom//\{\{store\}\}/$root}
-      printf '%s' "$custom"
-      return 0
-    fi
-    printf 'claude-session: %s is empty — using the default handoff prompt\n' \
-      "$CL_HANDOFF_PROMPT_FILE" >&2
+  # The built-in default asks for the handoff, the completion token, and
+  # nothing else. An earlier version of this "generic" default still carried a
+  # line-count target and a prescribed schema — which is a workflow, and made
+  # the documentation false for anyone who installed it. What a handoff should
+  # CONTAIN is in docs/handoff.md as an example override to copy, not here.
+  if tmpl=$(read_prompt_file "$CL_HANDOFF_PROMPT_FILE"); then
+    # A custom prompt that never asks for the token can never be confirmed:
+    # the request would be sent, a perfectly good handoff might be written, and
+    # every session would still wait out the full timeout. With several
+    # sessions that is minutes lost to a mistake visible before sending. Warn
+    # and use the built-in default instead — which keeps the promise that a
+    # handoff problem never prevents a stop.
+    case "$tmpl" in
+      *'{{nonce}}'*)
+        out=$(_prompt_expand "$tmpl" "$hp" "$nonce" "$name" "$root")
+        printf '%s' "$out"
+        return 0 ;;
+      *)
+        printf 'claude-session: %s has no {{nonce}} placeholder, so a handoff could never be confirmed — using the built-in default instead\n' \
+          "$CL_HANDOFF_PROMPT_FILE" >&2 ;;
+    esac
   fi
 
-  # The nonce requirement is not decoration: it is the ONLY thing that tells
-  # the caller this handoff is the one it just asked for, rather than a
-  # byte-identical file left by an earlier rotation.
-  printf 'Before you stop: write a handoff to "%s" — at most ~100 lines, covering in-flight work (branches, PRs, tickets), next steps, open decisions, gotchas and lessons, pointers to evidence, and today'"'"'s date. Write it atomically: write a temp file, then rename it into place. Include the token "%s" verbatim, exactly once, anywhere in the file (a trailing HTML comment like "<!-- cl:%s -->" works well) — the caller waits for that token to confirm THIS handoff rather than a stale one. Once the rename completes, stop: no summary, no further action. The file containing that token is the signal that you are done, so do not write it until everything else is finished.' \
-    "$hp" "$nonce" "$nonce"
+  printf 'Before you stop: write a handoff to "%s" — write a temp file, then rename it into place. Include the token "%s" verbatim, exactly once, anywhere in the file (a trailing HTML comment like "<!-- cl:%s -->" works well): the caller waits for that token to confirm THIS handoff rather than a stale one, so write it last, after everything else you intend to do. Once the rename completes, stop.' \
+    "$hp" "$nonce" "$nonce" | _prompt_flatten
 }
 
 # send_text_tmux <tmux_session> <text>: type literal text into a live tmux pane
@@ -1322,14 +1484,19 @@ send_text_cmux() {
 
 # request_handoff <name> <sid> <cwd> <tmux_name> [--dry-run]: try to get the
 # live session to write its own handoff before it dies. Returns:
-#   0  THIS request's handoff confirmed written (its nonce token was found
-#      in the file — see handoff_nonce below)
+#   0  a handoff is on disk for this session and is THIS run's — either its
+#      nonce token was found (see handoff_nonce below) or a hand-written one
+#      was already waiting (see handoff_is_manual)
 #   1  could not even ask (no reachable pane, or no durable root at all —
 #      logs why)
-#   2  asked, but timed out waiting for the file (logs why)
+#   2  asked CL_HANDOFF_ATTEMPTS times, nothing landed (logs why)
 #   3  dry run — nothing sent
-# The caller's job either way is unchanged afterwards: proceed with the normal
-# kill flow. A 1/2 here is a fallback to a PLAIN stop, never a lost stop.
+#
+# It does NOT consume what it finds: the handoff has to survive the stop so
+# that the next `cl start` can rotate off it. Consuming is `do_start`'s job.
+#
+# A 1 or 2 is NOT a fallback to a plain stop any more. `cl stop` fails closed
+# on it and leaves the session running — see do_stop.
 #
 # handoff_nonce: one fresh, unpredictable-enough token per request. A content
 # hash (round 2's fix) is NOT a valid completion signal on its own — round 3
@@ -1371,39 +1538,70 @@ request_handoff() {
     return 1
   fi
   hp=$(handoff_path "$root" "$name")
-  nonce=$(handoff_nonce)
-  prompt=$(build_handoff_prompt "$root" "$name" "$nonce")
 
-  if [ -n "$t" ] && tmux has-session -t "=${t}" 2>/dev/null; then
-    send_text_tmux "$t" "$prompt" && sent=1
-  elif send_text_iterm "$t" "$prompt"; then
-    sent=1
-  else
-    store="$HOME/.cmuxterm/claude-hook-sessions.json"
-    if command -v jq >/dev/null 2>&1 && [ -r "$store" ]; then
-      sfc=$(jq -r --arg sid "$sid" '.sessions[$sid].surfaceId // empty' "$store" 2>/dev/null)
-      [ -n "$sfc" ] && send_text_cmux "$sfc" "$prompt" && sent=1
-    fi
+  # A hand-written handoff is an ANSWER, not a leftover: it is how you satisfy
+  # this requirement when the pane cannot be reached at all (`cl handoff`, run
+  # inside the session). Honour it instead of asking. Its AGE is printed
+  # prominently, because the one real hazard here is acting on something
+  # written weeks ago and forgotten.
+  if handoff_is_manual "$hp"; then
+    printf '✓ using the handoff you wrote by hand for "%s" — written %s ago (%s)\n' \
+      "$name" "$(handoff_age_human "$hp")" "$hp" >&2
+    return 0
   fi
 
-  if [ "$sent" != "1" ]; then
-    printf 'ℹ no reachable pane to hand off "%s" (not tmux, not a tagged iTerm tab, no cmux text-injection) — plain stop\n' "$name" >&2
-    return 1
-  fi
+  # Anything else still sitting here is a SUPERSEDED nonce handoff: written for
+  # a previous cycle and never consumed (a `--no-handoff` stop, or a crash
+  # between rotating and consuming). Sweep it before asking, so that the
+  # one-unconsumed-handoff invariant holds and the wait below cannot possibly
+  # match an old file.
+  [ -f "$hp" ] && consume_handoff "$root" "$name" "superseded, never consumed" >/dev/null
 
-  printf '⏳ asked "%s" to write its handoff — waiting up to %ss for %s\n' "$name" "$CL_HANDOFF_TIMEOUT" "$hp" >&2
-  waited=0
-  while [ "$waited" -lt "$CL_HANDOFF_TIMEOUT" ]; do
-    sleep 1; waited=$((waited+1))
-    # THIS request's nonce, not just "any change" — see handoff_nonce's
-    # comment for the two races a plain content hash still missed.
-    if [ -e "$hp" ] && grep -qF -- "$nonce" "$hp" 2>/dev/null; then
-      sleep 1   # small settle grace — atomic rename may still be mid-flight
-      printf '✓ handoff written for "%s"\n' "$name" >&2
-      return 0
+  local attempt=1
+  while [ "$attempt" -le "$CL_HANDOFF_ATTEMPTS" ]; do
+    # A FRESH nonce per attempt. Reusing one would let a late answer to
+    # attempt 1 be counted as confirmation of attempt 3 — which is the same
+    # stale-artifact confusion the nonce exists to prevent.
+    nonce=$(handoff_nonce)
+    prompt=$(build_handoff_prompt "$root" "$name" "$nonce")
+    sent=0
+
+    if [ -n "$t" ] && tmux has-session -t "=${t}" 2>/dev/null; then
+      send_text_tmux "$t" "$prompt" && sent=1
+    elif send_text_iterm "$t" "$prompt"; then
+      sent=1
+    else
+      store="$HOME/.cmuxterm/claude-hook-sessions.json"
+      if command -v jq >/dev/null 2>&1 && [ -r "$store" ]; then
+        sfc=$(jq -r --arg sid "$sid" '.sessions[$sid].surfaceId // empty' "$store" 2>/dev/null)
+        [ -n "$sfc" ] && send_text_cmux "$sfc" "$prompt" && sent=1
+      fi
     fi
+
+    # Unreachable is not a timing problem, so retrying cannot fix it — report
+    # it as "could not even ask" on the first attempt rather than burning the
+    # remaining attempts sending into nothing.
+    if [ "$sent" != "1" ]; then
+      printf 'ℹ no reachable pane to hand off "%s" (not tmux, not a tagged iTerm tab, no cmux text-injection)\n' "$name" >&2
+      return 1
+    fi
+
+    printf '⏳ asked "%s" to write its handoff (attempt %s of %s) — waiting up to %ss for %s\n' \
+      "$name" "$attempt" "$CL_HANDOFF_ATTEMPTS" "$CL_HANDOFF_TIMEOUT" "$hp" >&2
+    waited=0
+    while [ "$waited" -lt "$CL_HANDOFF_TIMEOUT" ]; do
+      sleep 1; waited=$((waited+1))
+      # THIS attempt's nonce, not just "any change" — see handoff_nonce's
+      # comment for the two races a plain content hash still missed.
+      if [ -e "$hp" ] && grep -qF -- "$nonce" "$hp" 2>/dev/null; then
+        sleep 1   # small settle grace — atomic rename may still be mid-flight
+        printf '✓ handoff written for "%s"\n' "$name" >&2
+        return 0
+      fi
+    done
+    printf '⚠ no handoff from "%s" after %ss\n' "$name" "$CL_HANDOFF_TIMEOUT" >&2
+    attempt=$((attempt+1))
   done
-  printf '⚠ handoff timed out for "%s" after %ss — proceeding with a plain stop\n' "$name" "$CL_HANDOFF_TIMEOUT" >&2
   return 2
 }
 
@@ -1510,8 +1708,13 @@ do_stop() {
     printf 'saved %s session(s) to %s\n\n' "$count" "$STATE"
   fi
 
-  local name t rrc
-  discover | while IFS=$'\t' read -r name sid cwd epoch agent; do
+  # `discover | while` would run the loop in a SUBSHELL, so nothing it counted
+  # could be reported afterwards. Read from a process substitution instead —
+  # the kept/killed tally below is the whole point of failing closed: a stop
+  # that silently leaves three sessions running is no better than one that
+  # silently kills them unhandoffed.
+  local name t rrc hrc kept=0 killed=0 kept_names=""
+  while IFS=$'\t' read -r name sid cwd epoch agent; do
     [ "$agent" = "claude" ] || continue   # codex lifecycle is out of scope here
     t=$(tmux_name "$name")
     # --dry-run must short-circuit BEFORE the kill logic regardless of
@@ -1526,10 +1729,23 @@ do_stop() {
       continue
     fi
     if [ "$no_handoff" = "0" ]; then
-      # 0 = written. 1/2 fall through to the SAME kill logic below,
-      # unchanged — a missed or timed-out handoff must never turn into a
-      # lost stop.
-      request_handoff "$name" "$sid" "$cwd" "$t" ""
+      # FAIL CLOSED. A session whose handoff never landed is left RUNNING
+      # rather than killed: the next `cl start` rotates off the handoff, so
+      # killing without one silently turns a rotation into a plain resume —
+      # and the context this whole feature exists to retire survives anyway.
+      # Leaving it alive keeps both options open and costs nothing but a tab.
+      #
+      # The two ways forward are printed, because a refusal with no route out
+      # of it is just a wedge: write the handoff by hand from inside the
+      # session, or skip it deliberately.
+      request_handoff "$name" "$sid" "$cwd" "$t" ""; hrc=$?
+      if [ "$hrc" -ne 0 ]; then
+        printf '✋ leaving "%s" running — no handoff, so stopping it now would lose the rotation.\n' "$name" >&2
+        printf '   · run `cl handoff` INSIDE that session, then `cl stop` again\n' >&2
+        printf '   · or `cl stop --no-handoff` to stop it anyway (cl start will resume it as-is)\n' >&2
+        kept=$((kept+1)); kept_names="${kept_names}${name}"$'\n'
+        continue
+      fi
     fi
     # retire_claude_session covers both branches (tmux-hosted and cmux/bare
     # process) with the busy-check-and-prompt, tab/surface cleanup, and the
@@ -1537,27 +1753,38 @@ do_stop() {
     # return value changes nothing here (a lost race, a decline, or a slow
     # shutdown are all just "didn't get killed this time, re-run stop").
     retire_claude_session "$name" "$sid" "$t" "$close_tabs"; rrc=$?
-  done
+    [ "$rrc" -eq 0 ] && killed=$((killed+1))
+  done < <(discover)
+
+  [ -n "$dry_run" ] && return 0
   printf '\nstate saved. Run cl start to bring these back.\n' >&2
+  if [ "$kept" -gt 0 ]; then
+    printf '\n%s session(s) left running for want of a handoff:\n' "$kept" >&2
+    printf '%s' "$kept_names" | sed '/^$/d; s/^/  · /' >&2
+    printf 'They are in the saved state either way, so `cl start` brings them back.\n' >&2
+  fi
 }
 
-# open_iterm_tabs <name>...: open one real iTerm tab per name, each running
-# `cl <name>` (which attaches that session's tmux). Mirrors the manual flow —
-# ⌘T, `cl`, pick the session — but creates ALL tabs in a SINGLE osascript
-# invocation (one AppleScript session for the whole set) instead of one process
-# per tab, which is markedly faster for a large working set. Returns non-zero if
-# the AppleScript fails (not in iTerm, automation denied) so the caller can fall
-# back to printing commands.
+# open_iterm_tabs <shell-command>...: open one real iTerm tab per command.
+# Mirrors the manual flow — ⌘T, `cl`, pick the session — but creates ALL tabs
+# in a SINGLE osascript invocation (one AppleScript session for the whole set)
+# instead of one process per tab, which is markedly faster for a large working
+# set. Returns non-zero if the AppleScript fails (not in iTerm, automation
+# denied) so the caller can fall back to printing the commands.
+#
+# Takes whole COMMANDS rather than names: a rotating session's tab has to carry
+# `--rotate-from <path>`, and rebuilding that here from a name would mean this
+# function re-deciding something do_start already decided.
 open_iterm_tabs() {
-  local name esc script
+  local cmd esc script
   script='tell application "iTerm"
   tell current window
 '
-  for name in "$@"; do
+  for cmd in "$@"; do
     # Escape backslashes then double-quotes for embedding in the AppleScript string.
-    esc="${name//\\/\\\\}"; esc="${esc//\"/\\\"}"
+    esc="${cmd//\\/\\\\}"; esc="${esc//\"/\\\"}"
     script+='    create tab with default profile
-    tell current session to write text "cl \"'"$esc"'\""
+    tell current session to write text "'"$esc"'"
 '
   done
   script+='  end tell
@@ -1567,10 +1794,25 @@ $script
 OSA
 }
 
-# do_start: bring back every session in STATE the way they were launched by
-# hand — one real iTerm tab each, tmux-backed via `cl <name>`. First it ensures
-# each session's tmux exists (detached), then opens a tab per session. Falls
-# back to printing the `cl <name>` commands when not in iTerm or osascript fails.
+# do_start: bring back every session in STATE — one real iTerm tab each,
+# tmux-backed via `cl <name>`. First it ensures each session's tmux exists
+# (detached), then opens a tab per session. Falls back to printing the commands
+# when not in iTerm or osascript fails.
+#
+# ROTATION. Per session, the presence of an unconsumed handoff decides how it
+# comes back:
+#
+#   handoff present  → consume it, start a NEW claude under the same name, and
+#                      hand it the file as its first message. The expensive
+#                      transcript is retired; the name, dir and reachability
+#                      are not. The old session id goes to FRESH_HISTORY, so
+#                      this is never a dead end.
+#   no handoff       → `--resume <sid>`, exactly as before.
+#
+# That second line is what makes a failed or skipped handoff safe: `cl stop
+# --no-handoff`, a session that could not be reached, a crash — all of them
+# simply leave no file, and the session comes back whole. Rotation is the
+# optimisation; resuming is the floor.
 do_start() {
   command -v jq >/dev/null 2>&1 || { echo "claude-session: start needs jq (brew install jq)" >&2; exit 1; }
   [ -r "$STATE" ] || { echo "claude-session: no saved state ($STATE) — run 'cl stop' first" >&2; exit 1; }
@@ -1578,19 +1820,36 @@ do_start() {
   local n; n=$(jq 'length' "$STATE" 2>/dev/null || echo 0)
   [ "$n" -gt 0 ] || { echo "claude-session: saved state is empty" >&2; exit 1; }
 
+  # Resolve the store ONCE for the whole run, the same discipline
+  # request_handoff follows: a per-session $(handoff_root) would resolve in a
+  # subshell and could pick a different root for two sessions started seconds
+  # apart. An unusable store is not fatal here — it only means no session can
+  # rotate, and every one of them still resumes.
+  local root=""
+  # stdout only — handoff_root's "falling back to…" notice belongs on screen
+  # here as much as it does during a stop.
+  handoff_root >/dev/null && root="$_CL_HANDOFF_ROOT"
+  [ -n "$root" ] || echo "claude-session: no usable handoff store — resuming every session as-is (no rotation)" >&2
+
   if in_cmux; then
     # cmux mode: one workspace per saved session, claude resumed tmux-free so
     # cmux's integration owns it. --focus false so eight restores don't fight
     # over focus. Live sessions (either kind) are left alone.
-    local name sid cwd i=0
+    local name sid cwd i=0 hoff cmd
     while IFS=$'\t' read -r name sid cwd; do
       if [ -n "$(session_pid "$sid")" ] \
          || { command -v tmux >/dev/null 2>&1 && tmux has-session -t "=$(tmux_name "$name")" 2>/dev/null; }; then
         printf '● %s already live\n' "$name"
       else
         [ -d "$cwd" ] || cwd="$HOME"
+        if hoff=$(plan_rotation "$root" "$name"); then
+          record_fresh_history "$name" "$sid" "$cwd"
+          cmd=$(fresh_cmd "$name" "$(build_resume_prompt "$hoff")")
+        else
+          cmd=$(resume_cmd claude "$sid")
+        fi
         cmux new-workspace --name "$name" --cwd "$cwd" --focus false \
-            --command "$(claude_cmd) --resume $(printf '%q' "$sid") --dangerously-skip-permissions" >/dev/null \
+            --command "$(env_prefix "$name")$cmd" >/dev/null \
           && { printf '✓ opened %s  (%s)\n' "$name" "$cwd"; i=$((i+1)); }
       fi
     done < <(jq -r '.[] | [.name, .sid, .cwd] | @tsv' "$STATE")
@@ -1605,37 +1864,53 @@ do_start() {
   #    tab still leaves a recoverable session. launch_session execs, so we
   #    replicate its create-detached form (incl. tmux_setup).
   use_tmux && tmux_setup
-  local name sid cwd t i=0 live_names=""
+  # One pass, not two. The tab command is no longer always `cl <name>` — a
+  # rotating session that has no tmux pane to pre-create has to carry its
+  # consumed handoff through to the tab — so the command is built in the same
+  # place the rotation is decided, rather than reconstructed from the name
+  # later. (It also means the STATE file is read once.)
+  local name sid cwd t i=0 hoff cmd
+  local -a names=() tab_cmds=()
   while IFS=$'\t' read -r name sid cwd; do
     t=$(tmux_name "$name")
     [ -d "$cwd" ] || cwd="$HOME"
+    i=$((i+1))
     if ! use_tmux; then
       # Without tmux there is nothing to pre-create: each tab's `cl <name>`
-      # execs the agent itself. Record the live ones so no tab is opened for
-      # them — `cl stop` leaves busy sessions running on purpose, and a tab
-      # for one would start a SECOND agent on the same transcript.
+      # execs the agent itself. Live ones get no tab — `cl stop` leaves busy
+      # sessions running on purpose, and a tab for one would start a SECOND
+      # agent on the same transcript.
       if [ -n "$(session_pid "$sid" claude "$name")" ]; then
-        printf '● %s already live\n' "$name"
-        live_names="${live_names}${name}"$'\n'
+        printf '● %s already live\n' "$name"; continue
       fi
-    elif tmux has-session -t "=${t}" 2>/dev/null; then
-      printf '● %s already live\n' "$name"
-      live_names="${live_names}${name}"$'\n'
+      # The rotation is decided (and the handoff consumed) HERE, so it happens
+      # exactly once even though the launch happens in another process.
+      if hoff=$(plan_rotation "$root" "$name"); then
+        record_fresh_history "$name" "$sid" "$cwd"
+        names+=("$name"); tab_cmds+=("cl \"$name\" --rotate-from $(printf '%q' "$hoff")")
+        printf '↻ %s will start fresh from its handoff\n' "$name"
+      else
+        names+=("$name"); tab_cmds+=("cl \"$name\"")
+      fi
+      continue
+    fi
+    if tmux has-session -t "=${t}" 2>/dev/null; then
+      printf '● %s already live\n' "$name"; continue
+    fi
+    # tmux path: the pane command IS the launch, so rotation is fully handled
+    # here and the tab only has to attach.
+    if hoff=$(plan_rotation "$root" "$name"); then
+      record_fresh_history "$name" "$sid" "$cwd"
+      cmd=$(fresh_cmd "$name" "$(build_resume_prompt "$hoff")")
+      tmux new-session -d -s "$t" -c "$cwd" "$(env_prefix "$name")$cmd" \
+        && printf '↻ prepared %s fresh from its handoff  (%s)\n' "$name" "$cwd"
     else
-      tmux new-session -d -s "$t" -c "$cwd" "claude --resume $(printf '%q' "$sid") --dangerously-skip-permissions" \
+      cmd=$(resume_cmd claude "$sid")
+      tmux new-session -d -s "$t" -c "$cwd" "$(env_prefix "$name")$cmd" \
         && printf '✓ prepared %s  (%s)\n' "$name" "$cwd"
     fi
-    i=$((i+1))
+    names+=("$name"); tab_cmds+=("cl \"$name\"")
   done < <(jq -r '.[] | [.name, .sid, .cwd] | @tsv' "$STATE")
-
-  # 2. Open a real iTerm tab per session (or fall back to printing commands).
-  #    Read names into an array first so the STATE file can be cleared safely.
-  local -a names=()
-  while IFS= read -r name; do
-    # Skip the ones reported live above: opening a tab for them duplicates.
-    printf '%s' "$live_names" | grep -qxF -- "$name" && continue
-    names+=("$name")
-  done < <(jq -r '.[].name' "$STATE")
 
   # Snapshot consumed: archive a copy first (so a failed relaunch never loses the
   # list — restore from STATE_HISTORY_DIR), then clear for the next clean cycle.
@@ -1652,7 +1927,7 @@ do_start() {
 
   local have_iterm=0
   in_iterm && have_iterm=1
-  if [ "$have_iterm" = "1" ] && open_iterm_tabs "${names[@]}"; then
+  if [ "$have_iterm" = "1" ] && open_iterm_tabs "${tab_cmds[@]}"; then
     printf '\nopened %s iTerm tab(s).\n' "${#names[@]}"
   else
     if [ "$have_iterm" = "1" ]; then
@@ -1660,7 +1935,7 @@ do_start() {
     else
       printf '\n%s session(s) prepared. Not in iTerm (or no osascript) — open a tab and run:\n' "$i"
     fi
-    for name in "${names[@]}"; do printf '  cl "%s"\n' "$name"; done
+    for cmd in "${tab_cmds[@]}"; do printf '  %s\n' "$cmd"; done
   fi
 }
 
@@ -1750,7 +2025,8 @@ EOF
   request_handoff "$name" "$sid" "$cwd" "$t" ""; hrc=$?
   case "$hrc" in
     0) : ;;
-    *) echo "claude-session: no handoff arrived for \"$name\" — not starting fresh (it is still running; re-run once it responds, or use plain \`cl stop\`/\`cl <name>\`)" >&2; exit 1 ;;
+    1) echo "claude-session: could not reach \"$name\" to ask for a handoff — not starting fresh. Run \`cl handoff\` inside it and try again; if it is already stopped, plain \`cl start\` rotates it off any handoff it left." >&2; exit 1 ;;
+    *) echo "claude-session: no handoff arrived for \"$name\" after $CL_HANDOFF_ATTEMPTS attempt(s) — not starting fresh (it is left running; run \`cl handoff\` inside it, or \`cl stop --no-handoff\` to stop it as-is)" >&2; exit 1 ;;
   esac
   # request_handoff resolved the handoff dir/fallback root exactly once, via a
   # direct (non-$()) call, and left it memoized here — reused below so the
@@ -1775,11 +2051,86 @@ EOF
 
   record_fresh_history "$name" "$sid" "$cwd"
 
+  # Consume it here, exactly as `cl start` does. This handoff has now been
+  # used; leaving it in place would make the NEXT plain `cl start` rotate the
+  # replacement session off it too, having never been stopped.
   local hp prompt
-  hp=$(handoff_path "$root" "$name")
+  if ! hp=$(consume_handoff "$root" "$name" "rotating now"); then
+    hp=$(handoff_path "$root" "$name")   # nothing to move (or the move failed)
+  fi
   prompt=$(build_resume_prompt "$hp")
 
   launch_fresh "$name" "$cwd" "$prompt"
+}
+
+# do_handoff [--path] [name]: write this session's handoff BY HAND, from
+# inside it. The escape hatch for the case `cl stop` cannot solve on its own —
+# a pane that text injection cannot reach, or a session too wedged to answer —
+# and the reason `cl stop` can afford to fail closed: refusing to kill a
+# session is only reasonable if there is a way to satisfy the requirement.
+#
+# The name comes from CL_SESSION_NAME, exported by every launch path, so inside
+# a session this is just `cl handoff`. Sessions started before that existed
+# (and anything scripted) can name it: `cl handoff "Some Name"`.
+#
+# Content comes from stdin when stdin is not a terminal, so an agent can pipe
+# its handoff straight in and let cl own the atomic rename and the marker. Run
+# interactively it prints where to write and what to include instead.
+do_handoff() {
+  local path_only=0 name="" arg
+  for arg in "$@"; do
+    case "$arg" in
+      --path) path_only=1 ;;
+      --*)    echo "claude-session: handoff: unrecognised flag '$arg'" >&2; exit 1 ;;
+      *)      name="$arg" ;;
+    esac
+  done
+  [ -n "$name" ] || name="${CL_SESSION_NAME:-}"
+  if [ -z "$name" ]; then
+    echo 'claude-session: handoff: no session name — run this inside a cl-started session, or pass one: cl handoff "Some Name"' >&2
+    exit 1
+  fi
+
+  local root hp
+  handoff_root >/dev/null || { echo "claude-session: handoff: no usable handoff store" >&2; exit 1; }
+  root="$_CL_HANDOFF_ROOT"
+  hp=$(handoff_path "$root" "$name")
+
+  if [ "$path_only" = "1" ]; then printf '%s\n' "$hp"; exit 0; fi
+
+  # At most one unconsumed handoff per session — so an earlier one is swept
+  # before this one lands, exactly as `cl stop` sweeps before asking.
+  [ -f "$hp" ] && consume_handoff "$root" "$name" "replaced by a hand-written handoff" >/dev/null
+
+  if [ -t 0 ]; then
+    printf 'Write this session'"'"'s handoff to:\n  %s\n\n' "$hp"
+    printf 'Write a temp file and rename it into place, and end it with this line\n'
+    printf 'so cl knows it was written by hand rather than left over:\n  %s%s -->\n\n' \
+      "$MANUAL_MARKER_PREFIX" "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)"
+    printf 'Or pipe it in and let cl do both:  cl handoff < your-file\n'
+    exit 0
+  fi
+
+  local tmp
+  tmp="$hp.partial.$$"
+  if ! cat > "$tmp" 2>/dev/null; then
+    rm -f "$tmp" 2>/dev/null
+    echo "claude-session: handoff: could not write $tmp" >&2; exit 1
+  fi
+  if [ ! -s "$tmp" ]; then
+    rm -f "$tmp" 2>/dev/null
+    echo "claude-session: handoff: nothing on stdin — refusing to write an empty handoff" >&2; exit 1
+  fi
+  printf '\n%s%s -->\n' "$MANUAL_MARKER_PREFIX" \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)" >> "$tmp"
+  # Rename last, so a reader never sees a half-written handoff.
+  if mv "$tmp" "$hp" 2>/dev/null; then
+    printf '✓ handoff written for "%s" → %s\n' "$name" "$hp" >&2
+    printf '  `cl stop` will now accept it, and the next `cl start` will rotate off it.\n' >&2
+    exit 0
+  fi
+  rm -f "$tmp" 2>/dev/null
+  echo "claude-session: handoff: could not move the handoff into place at $hp" >&2; exit 1
 }
 
 # do_restore: copy a snapshot from STATE_HISTORY_DIR back to STATE so the next
@@ -1914,6 +2265,7 @@ case "${1:-}" in
     shift
     if [ "${1:-}" = "--fresh" ]; then shift; do_fresh_start "$@"; else do_start; fi
     exit 0 ;;
+  handoff) shift; do_handoff "$@"; exit 0 ;;
   restore) do_restore "${2:-}"; exit 0 ;;
   --discover)  # raw TSV (name sid cwd epoch agent) — for scripts and tests
     discover; exit 0 ;;
@@ -1928,6 +2280,20 @@ case "${1:-}" in
   -h|--help) awk 'NR>1 && !/^#/{exit} NR>1{print}' "$0"; exit 0 ;;
   '') : ;;  # fall through to picker
   *)
+    # `cl <name> --rotate-from <path>`: internal, emitted by `cl start` for a
+    # rotating session in the no-tmux shape, where nothing is pre-created and
+    # the tab itself has to do the launch. The handoff is ALREADY consumed by
+    # then (do_start does it once, before opening any tab), so the path names a
+    # file under consumed/ and this just reads it.
+    if [ "${2:-}" = "--rotate-from" ]; then
+      rotate_from="${3:-}"
+      [ -n "$rotate_from" ] || { echo "claude-session: --rotate-from needs a path" >&2; exit 1; }
+      [ -r "$rotate_from" ] || { echo "claude-session: cannot read handoff $rotate_from" >&2; exit 1; }
+      rcwd=$(discover | awk -F'\t' -v n="$1" '$1==n && $5=="claude" {print $3; exit}')
+      [ -d "$rcwd" ] || rcwd="$HOME"
+      launch_fresh "$1" "$rcwd" "$(build_resume_prompt "$rotate_from")"
+      exit 0
+    fi
     # direct launch by name. A name held by BOTH agents is refused unless
     # --codex/--claude says which — never first-row-wins.
     match=$(discover | awk -F'\t' -v n="$1" -v a="$AGENT_FILTER" '$1==n && (a=="" || $5==a)')

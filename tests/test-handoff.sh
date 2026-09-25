@@ -430,5 +430,263 @@ check "a real run creates the directory the preview named" "1" "$real_dir_ok"
 check "…and the previewed path sits inside it" "1" \
   "$(printf '%s' "$prev" | grep -c "^$PV/")"
 
+echo "prompt construction: one literal line, literal substitution, refused without a token"
+# These go at the builder directly. The end-to-end dry-run path returns before
+# a prompt is ever built, so driving these through it would assert nothing —
+# and the properties here are exactly the ones that were wrong.
+PROMPTS="$HOME/.config/claude-session"; mkdir -p "$PROMPTS"
+BUILD="$FIX/build.sh"
+{ grep '^_prompt_flatten() {' "$CL"                 # a one-liner: match the line
+  sed -n '/^_prompt_expand/,/^}$/p'      "$CL"
+  sed -n '/^read_prompt_file/,/^}$/p'    "$CL"
+  sed -n '/^build_resume_prompt/,/^}$/p' "$CL"
+  sed -n '/^build_handoff_prompt/,/^}$/p' "$CL"
+} > "$BUILD"
+printf 'handoff_path() { printf "%%s/%%s.md" "$1" "$2"; }\n' >> "$BUILD"
+bp() { env CL_HANDOFF_PROMPT_FILE="${1:-/nonexistent}" CL_RESUME_PROMPT_FILE=/nonexistent \
+        bash -c "source '$BUILD'; build_handoff_prompt \"\$@\"" _ "$2" "$3" "$4" 2>"$FIX/bp.err"; }
+
+# A CRLF file keeps one CR per line after tr '\n'; cmux reads CR as Enter, and
+# a tab is a real Tab keystroke.
+printf 'one {{nonce}}\r\ntwo\tafter tab {{handoff}}\r\n' > "$PROMPTS/handoff-prompt.txt"
+out=$(bp "$PROMPTS/handoff-prompt.txt" /store Name clho:1:1:1:1)
+check "a CRLF template yields no carriage return" "0" "$(printf '%s' "$out" | LC_ALL=C grep -c $'\r')"
+check "…and no literal tab"                       "0" "$(printf '%s' "$out" | LC_ALL=C grep -c $'\t')"
+check "…and is a single line"                     "0" "$(printf '%s' "$out" | grep -c '^$')"
+
+# A control character arriving through a SUBSTITUTED VALUE is the case that
+# flattening the template alone never sees.
+printf 'x {{nonce}} {{name}} y\n' > "$PROMPTS/handoff-prompt.txt"
+out=$(bp "$PROMPTS/handoff-prompt.txt" /store "$(printf 'Bad\rName')" clho:1:1:1:1)
+check "a control character inside a value is folded too" "0" \
+  "$(printf '%s' "$out" | LC_ALL=C grep -c $'\r')"
+
+# Sequential ${var//} passes rescan what earlier passes inserted.
+printf 'H={{handoff}} N={{nonce}} A={{name}} S={{store}}\n' > "$PROMPTS/handoff-prompt.txt"
+out=$(bp "$PROMPTS/handoff-prompt.txt" /the-store '{{store}}-and-{{nonce}}' clho:7:7:7:7)
+contains "a value spelling {{store}} is inserted verbatim" "$out" 'A={{store}}-and-{{nonce}}'
+check "…never expanded into the real store path" "0" "$(printf '%s' "$out" | grep -c 'A=/the-store')"
+check "…and never rewritten into the nonce"      "1" "$(printf '%s' "$out" | grep -c 'and-{{nonce}}')"
+
+# A prompt that never asks for the token can never be confirmed: sending it
+# costs every session the full timeout on a statically visible mistake.
+printf 'tidy up and write something to {{handoff}}\n' > "$PROMPTS/handoff-prompt.txt"
+out=$(bp "$PROMPTS/handoff-prompt.txt" /store Name clho:2:2:2:2)
+err=$(cat "$FIX/bp.err")
+contains "a prompt with no {{nonce}} is refused" "$err" "no {{nonce}} placeholder"
+not_contains "…and its text is never used"       "$out" "tidy up"
+contains "…the built-in default is sent instead" "$out" "Before you stop: write a handoff"
+rm -f "$PROMPTS/handoff-prompt.txt"
+
+# The default is what strangers inherit. An earlier "generic" default still
+# carried a line-count target and a prescribed schema while the docs claimed it
+# defined nothing beyond the token. Asserted here rather than through
+# `--fresh --dry-run`, which prints the RESUME prompt and returns before a
+# handoff prompt is ever built — so those assertions held whatever it said.
+out=$(bp /nonexistent /store Name clho:3:3:3:3)
+not_contains "the default prescribes no line count" "$out" "100 lines"
+not_contains "…and no content schema"              "$out" "gotchas"
+not_contains "…and no list of what to cover"       "$out" "in-flight work"
+contains     "…it asks for the handoff"            "$out" "write a handoff"
+contains     "…and for the token"                  "$out" "clho:3:3:3:3"
+
+echo "the fallback is write-probed, not just stat'd"
+# The primary gets a real write probe; the fallback used to get [ -d ] only —
+# on exactly the path taken when the primary has already failed.
+RO2="$FIX/ro-fallback"; mkdir -p "$RO2/primary" "$RO2/fb"
+chmod 555 "$RO2/primary"      # primary exists but rejects writes -> fall back
+chmod 555 "$RO2/fb"           # fallback exists, is a dir, and ALSO rejects writes
+fb_out=$(env -i HOME="$HOME" PATH="$BASEPATH" \
+  CL_HANDOFF_DIR="$RO2/primary" CL_HANDOFF_FALLBACK_BASE="$RO2/fb" \
+  CL_HANDOFF_TIMEOUT=1 bash "$CL" stop --keep-tabs 2>&1)
+chmod 755 "$RO2/primary" "$RO2/fb"
+contains "an unwritable fallback is reported, not accepted" "$fb_out" "no durable handoff location"
+
+echo "dry run and a real run agree on a first install"
+# The preview used to require the directory to already exist, so on a fresh
+# machine it announced the fallback while the real run created and used the
+# configured default — the divergence that matters most, on first use.
+NEW="$FIX/never-used/handoff"          # does not exist; its parent is writable
+NUFB="$FIX/nu-fallback"
+new_out=$(env -i HOME="$HOME" PATH="$BASEPATH" CL_HANDOFF_DIR="$NEW" \
+  CL_HANDOFF_FALLBACK_BASE="$NUFB" bash "$CL" stop --dry-run 2>&1)
+contains "the previewed path is under the configured dir" "$new_out" "$NEW/T-Big.md"
+not_contains "…a creatable dir is not announced as unusable" "$new_out" "handoff dir unusable"
+not_contains "…and the fallback is not named"               "$new_out" "nu-fallback"
+check "…while the dry run still creates nothing" "0" "$([ -e "$NEW" ] && echo 1 || echo 0)"
+# And prove the preview told the truth: a real run uses that same path.
+env -i HOME="$HOME" PATH="$BASEPATH" CL_HANDOFF_DIR="$NEW" \
+  CL_HANDOFF_FALLBACK_BASE="$NUFB" CL_HANDOFF_TIMEOUT=1 \
+  bash "$CL" stop --keep-tabs >/dev/null 2>&1
+check "a real first run creates and uses exactly that dir" "1" "$([ -d "$NEW" ] && echo 1 || echo 0)"
+check "…and never falls back"                              "0" "$([ -e "$NUFB" ] && echo 1 || echo 0)"
+
+
+# ===========================================================================
+# Rotation: the handoff as the hinge between two runs.
+# ===========================================================================
+# `cl stop` writes it, `cl start` rotates off it. The invariant everything
+# below rests on: AT MOST ONE UNCONSUMED HANDOFF PER SESSION — so the mere
+# presence of the file means "written, not yet used".
+#
+# These drive the NO-TMUX shape on purpose: nothing is pre-created there, so
+# `cl start` has to carry the decision into the tab command, where it is
+# visible to a test without launching a single agent. PATH excludes tmux so
+# use_tmux() is false; jq is symlinked in because do_start requires it.
+NOTMUX="$FIX/notmux-bin"; mkdir -p "$NOTMUX"
+ln -sf "$(command -v jq)" "$NOTMUX/jq" 2>/dev/null
+NOTMUX_PATH="$NOTMUX:/usr/bin:/bin"
+STATEDIR="$HOME/.config/claude-session"; mkdir -p "$STATEDIR"
+RDIR="$FIX/rot-store"
+
+write_state() { # name sid cwd
+  printf '[{"name":"%s","sid":"%s","cwd":"%s"}]\n' "$1" "$2" "$3" > "$STATEDIR/state.json"
+}
+run_start() { env -i HOME="$HOME" PATH="$NOTMUX_PATH" CL_HANDOFF_DIR="$RDIR" \
+  CL_HANDOFF_FALLBACK_BASE="$FIX/rot-fb" bash "$CL" start 2>&1; }
+consumed_count() { ls "$RDIR/consumed" 2>/dev/null | grep -c . ; }
+
+echo "cl start rotates a session that has an unconsumed handoff"
+mkdir -p "$RDIR"
+printf 'work in flight\n<!-- cl:clho:1:1:1:1 -->\n' > "$RDIR/T-Big.md"
+write_state "T-Big" "sid-big" "$FIX/work1"
+rot_out=$(run_start)
+contains "the tab command says to start fresh from the handoff" "$rot_out" "--rotate-from"
+contains "…and it is announced, not silent"                     "$rot_out" "will start fresh"
+check "…the handoff is no longer sitting unconsumed" "0" "$([ -e "$RDIR/T-Big.md" ] && echo 1 || echo 0)"
+check "…it moved to consumed/, it was not deleted"   "1" "$(consumed_count)"
+contains "…and the rotate-from path points INTO consumed/" "$rot_out" "consumed/"
+
+echo "…and the OLD session id is recorded, so a rotation is never a dead end"
+check "fresh-history records the retired session" "1" \
+  "$(grep -c 'sid-big' "$STATEDIR/fresh-history.json" 2>/dev/null || echo 0)"
+
+echo "a SECOND cl start does not rotate again — the handoff was consumed"
+# The trap this invariant exists to close: with nothing consuming the file,
+# every start from here on would rotate off the same ever-staler handoff, and
+# `--no-handoff` would quietly stop meaning anything.
+write_state "T-Big" "sid-big" "$FIX/work1"
+again_out=$(run_start)
+not_contains "no rotation the second time"        "$again_out" "--rotate-from"
+contains     "…it resumes the session instead"    "$again_out" 'cl "T-Big"'
+check "…and nothing new was consumed" "1" "$(consumed_count)"
+
+echo "no handoff at all means resume — nothing is lost"
+# The floor the whole design stands on: a skipped, failed or impossible
+# handoff leaves no file, and the session comes back whole.
+rm -f "$RDIR/T-Small.md"
+write_state "T-Small" "sid-small" "$FIX/work2"
+plain_out=$(run_start)
+not_contains "a session with no handoff is not rotated" "$plain_out" "--rotate-from"
+contains     "…it comes back by name"                   "$plain_out" 'cl "T-Small"'
+
+echo "a handoff that cannot be cleared does not rotate"
+# Rotating off a file we failed to move means rotating off it again every
+# start, forever. Declining degrades to a plain resume, which loses nothing.
+# The store itself must stay writable — making it read-only would fail the
+# root probe instead and silently fall back, testing the wrong branch. A plain
+# FILE where consumed/ needs to be makes the MOVE fail and nothing else.
+RO3="$FIX/rot-ro"; mkdir -p "$RO3"
+printf 'stuck\n<!-- cl:clho:9:9:9:9 -->\n' > "$RO3/T-Big.md"
+: > "$RO3/consumed"
+write_state "T-Big" "sid-big" "$FIX/work1"
+stuck_out=$(env -i HOME="$HOME" PATH="$NOTMUX_PATH" CL_HANDOFF_DIR="$RO3" \
+  CL_HANDOFF_FALLBACK_BASE="$FIX/rot-fb2" bash "$CL" start 2>&1)
+not_contains "an unmovable handoff is not rotated off" "$stuck_out" "--rotate-from"
+contains     "…and the reason is reported"             "$stuck_out" "not rotating it"
+contains     "…while the session still comes back"     "$stuck_out" 'cl "T-Big"'
+check "…and the handoff is left where it is, not lost" "1" "$([ -f "$RO3/T-Big.md" ] && echo 1 || echo 0)"
+
+# ===========================================================================
+# cl stop fails CLOSED.
+# ===========================================================================
+echo "cl stop leaves a session running when no handoff lands"
+# The inversion: stopping without a handoff silently turns a rotation into a
+# plain resume. Leaving it alive keeps both options open and costs a tab.
+rtmux new-session -d -s KeepAlive -c "$FIX" 'sleep 30'
+printf '{"cwd":"%s"}\n{"customTitle":"KeepAlive"}\n' "$FIX" > "$HOME/.claude/projects/p1/sid-keepalive.jsonl"
+keep_out=$(env -i HOME="$HOME" PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
+  CL_HANDOFF_DIR="$FIX/keep-store" CL_HANDOFF_TIMEOUT=1 CL_HANDOFF_ATTEMPTS=2 \
+  bash "$CL" stop --keep-tabs 2>&1)
+alive=0; rtmux has-session -t KeepAlive 2>/dev/null && alive=1
+check "the session is still alive after a failed handoff" "1" "$alive"
+contains "…and the refusal says so"           "$keep_out" "leaving \"KeepAlive\" running"
+contains "…naming the way out"                "$keep_out" "cl handoff"
+contains "…and the other way out"             "$keep_out" "--no-handoff"
+contains "…it is asked more than once"        "$keep_out" "attempt 2 of 2"
+
+echo "…but --no-handoff still stops it"
+# Fail-closed must not become a wedge: the deliberate skip has to still work.
+env -i HOME="$HOME" PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
+  bash "$CL" stop --keep-tabs --no-handoff >/dev/null 2>&1
+alive2=0; rtmux has-session -t KeepAlive 2>/dev/null && alive2=1
+check "--no-handoff stops a session that has no handoff" "0" "$alive2"
+rtmux kill-session -t KeepAlive >/dev/null 2>&1 || true
+rm -f "$HOME/.claude/projects/p1/sid-keepalive.jsonl"
+
+# ===========================================================================
+# The hand-written escape hatch.
+# ===========================================================================
+echo "cl handoff writes a handoff from inside a session"
+HDIR2="$FIX/manual-store"; mkdir -p "$HDIR2"
+man_path=$(env -i HOME="$HOME" PATH="$BASEPATH" CL_HANDOFF_DIR="$HDIR2" \
+  CL_SESSION_NAME="T-Big" bash "$CL" handoff --path 2>/dev/null)
+check "--path prints the path it would write" "$HDIR2/T-Big.md" "$man_path"
+printf 'hand written state\n' | env -i HOME="$HOME" PATH="$BASEPATH" \
+  CL_HANDOFF_DIR="$HDIR2" CL_SESSION_NAME="T-Big" bash "$CL" handoff >/dev/null 2>&1
+check "piping content in writes the file" "1" "$([ -f "$HDIR2/T-Big.md" ] && echo 1 || echo 0)"
+contains "…keeping what was piped in" "$(cat "$HDIR2/T-Big.md" 2>/dev/null)" "hand written state"
+contains "…and stamping it as hand-written" "$(cat "$HDIR2/T-Big.md" 2>/dev/null)" "<!-- cl:manual:"
+
+echo "…an empty handoff is refused, not written"
+# An empty file would satisfy every existence check while saying nothing.
+rm -f "$HDIR2/T-Empty.md"
+empty_rc=0
+printf '' | env -i HOME="$HOME" PATH="$BASEPATH" CL_HANDOFF_DIR="$HDIR2" \
+  CL_SESSION_NAME="T-Empty" bash "$CL" handoff >/dev/null 2>&1 || empty_rc=$?
+check "an empty pipe is rejected"        "1" "$empty_rc"
+check "…and no file is left behind"      "0" "$([ -e "$HDIR2/T-Empty.md" ] && echo 1 || echo 0)"
+
+echo "…and without a name it says so rather than guessing"
+noname_out=$(env -i HOME="$HOME" PATH="$BASEPATH" CL_HANDOFF_DIR="$HDIR2" \
+  bash "$CL" handoff --path 2>&1) || true
+contains "no CL_SESSION_NAME is an error, not a guess" "$noname_out" "no session name"
+
+echo "a hand-written handoff is honoured by cl stop instead of asking"
+# The whole reason `cl stop` can afford to fail closed: there is a way to
+# satisfy it when the pane cannot be reached at all.
+rtmux new-session -d -s ManualTarget -c "$FIX" 'sleep 30'
+printf '{"cwd":"%s"}\n{"customTitle":"ManualTarget"}\n' "$FIX" > "$HOME/.claude/projects/p1/sid-manual.jsonl"
+MSTORE="$FIX/manual-honour"; mkdir -p "$MSTORE"
+printf 'written by hand\n<!-- cl:manual:2026-09-24T00:00:00Z -->\n' > "$MSTORE/ManualTarget.md"
+man_out=$(env -i HOME="$HOME" PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
+  CL_HANDOFF_DIR="$MSTORE" CL_HANDOFF_TIMEOUT=1 bash "$CL" stop --keep-tabs 2>&1)
+contains "the hand-written handoff is used"        "$man_out" "handoff you wrote by hand"
+contains "…with its age, so an old one is obvious" "$man_out" "ago"
+not_contains "…and the pane is never asked"        "$man_out" "attempt 1 of"
+check "…the file is left for cl start to consume" "1" "$([ -f "$MSTORE/ManualTarget.md" ] && echo 1 || echo 0)"
+# The other half of the contract: fail-closed only refuses when the handoff is
+# MISSING. Once it is satisfied, the stop proceeds exactly as it always did.
+man_alive=0; rtmux has-session -t ManualTarget 2>/dev/null && man_alive=1
+check "…and the session IS stopped once the handoff is satisfied" "0" "$man_alive"
+rtmux kill-session -t ManualTarget >/dev/null 2>&1 || true
+
+echo "a superseded nonce handoff is swept before a new one is requested"
+# Left by a --no-handoff stop or a crash. It must not be able to satisfy the
+# wait below, or a stop would confirm itself off a file from weeks ago.
+rtmux new-session -d -s SweepTarget -c "$FIX" 'sleep 30'
+printf '{"cwd":"%s"}\n{"customTitle":"SweepTarget"}\n' "$FIX" > "$HOME/.claude/projects/p1/sid-sweep.jsonl"
+SSTORE="$FIX/sweep-store"; mkdir -p "$SSTORE"
+printf 'old cycle\n<!-- cl:clho:0:0:0:0 -->\n' > "$SSTORE/SweepTarget.md"
+sweep_out=$(env -i HOME="$HOME" PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
+  CL_HANDOFF_DIR="$SSTORE" CL_HANDOFF_TIMEOUT=1 CL_HANDOFF_ATTEMPTS=1 \
+  bash "$CL" stop --keep-tabs 2>&1)
+contains "the leftover is swept"                "$sweep_out" "superseded"
+check "…out of the way"  "0" "$([ -e "$SSTORE/SweepTarget.md" ] && echo 1 || echo 0)"
+check "…into consumed/"  "1" "$(ls "$SSTORE/consumed" 2>/dev/null | grep -c .)"
+contains "…and a fresh request is made anyway"  "$sweep_out" "attempt 1 of"
+rtmux kill-session -t SweepTarget >/dev/null 2>&1 || true
+rm -f "$HOME/.claude/projects/p1/sid-manual.jsonl" "$HOME/.claude/projects/p1/sid-sweep.jsonl"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
