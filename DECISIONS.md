@@ -532,37 +532,76 @@ handoff whose prose *mentions* a marker was classified by that mention.
 evidence of what went wrong, so it is filed, not destroyed. Leaving it in place
 was also rejected: it would be re-examined and re-rejected on every start.
 
-## 2026-09-25 — A handoff is spent only when a replacement is running: claim, then commit or roll back
+## 2026-09-25 — The pathname handed to a replacement is never renamed again
 
-**Chose:** rotating moves the handoff into `<store>/.claims/` first; it is
-committed to `consumed/` only once the launch is accepted, and rolled back to
-the active path if it is refused. Where "accepted" is decided depends on the
-shape: under tmux/cmux the launching process sees the backend answer, so it
-commits; without tmux the agent is started by the tab, so the tab claims it
-after `acquire_launch` grants ownership of the name. A session whose launch was
-refused keeps its row in the restart list.
+> Supersedes the two-phase `.claims/` staging introduced earlier the same day,
+> which was broken on every rotation path.
 
-**Forecloses:** treating a handoff as spent at the moment a rotation is
-*decided*.
+**Chose:** rotating renames the active handoff **once**, straight to its
+permanent home under `<store>/consumed/`, and hands that path to the
+replacement. `.claims/` is gone. Destination names are unique by construction
+(timestamp + pid + two random draws), not by checking for a free name first.
+Rollback moves the file back to the active path **only if nothing newer is
+there**. A synchronous launch (tmux, cmux) that is refused rolls back and keeps
+the session's row in the restart list; the exec paths preflight the working
+directory and the agent binary before the handoff is treated as spent.
 
-**Reverses by:** a launch path that can report acceptance synchronously in
-every shape, which would let one process own the whole transaction.
+**Forecloses:** any staging area for an in-flight handoff, and any "commit"
+step that moves a path another process already holds.
 
-**Why:** consuming first and launching second meant a failed launch left the
-session with no active handoff AND — once `cl start` cleared the list — no
-restart row, recoverable only through `cl restore`. That is a hole in the
-"always falls back to a plain resume" floor the design claims. The claim is a
-`rename`, so it is also the concurrency answer: two starts racing for one
-handoff produce exactly one rotation and one ordinary resume.
+**Reverses by:** a launch protocol where the replacement acknowledges receipt,
+which would allow a real two-phase commit.
 
-**Not chosen:** a lock file. `rename` already gives atomic hand-over with no
-stale-lock problem and no reclamation policy to get wrong.
+**Why:** the staged design built the replacement's first message from the
+staging path and then moved the file to `consumed/` once the backend accepted.
+The prompt was already on its way to the agent, so **every rotation told the new
+session to read a path that no longer existed** — the feature silently did
+nothing. Reproduced by recording the agent's argv. Every test passed throughout,
+because they all asserted on the store (active file gone, `consumed/` one richer)
+and none on whether the path in the agent's own argv still resolved. A rename is
+also the whole concurrency answer: two starts racing for one handoff give exactly
+one rotation and one ordinary resume, with no lock to go stale.
 
-## 2026-09-25 — A hand-written handoff is stamped with the session that wrote it
+**Not chosen:** claiming ownership separately from the content path via a
+metadata record. It works, but it adds a second thing to keep consistent in
+order to preserve a staging step with no remaining purpose.
 
-**Chose:** `cl handoff` writes `<!-- cl:manual:<ts>@<sid> -->`, and a rotation
-refuses a handoff whose stamped id is not the session being replaced. Markers
-without an id predate the stamp and are accepted for any occupant.
+**Honest boundary:** on an `exec` path the launcher becomes the agent, so it can
+never observe the agent running. Ownership granted + cwd reachable + agent
+runnable is what it can establish, and that is what the comments claim.
+
+## 2026-09-25 — Which way a session comes back is recorded on its row, not inferred from the store
+
+**Chose:** `cl stop` sets `resume_only` on the saved row when no handoff arrived
+or `--no-handoff` was given, and `cl start` obeys the row, filing any stale
+handoff aside.
+
+**Forecloses:** deriving the start mode from whichever file happens to be
+present.
+
+**Reverses by:** handoffs becoming per-cycle artifacts that cannot outlive the
+stop that requested them, which would make presence unambiguous again.
+
+**Why:** two cases broke inference. A stop whose request failed can leave an
+OLDER complete handoff in place, so the next start rotates from notes predating
+everything done since — while `cl stop` has already printed that it would
+resume. And `--no-handoff`'s attempt to clear a pending handoff can itself fail,
+silently reversing an explicit choice. A promise printed to the user should not
+depend on a filesystem move succeeding.
+
+## 2026-09-25 — A hand-written handoff is stamped with the id its session was LAUNCHED with
+
+**Chose:** `cl handoff` writes `<!-- cl:manual:<ts>@<sid> -->` using
+`CL_SESSION_ID`, set by every launch that knows the id and passed into pane
+commands explicitly. A rotation refuses a handoff whose stamped id is not the
+session being replaced. A session with no id stamps none, and unstamped markers
+are accepted for any occupant.
+
+**Also forecloses:** deriving "my own session id" from the display name. That is
+no evidence: the name is stable across rotations, so after one the newest
+session under it is the REPLACEMENT — a predecessor still finishing its handoff
+would stamp its successor's id onto its own file and make a stale handoff look
+current. Unstamped is honest; wrongly stamped is worse than nothing.
 
 **Forecloses:** a name alone identifying a handoff's author.
 

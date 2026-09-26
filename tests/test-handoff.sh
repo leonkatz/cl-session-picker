@@ -535,6 +535,13 @@ check "…and never falls back"                              "0" "$([ -e "$NUFB"
 # use_tmux() is false; jq is symlinked in because do_start requires it.
 NOTMUX="$FIX/notmux-bin"; mkdir -p "$NOTMUX"
 ln -sf "$(command -v jq)" "$NOTMUX/jq" 2>/dev/null
+# A stand-in agent that records the argv it was handed. `cl` now preflights that
+# the agent is runnable before it treats a handoff as spent, so a PATH with no
+# agent on it exercises the refusal path, not the success path. Recording the
+# argv also lets a test assert what the replacement was actually TOLD — the gap
+# that let a rotation point every new session at a path the commit had moved.
+printf '#!/bin/sh\nprintf "%%s\\n" "$@" > "${CL_AGENT_REC:-/dev/null}"\n' > "$NOTMUX/claude"
+chmod +x "$NOTMUX/claude"
 NOTMUX_PATH="$NOTMUX:/usr/bin:/bin"
 STATEDIR="$HOME/.config/claude-session"; mkdir -p "$STATEDIR"
 RDIR="$FIX/rot-store"
@@ -548,7 +555,8 @@ run_start() { env -i HOME="$HOME" PATH="$NOTMUX_PATH" CL_HANDOFF_DIR="$RDIR" \
 # the fixture PATH) — deliberately: what matters is that the claim is committed
 # at the point launch ownership is granted, which happens first.
 run_tab() { env -i HOME="$HOME" PATH="$NOTMUX_PATH" CL_HANDOFF_DIR="${2:-$RDIR}" \
-  CL_HANDOFF_FALLBACK_BASE="$FIX/rot-fb" bash "$CL" "$1" --rotate-from "${3:-$RDIR/$1.md}" 2>&1; }
+  CL_HANDOFF_FALLBACK_BASE="$FIX/rot-fb" CL_AGENT_REC="${4:-$FIX/agent-argv}" \
+  bash "$CL" "$1" --rotate-from "${3:-$RDIR/$1.md}" 2>&1; }
 consumed_count() { ls "$RDIR/consumed" 2>/dev/null | grep -c . ; }
 
 echo "cl start rotates a session that has an unconsumed handoff"
@@ -573,8 +581,8 @@ tab_out=$(run_tab "T-Big")
 check "the tab consumes the handoff once it owns the launch" "0" \
   "$([ -e "$RDIR/T-Big.md" ] && echo 1 || echo 0)"
 check "…filing it in consumed/, not deleting it"             "1" "$(consumed_count)"
-check "…and nothing is left stranded in .claims/"            "0" \
-  "$(ls "$RDIR/.claims" 2>/dev/null | grep -c .)"
+check "…and the path it was told to read still exists"       "1" \
+  "$(p=$(grep -o '/[^\"]*\.md' "$FIX/agent-argv" 2>/dev/null | head -1); [ -n "$p" ] && [ -e "$p" ] && echo 1 || echo 0)"
 
 echo "…and the OLD session id is recorded, so a rotation is never a dead end"
 check "fresh-history records the retired session" "1" \
@@ -604,16 +612,16 @@ echo "a handoff that cannot be cleared does not rotate"
 # start, forever. Declining degrades to a plain resume, which loses nothing.
 # The store itself must stay writable — making it read-only would fail the
 # root probe instead and silently fall back, testing the wrong branch. A plain
-# FILE where .claims/ needs to be makes the CLAIM fail and nothing else.
+# FILE where consumed/ needs to be makes the CLAIM fail and nothing else.
 RO3="$FIX/rot-ro"; mkdir -p "$RO3"
 printf 'stuck\n<!-- cl:clho:9:9:9:9 -->\n' > "$RO3/T-Big.md"
-: > "$RO3/.claims"
+: > "$RO3/consumed"
 # The claim happens in the tab, so that is where the failure surfaces.
 stuck_out=$(run_tab "T-Big" "$RO3" "$RO3/T-Big.md")
 contains "an unclaimable handoff reports why"          "$stuck_out" "could not claim"
 contains "…and the session resumes instead of rotating" "$stuck_out" "resuming it instead"
 check "…with the handoff left where it is, not lost"   "1" "$([ -f "$RO3/T-Big.md" ] && echo 1 || echo 0)"
-check "…and nothing filed as consumed"                 "0" "$(ls "$RO3/consumed" 2>/dev/null | grep -c .)"
+check "…and consumed/ is still the obstructing file"   "1" "$([ -f "$RO3/consumed" ] && echo 1 || echo 0)"
 
 # ===========================================================================
 # cl stop fails CLOSED.
@@ -820,7 +828,11 @@ check "…the handoff is active again, exactly where it was" "1" \
   "$([ -f "$RB/T-Big.md" ] && echo 1 || echo 0)"
 contains "…with its content intact" "$(cat "$RB/T-Big.md" 2>/dev/null)" "good work"
 check "…nothing was filed as consumed"         "0" "$(ls "$RB/consumed" 2>/dev/null | grep -c .)"
-check "…and nothing is stranded in .claims/"   "0" "$(ls "$RB/.claims" 2>/dev/null | grep -c .)"
+# There is no staging directory any more, so the only two places the handoff
+# can be are the active path and consumed/ — and a rollback must leave it in
+# exactly one of them.
+check "…and it sits in exactly one place, not two" "1" \
+  "$(( $([ -f "$RB/T-Big.md" ] && echo 1 || echo 0) + $(ls "$RB/consumed" 2>/dev/null | grep -c .) ))"
 
 echo "a start whose launch is refused keeps its row for a retry"
 # tmux is the shape where this process can see acceptance, so it is the shape
@@ -854,7 +866,7 @@ rtmux new-session -d -s "claude-FreshClaim" -c "$FIX" 'sleep 30'
 printf '{"cwd":"%s"}\n{"customTitle":"FreshClaim"}\n' "$FIX" > "$HOME/.claude/projects/p1/sid-freshclaim.jsonl"
 FC="$FIX/fresh-claim"; mkdir -p "$FC"
 printf 'work\n\n<!-- cl:manual:2026-09-25T00:00:00Z -->\n' > "$FC/FreshClaim.md"
-: > "$FC/.claims"      # claiming cannot succeed
+: > "$FC/consumed"     # claiming cannot succeed
 fc_out=$(env -i HOME="$HOME" PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
   CL_HANDOFF_DIR="$FC" CL_HANDOFF_TIMEOUT=1 bash "$CL" start --fresh "FreshClaim" 2>&1)
 fc_alive=0; rtmux has-session -t "claude-FreshClaim" 2>/dev/null && fc_alive=1
@@ -896,8 +908,115 @@ check "…and it is consumed normally" "1" "$(ls "$LEG/consumed" 2>/dev/null | g
 echo "cl handoff stamps its own session id"
 ST="$FIX/stamp"; mkdir -p "$ST"
 printf 'by hand\n' | env -i HOME="$HOME" PATH="$BASEPATH" CL_HANDOFF_DIR="$ST" \
-  CL_SESSION_NAME="T-Big" bash "$CL" handoff >/dev/null 2>&1
-contains "the marker carries a session id after '@'" "$(tail -1 "$ST/T-Big.md" 2>/dev/null)" "@sid-big"
+  CL_SESSION_NAME="T-Big" CL_SESSION_ID="sid-big" bash "$CL" handoff >/dev/null 2>&1
+contains "the marker carries the launched session id after '@'" "$(tail -1 "$ST/T-Big.md" 2>/dev/null)" "@sid-big"
+# Without an id it must stamp NONE rather than guess one by name: after a
+# rotation the newest row for a name is the replacement, so a guess would stamp
+# the successor's id onto the predecessor's handoff and make it look current.
+printf 'by hand\n' | env -i HOME="$HOME" PATH="$BASEPATH" CL_HANDOFF_DIR="$ST" \
+  CL_SESSION_NAME="T-Small" bash "$CL" handoff >/dev/null 2>&1
+not_contains "with no launched id, no id is invented" "$(tail -1 "$ST/T-Small.md" 2>/dev/null)" "@"
+
+
+# ===========================================================================
+# The path handed to the replacement must still be there when it reads it.
+# ===========================================================================
+echo "the replacement is told a path that still exists after the rotation"
+# THE assertion the previous round was missing. Every test checked the STORE —
+# active file gone, consumed/ gained one — and all of them passed while the
+# prompt named a `.claims/` path that commit had already renamed away. Every
+# rotation pointed the new session at a file that did not exist.
+STB="$FIX/stable-path"; mkdir -p "$STB"
+printf 'handoff body\n\n<!-- cl:clho:2:2:2:2 -->\n' > "$STB/T-Big.md"
+: > "$FIX/argv-stable"
+run_tab "T-Big" "$STB" "$STB/T-Big.md" "$FIX/argv-stable" >/dev/null 2>&1
+told=$(grep -o '/[^"]*\.md' "$FIX/argv-stable" 2>/dev/null | head -1)
+check "the agent was given a handoff path at all" "1" "$([ -n "$told" ] && echo 1 || echo 0)"
+check "…and that exact path is readable now"      "1" "$([ -n "$told" ] && [ -r "$told" ] && echo 1 || echo 0)"
+contains "…with the handoff's real content in it" "$(cat "$told" 2>/dev/null)" "handoff body"
+check "…and it is its permanent home, not a staging dir" "1" \
+  "$(printf '%s' "$told" | grep -c '/consumed/')"
+
+echo "archive destinations are unique by construction, not by checking"
+# A check-then-move ("pick a name that does not exist, then mv") is not
+# collision-safe: two writers in the same second can both see the same absent
+# name and the second overwrites the first. Asserted against the generator
+# directly — a rotation test cannot reach it, because only one process can ever
+# hold the single active handoff.
+gen=$(env -i HOME="$HOME" PATH="$BASEPATH" bash -c '
+  eval "$(sed -n "/^_archive_dest/,/^}/p;/^name_component/,/^}/p" "$1")"
+  i=0; while [ $i -lt 40 ]; do _archive_dest /r consumed "T-Big"; echo; i=$((i+1)); done' _ "$CL")
+check "40 destinations drawn in the same second are all distinct" "40" \
+  "$(printf '%s\n' "$gen" | sed '/^$/d' | sort -u | grep -c .)"
+not_contains "…and none is a bare timestamp that two writers could share" \
+  "$(printf '%s\n' "$gen" | head -1)" "$(date +%Y%m%d-%H%M%S).md"
+
+echo "rollback never overwrites a newer handoff"
+# While a claim is out, the old session can publish a NEWER handoff at the now
+# free active path. Moving the claim back on top of it would destroy it.
+NW="$FIX/newer-wins"; mkdir -p "$NW/consumed"
+printf 'OLDER\n\n<!-- cl:clho:6:6:6:6 -->\n' > "$NW/claimed.md"
+printf 'NEWER\n\n<!-- cl:clho:7:7:7:7 -->\n' > "$NW/T-Big.md"
+rb2=$(env -i HOME="$HOME" PATH="$NOTMUX_PATH" CL_HANDOFF_DIR="$NW" bash -c '
+  eval "$(sed -n "/^rollback_claim/,/^}/p;/^handoff_path/,/^}/p;/^name_component/,/^}/p" "$1")"
+  CL_HANDOFF_DIR="$2" rollback_claim "$2" "T-Big" "$2/claimed.md"' _ "$CL" "$NW" 2>&1)
+contains "it declines, saying a newer one exists" "$rb2" "newer one has been written"
+contains "…and the newer handoff is untouched"   "$(cat "$NW/T-Big.md" 2>/dev/null)" "NEWER"
+check "…while the older claim stays filed"       "1" "$([ -f "$NW/claimed.md" ] && echo 1 || echo 0)"
+
+echo "a handoff is not spent when the agent cannot be run"
+# Preflight: a cwd that has gone, or no runnable agent, used to consume the
+# handoff on a launch that could never happen.
+NA="$FIX/no-agent"; mkdir -p "$NA"
+printf 'body\n\n<!-- cl:clho:8:8:8:8 -->\n' > "$NA/T-Big.md"
+# A PATH with jq but NO agent on it: claude_cmd has no override, so absence is
+# how the refusal is reached.
+NOAGENT="$FIX/noagent-bin"; mkdir -p "$NOAGENT"; ln -sf "$(command -v jq)" "$NOAGENT/jq"
+na_out=$(env -i HOME="$HOME" PATH="$NOAGENT:/usr/bin:/bin" CL_HANDOFF_DIR="$NA" \
+  CL_HANDOFF_FALLBACK_BASE="$FIX/na-fb" \
+  bash "$CL" "T-Big" --rotate-from "$NA/T-Big.md" 2>&1)
+contains "it says the agent cannot be run" "$na_out" "cannot run the agent"
+check "the handoff is still active after a refused launch" "1" \
+  "$([ -f "$NA/T-Big.md" ] && echo 1 || echo 0)"
+check "…and nothing was filed as consumed" "0" "$(ls "$NA/consumed" 2>/dev/null | grep -c .)"
+
+# ===========================================================================
+# resume_only: the decision lives on the row, not in whichever file survived.
+# ===========================================================================
+echo "a stop whose handoff failed records resume-only, and start honours it"
+# `cl stop` prints "cl start will RESUME it, not rotate it" — but a prior
+# complete handoff left in place would make the next start rotate from notes
+# that predate everything done since. The printed promise has to be durable.
+rtmux new-session -d -s RoOnly -c "$FIX" 'sleep 30'
+printf '{"cwd":"%s"}\n{"customTitle":"RoOnly"}\n' "$FIX" > "$HOME/.claude/projects/p1/sid-roonly.jsonl"
+RO="$FIX/resume-only"; mkdir -p "$RO"
+printf 'OLD notes from an earlier cycle\n\n<!-- cl:clho:1:1:1:1 -->\n' > "$RO/RoOnly.md"
+env -i HOME="$HOME" PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
+  CL_HANDOFF_DIR="$RO" CL_HANDOFF_TIMEOUT=1 CL_HANDOFF_ATTEMPTS=1 \
+  bash "$CL" stop --keep-tabs >/dev/null 2>&1
+check "the saved row is marked resume-only" "1" \
+  "$(jq -r '.[]|select(.name=="RoOnly")|.resume_only' "$STATEDIR/state.json" 2>/dev/null | grep -c true)"
+ro_out=$(env -i HOME="$HOME" PATH="$NOTMUX_PATH" CL_HANDOFF_DIR="$RO" \
+  CL_HANDOFF_FALLBACK_BASE="$FIX/ro-fb2" bash "$CL" start 2>&1)
+not_contains "…so the next start does not rotate" "$ro_out" "--rotate-from"
+contains     "…it resumes, as promised"           "$ro_out" 'cl "RoOnly"'
+check "…and the stale handoff is filed out of the way" "0" \
+  "$([ -e "$RO/RoOnly.md" ] && echo 1 || echo 0)"
+rtmux kill-session -t RoOnly >/dev/null 2>&1 || true
+rm -f "$HOME/.claude/projects/p1/sid-roonly.jsonl"
+
+echo "--no-handoff is honoured even if clearing the handoff fails"
+rtmux new-session -d -s SkipHard -c "$FIX" 'sleep 30'
+printf '{"cwd":"%s"}\n{"customTitle":"SkipHard"}\n' "$FIX" > "$HOME/.claude/projects/p1/sid-skiphard.jsonl"
+SH="$FIX/skip-hard"; mkdir -p "$SH"
+printf 'pending\n\n<!-- cl:clho:2:2:2:2 -->\n' > "$SH/SkipHard.md"
+: > "$SH/consumed"     # the clear cannot succeed
+env -i HOME="$HOME" PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
+  CL_HANDOFF_DIR="$SH" bash "$CL" stop --keep-tabs --no-handoff >/dev/null 2>&1
+check "the row still records resume-only" "1" \
+  "$(jq -r '.[]|select(.name=="SkipHard")|.resume_only' "$STATEDIR/state.json" 2>/dev/null | grep -c true)"
+rtmux kill-session -t SkipHard >/dev/null 2>&1 || true
+rm -f "$HOME/.claude/projects/p1/sid-skiphard.jsonl"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

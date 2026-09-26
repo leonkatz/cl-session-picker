@@ -52,45 +52,83 @@ A prior handoff is never swept merely to make room: nothing invalidates it
 until a newer one actually replaces it, and the agent's atomic rename does that
 only when the new handoff is finished.
 
-### Spending a handoff: claim, then commit or roll back
+### Spending a handoff: one move, to a permanent path
 
-A handoff is only spent once a replacement is actually running. Moving it to
-`consumed/` first and launching afterwards means a launch that fails leaves the
-session with no handoff *and* — once the restart list is cleared — no row
-either, which is a hole in the floor this design promises.
+Rotating renames the active handoff **straight to its permanent home** under
+`<store>/consumed/`, and hands *that* path to the replacement. The pathname
+given to another process is never renamed again.
 
-So it moves in two steps:
+An earlier design staged it in a `.claims/` directory and moved it to
+`consumed/` once the launch was accepted. That was wrong in a way the tests
+could not see: the replacement's first message had already been built from the
+staging path, so the second move renamed the file out from under a prompt that
+was already on its way to the agent. **Every rotation told the new session to
+read a path that no longer existed.** The tests all checked the *store* — the
+active file gone, `consumed/` one file richer — and passed throughout. What
+none of them checked was whether the path in the agent's own argv still
+resolved.
 
-1. **Claim** — the file moves out of the active path into `<store>/.claims/`.
-   Nothing else can rotate from it, and it is still restorable.
-2. **Launch.**
-3. **Commit** on acceptance — the claim moves to `<store>/consumed/`.
-   **Roll back** on refusal — it moves back to the active path, and the session
-   resumes as though nothing had been attempted.
+Destination names are unique **by construction** (timestamp, pid, two random
+draws). A check-then-move — "pick a name nothing occupies, then rename onto it"
+— is not collision-safe: two writers in the same second can both see the same
+free name.
 
-The claim is a `rename`, so it is atomic: two starts racing for one handoff
-produce exactly one rotation and one ordinary resume, with nothing stranded.
+The move is a `rename`, so claiming is atomic: two starts racing for one
+handoff produce exactly one rotation and one ordinary resume.
 
-**Where "accepted" is decided depends on the shape.** Under tmux or cmux the
-launching process sees the backend accept or refuse, so it commits. Without
-tmux the agent is started by the *tab*, in another process — and "the terminal
-accepted the text" is not "an agent started". There the parent leaves the
-handoff active and passes its path to the tab, which claims it only after
-`acquire_launch` grants it ownership of the name. A tab that never runs spends
-nothing.
+**Rolling back.** If the launch is refused, the handoff goes back to the active
+path — but **only if nothing newer is there**. While a rotation is in flight the
+old session (or `cl handoff`) can publish a newer handoff at the freed path, and
+moving the older one back on top of it would destroy the more recent answer. In
+that case the older one stays filed and says so.
 
-A session whose launch was refused **keeps its row in the restart list**, so
-`cl start` simply retries it, and the command exits non-zero.
+**What "accepted" can honestly mean.** On an `exec` path the launcher replaces
+itself with the agent, so it can never observe the agent running. What it can
+establish is: launch ownership granted, the working directory reachable, and the
+agent binary runnable — all three preflighted, so a missing agent or a vanished
+directory rolls the handoff back instead of spending it. An `exec` that fails
+after that still spends it; closing that would need the replacement to
+acknowledge, which nothing here does. The docs say what is checked rather than
+claiming more.
+
+Where the launch *is* synchronous — a detached tmux session, a cmux workspace —
+the launching process sees the backend answer, and a refusal rolls back and
+**keeps the session's row in the restart list**, so `cl start` simply retries it
+and the command exits non-zero. Without tmux the agent is started by the *tab*,
+in another process: "the terminal accepted the text" is not "an agent started",
+so there the parent leaves the handoff untouched and the tab claims it after
+`acquire_launch` grants ownership. A tab that never runs spends nothing.
+
+### Which way a session comes back is recorded, not inferred
+
+`cl stop` writes `resume_only` on the saved row when it could not get a handoff,
+or when `--no-handoff` was given. `cl start` obeys the row.
+
+Inferring it from "is there a handoff file?" was not enough. A stop whose
+request failed can leave an *older* complete handoff in place — so the next
+start would rotate from notes predating everything the session did since, while
+`cl stop` had already printed that it would resume. And `--no-handoff`'s attempt
+to clear a pending handoff can itself fail, silently reversing an explicit
+choice. With the decision on the row, a clear that fails cannot change what
+happens next.
 
 ### Whose handoff is it?
 
 `cl handoff` stamps the writing session's id into its marker
-(`<!-- cl:manual:<ts>@<sid> -->`). A rotation refuses a handoff stamped with a
+(`<!-- cl:manual:<ts>@<sid> -->`), taken from `CL_SESSION_ID`, which every
+launch that knows the id sets. A rotation refuses a handoff stamped with a
 *different* id: it belongs to a previous occupant of that name. Without this, a
 `cl handoff` that began writing before a rotation and finished after it would
 drop the predecessor's notes into the freshly-emptied path, and the next start
-would seed a replacement from them. Markers with no id predate the stamp and
-are accepted for any occupant.
+would seed a replacement from them.
+
+The id is **passed in, never looked up by name**. A lookup would be no evidence
+at all: the display name is stable across rotations, so after one the newest
+session under that name is the *replacement* — and a predecessor still finishing
+its handoff would stamp its successor's id onto its own file, making a stale
+handoff look current. A session with no id yet (a freshly rotated one) stamps
+none. Unstamped markers are accepted for any occupant: honest and permissive
+beats confidently wrong.
 
 ### 1. Handoff on `cl stop`
 
@@ -242,7 +280,6 @@ completion signal `cl` has, so anything after it can be interrupted by the kill.
 | `<store>/<Name>.md` | the one active, unconsumed handoff for that session |
 | `<store>/consumed/` | handoffs a replacement actually started from |
 | `<store>/incomplete/` | files that were not usable — truncated, or written by a different occupant of the name |
-| `<store>/.claims/` | in-flight claims; empty except during a rotation |
 
 Nothing is ever deleted. An incomplete handoff is still real work and is the
 evidence of what went wrong.
