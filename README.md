@@ -271,7 +271,7 @@ reboot, or to pick up a new Claude version (a running session keeps the version
 it launched with; only a fresh launch upgrades).
 
 - **`cl stop`** writes the live sessions to `~/.config/claude-session/state.json`
-  (one record per session: name, session id, cwd), then kills them. Before
+  (one record per session: name, session id, cwd, agent), then kills them. Before
   killing a session that looks **mid-task**, it asks `Kill it anyway? [y/N]`;
   answer no and that session is left running while the rest are killed. Re-run
   `cl stop` once it's idle to catch it. Needs `jq`.
@@ -284,8 +284,56 @@ it launched with; only a fresh launch upgrades).
     to leave all tabs open.
 - **`cl start`** reads the state file and, for each session, reattaches if it's
   already live, else creates the tmux session and resumes the pinned
-  conversation by id. Then attach with `tmux attach` (or `tmux -CC attach` in
-  iTerm for native tabs).
+  conversation by id — as the agent it was saved under. Then attach with
+  `tmux attach` (or `tmux -CC attach` in iTerm for native tabs).
+
+### Codex sessions: what stop/start covers, and what it doesn't
+
+Both cover **Codex sessions that `cl` launched**, and deliberately nothing else.
+
+For Claude, an argv match (`--resume <id>`) identifies the process well enough
+to signal it. For Codex it does not: threads also run through a shared
+app-server daemon, the Desktop app and `--remote` clients — none of which carry
+`resume <id>` in their argv — and the npm launcher is a node wrapper plus a
+native child that *both* match. Signalling on that basis can hit an unrelated
+process.
+
+So `cl stop` uses only the launch registry: a pid `cl` itself recorded, with a
+process start token, under that exact agent, name **and thread id** — names are
+not unique over time, and a newer thread with the same name wins discovery, so
+a name-only record could have stopped one session while saving another.
+
+Before signalling, it re-checks that the pid is still running that agent: a
+start token is second-resolution and a launcher can `exec` something else
+without changing pid or start time. Afterwards it checks that no child of the
+process survived — the npm launcher is a wrapper plus a native child, and
+killing the wrapper alone would leave a client on the transcript. If one
+survives, the stop is reported incomplete and ownership is kept so a retry can
+finish it.
+
+A tmux-hosted Codex session is only killed if it carries `cl`'s own ownership
+stamp (`@cl_agent` / `@cl_sid`, set when `cl` creates the session). A matching
+tmux *name* is not proof: the name is derived from the display name and the
+derivation collides.
+
+A Codex session it has no record for is reported and left running, with its own
+tab to close — but only when something suggests it is actually being served.
+Stored threads with no process produce no warning at all:
+
+```
+⚠ leaving Review — cl has no launch record for this Codex session, so it has
+  no safe way to identify the process. Close it in its own tab.
+```
+
+Such a session is also **not** written to the state file, because `cl start`
+would later resume a thread that is still open somewhere `cl` cannot see — two
+clients on one transcript.
+
+`cl start` is the reverse case and uses the looser test on purpose: any sign of
+life means skip. A false positive costs a tab you reopen by hand; a false
+negative starts a second client on a live transcript. Rows skipped that way stay
+in `state.json` rather than being consumed, so the next `cl start` picks them up
+once they really are gone — you do not have to know to run `cl restore`.
 
 ### State history (recovery)
 

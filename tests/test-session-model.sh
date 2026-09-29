@@ -394,9 +394,18 @@ SEAM="$FIX/seam.sh"
   extract_fn "$CL" launch_named
   extract_fn "$CL" agent_cmd_word
   extract_fn "$CL" _agent_executable
+  # With the lifecycle branch merged, the create-then-commit ordering lives in the
+  # helper and commit_pending_model is top-level taking (agent, name) rather than a
+  # closure. Without these the seam calls functions that are not there and every
+  # assertion fails for that reason instead of the one under test.
+  extract_fn "$CL" tmux_start_and_attach
+  extract_fn "$CL" tmux_claim
+  extract_fn "$CL" tmux_owned
+  extract_fn "$CL" commit_pending_model
   # Everything launch_named leans on, stubbed so the assertion is about ORDERING.
   cat <<'STUBS'
 model_flag() { [ -n "${2:-}" ] && printf ' --model %s' "$2"; return 0; }
+tmux_owned() { return 1; }   # nothing is pre-owned in the seam
 model_for()  { printf ''; }
 set_model()  { printf '%s\n' "$3" > "$SEAM_MODEL_WRITTEN"; return 0; }
 claude_cmd() { printf 'claude'; }
@@ -418,8 +427,15 @@ else fail=$((fail+1)); printf '  FAIL %s\n' "the extracted seam parses"; fi
 # revert matrix that counts FAIL lines reads that as "nothing broke". It is the
 # create-detached step that makes the ordering testable, so its absence is the
 # most important thing this file can report.
-if grep -q 'new-session -d' "$SEAM"; then pass=$((pass+1)); printf '  ok   %s\n' "launch_named creates detached before committing"
-else fail=$((fail+1)); printf '  FAIL %s\n       the interactive path does not create detached, so a failed create cannot be caught before the model is stored\n' "launch_named creates detached before committing"; fi
+if grep -q 'new-session -d' "$SEAM"; then pass=$((pass+1)); printf '  ok   %s\n' "the interactive path creates detached before committing"
+else fail=$((fail+1)); printf '  FAIL %s\n       it does not create detached, so a failed create cannot be caught before the model is stored\n' "the interactive path creates detached before committing"; fi
+# And never with -A: it SUCCEEDS by attaching an existing session, so the ownership
+# stamp and the model commit both run for a session this invocation did not create.
+# Comments stripped first — the helper's own comment explains why -A is wrong, and
+# a bare grep matched that explanation rather than any code.
+if grep -v '^[[:space:]]*#' "$SEAM" | grep -q 'new-session -d -A'; then
+  fail=$((fail+1)); printf '  FAIL %s\n       -A makes creation and attachment indistinguishable\n' "…and never with -A"
+else pass=$((pass+1)); printf '  ok   %s\n' "…and never with -A"; fi
 
 seam_run() { # <tmux-new-session-exit> -> prints rc; records any model write
   local nsrc="$1" d="$FIX/seamdir"
