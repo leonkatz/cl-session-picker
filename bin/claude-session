@@ -1062,6 +1062,24 @@ launch_new() { # cwd [agent]
 #           session / cmux tab only; the thread is unnamed (and invisible to
 #           `cl --list`) until the user runs /rename inside codex. Said so
 #           on screen rather than pretended.
+# agent_cmd_word <agent>: the first word of the command that launches it —
+# claude_cmd/codex_cmd can be wrappers with arguments, and only the first word is
+# something to resolve.
+agent_cmd_word() {
+  local c
+  case "$1" in codex) c=$(codex_cmd) ;; *) c=$(claude_cmd) ;; esac
+  printf '%s' "${c%% *}"
+}
+
+# _agent_executable <agent>: is the configured agent launchable at all? The exec
+# paths commit a model preference immediately before replacing themselves with
+# the agent, so this is the last thing they can check on its behalf.
+_agent_executable() {
+  local w; w=$(agent_cmd_word "$1")
+  [ -n "$w" ] || return 1
+  command -v "$w" >/dev/null 2>&1
+}
+
 launch_named() { # name cwd [agent]
   local name="$1" cwd="$2" agent="${3:-claude}" t qname cmd mf
   [ -d "$cwd" ] || cwd="$HOME"
@@ -1079,6 +1097,16 @@ launch_named() { # name cwd [agent]
       ;;
     *) cmd="$(claude_cmd) --name $qname --dangerously-skip-permissions$mf" ;;
   esac
+  # The exec paths below can never observe the agent running — they become it.
+  # What they CAN establish is that every launcher-side refusal has passed and the
+  # agent is actually executable, so that is what they check before committing,
+  # and it is what the contract claims. An agent that fails after exec still
+  # leaves a stored preference; closing that would need the agent to report back.
+  if ! _agent_executable "$agent"; then
+    printf 'claude-session: cannot run %s — nothing was started%s\n' "$(agent_cmd_word "$agent")" \
+      "$( [ -n "${CL_PENDING_MODEL:-}" ] && printf ', and --model was not stored' )" >&2
+    exit 1
+  fi
   if in_cmux; then
     cmux rename-tab "$name" >/dev/null 2>&1
     cd "$cwd" || exit 1

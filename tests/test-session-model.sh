@@ -371,5 +371,124 @@ CLPATH="$FIX/tmuxbin2:$BASEPATH" cl new --model create-failed "Doomed" "$FIX/wor
 check "a failed create stores nothing" "null" "$(jq -r '.claude.Doomed // "null"' "$MODELS")"
 check "…having tried" "1" "$(grep -c 'new-session' "$FIX/tmux2.calls" 2>/dev/null)"
 
+
+# ===========================================================================
+# The INTERACTIVE path (launch_named), which the fixtures above cannot reach.
+# ===========================================================================
+# `cl new` without a TTY takes do_new's DETACHED branch. That branch already had
+# the right ordering, so testing it proved nothing about launch_named — where
+# `exec tmux new-session -s` replaced this process, and a failed creation was
+# therefore discovered only after the model had been stored for a session that
+# was never made.
+#
+# Driven through a unit seam rather than a PTY: a failed create exits BEFORE the
+# exec, so the function returns and can be asserted on.
+extract_fn() { # file name
+  awk -v n="$2" '
+    !inf && $0 ~ "^"n"\\(\\)" { print; if ($0 ~ /}[[:space:]]*$/) next; inf=1; next }
+    inf { print; if ($0 ~ /^}$/) inf=0 }
+  ' "$1"
+}
+SEAM="$FIX/seam.sh"
+{
+  extract_fn "$CL" launch_named
+  extract_fn "$CL" agent_cmd_word
+  extract_fn "$CL" _agent_executable
+  # With the lifecycle branch merged, the create-then-commit ordering lives in the
+  # helper and commit_pending_model is top-level taking (agent, name) rather than a
+  # closure. Without these the seam calls functions that are not there and every
+  # assertion fails for that reason instead of the one under test.
+  extract_fn "$CL" tmux_start_and_attach
+  extract_fn "$CL" tmux_claim
+  extract_fn "$CL" tmux_owned
+  extract_fn "$CL" commit_pending_model
+  # Everything launch_named leans on, stubbed so the assertion is about ORDERING.
+  cat <<'STUBS'
+model_flag() { [ -n "${2:-}" ] && printf ' --model %s' "$2"; return 0; }
+tmux_owned() { return 1; }   # nothing is pre-owned in the seam
+model_for()  { printf ''; }
+set_model()  { printf '%s\n' "$3" > "$SEAM_MODEL_WRITTEN"; return 0; }
+claude_cmd() { printf 'claude'; }
+codex_cmd()  { printf 'codex'; }
+codex_args() { printf ''; }
+tmux_name()  { printf '%s' "$1"; }
+in_cmux()    { return 1; }
+in_iterm()   { return 1; }
+use_tmux()   { return 0; }
+tmux_setup() { :; }
+tag_iterm_session() { :; }
+acquire_launch() { printf ''; return 0; }
+drop_cmux_env()  { :; }
+STUBS
+} > "$SEAM"
+if bash -n "$SEAM" 2>/dev/null; then pass=$((pass+1)); printf '  ok   %s\n' "the extracted seam parses"
+else fail=$((fail+1)); printf '  FAIL %s\n' "the extracted seam parses"; fi
+# Asserted, not aborted: an `exit 2` here produces no FAIL lines at all, and a
+# revert matrix that counts FAIL lines reads that as "nothing broke". It is the
+# create-detached step that makes the ordering testable, so its absence is the
+# most important thing this file can report.
+if grep -q 'new-session -d' "$SEAM"; then pass=$((pass+1)); printf '  ok   %s\n' "the interactive path creates detached before committing"
+else fail=$((fail+1)); printf '  FAIL %s\n       it does not create detached, so a failed create cannot be caught before the model is stored\n' "the interactive path creates detached before committing"; fi
+# And never with -A: it SUCCEEDS by attaching an existing session, so the ownership
+# stamp and the model commit both run for a session this invocation did not create.
+# Comments stripped first — the helper's own comment explains why -A is wrong, and
+# a bare grep matched that explanation rather than any code.
+if grep -v '^[[:space:]]*#' "$SEAM" | grep -q 'new-session -d -A'; then
+  fail=$((fail+1)); printf '  FAIL %s\n       -A makes creation and attachment indistinguishable\n' "…and never with -A"
+else pass=$((pass+1)); printf '  ok   %s\n' "…and never with -A"; fi
+
+seam_run() { # <tmux-new-session-exit> -> prints rc; records any model write
+  local nsrc="$1" d="$FIX/seamdir"
+  rm -rf "$d"; mkdir -p "$d/bin" "$d/work"
+  # A tmux whose has-session says "absent" and whose new-session exits as asked.
+  cat > "$d/bin/tmux" <<TMUX
+#!/bin/sh
+case "\$1" in
+  has-session) exit 1 ;;
+  new-session) exit $nsrc ;;
+esac
+exit 0
+TMUX
+  chmod +x "$d/bin/tmux"
+  printf '#!/bin/sh\nexit 0\n' > "$d/bin/claude"; chmod +x "$d/bin/claude"
+  rm -f "$d/model-written"
+  env -i HOME="$HOME" PATH="$d/bin:/usr/bin:/bin" \
+      SEAM_MODEL_WRITTEN="$d/model-written" CL_PENDING_MODEL="seam-model" \
+      bash -c '. "$1"; launch_named "SeamName" "$2" claude; echo "rc=$?"' _ "$SEAM" "$d/work" 2>&1
+  printf 'written=%s\n' "$([ -f "$d/model-written" ] && cat "$d/model-written" || echo NONE)"
+}
+
+echo "a failed interactive tmux create stores no model"
+out=$(seam_run 1)
+case "$out" in *'written=NONE'*) pass=$((pass+1)); printf '  ok   %s\n' "a refused create stores nothing" ;;
+  *) fail=$((fail+1)); printf '  FAIL %s\n       %s\n' "a refused create stores nothing" "$out" ;; esac
+case "$out" in *'could not create'*) pass=$((pass+1)); printf '  ok   %s\n' "…and says so" ;;
+  *) fail=$((fail+1)); printf '  FAIL %s\n       %s\n' "…and says so" "$out" ;; esac
+case "$out" in *'--model was not stored'*) pass=$((pass+1)); printf '  ok   %s\n' "…naming the consequence for --model" ;;
+  *) fail=$((fail+1)); printf '  FAIL %s\n       %s\n' "…naming the consequence for --model" "$out" ;; esac
+case "$out" in *'rc=0'*) fail=$((fail+1)); printf '  FAIL %s\n' "…and exits non-zero" ;;
+  *) pass=$((pass+1)); printf '  ok   %s\n' "…and exits non-zero" ;; esac
+
+echo "…while a successful create does store it"
+# The control: ordering must not become "never store".
+out=$(seam_run 0)
+case "$out" in *'written=seam-model'*) pass=$((pass+1)); printf '  ok   %s\n' "an accepted create stores the model" ;;
+  *) fail=$((fail+1)); printf '  FAIL %s\n       %s\n' "an accepted create stores the model" "$out" ;; esac
+
+echo "an agent that cannot be run stores nothing either"
+# The exec paths commit immediately before replacing themselves with the agent,
+# so the last thing they can check on its behalf is that it exists.
+d="$FIX/seamdir-noagent"; rm -rf "$d"; mkdir -p "$d/bin" "$d/work"
+printf '#!/bin/sh\ncase "$1" in has-session) exit 1 ;; esac\nexit 0\n' > "$d/bin/tmux"; chmod +x "$d/bin/tmux"
+rm -f "$d/model-written"
+na=$(env -i HOME="$HOME" PATH="$d/bin:/usr/bin:/bin" \
+     SEAM_MODEL_WRITTEN="$d/model-written" CL_PENDING_MODEL="seam-model" \
+     bash -c '. "$1"; launch_named "SeamName" "$2" claude; echo "rc=$?"' _ "$SEAM" "$d/work" 2>&1
+     printf 'written=%s\n' "$([ -f "$d/model-written" ] && cat "$d/model-written" || echo NONE)")
+case "$na" in *'cannot run claude'*) pass=$((pass+1)); printf '  ok   %s\n' "a missing agent is refused before anything is stored" ;;
+  *) fail=$((fail+1)); printf '  FAIL %s\n       %s\n' "a missing agent is refused before anything is stored" "$na" ;; esac
+case "$na" in *'written=NONE'*) pass=$((pass+1)); printf '  ok   %s\n' "…and no model is written" ;;
+  *) fail=$((fail+1)); printf '  FAIL %s\n       %s\n' "…and no model is written" "$na" ;; esac
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

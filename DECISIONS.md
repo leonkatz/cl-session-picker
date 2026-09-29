@@ -58,7 +58,6 @@ path is covered by the registry; its tmux path still trusts the name.
 continue` filters in `save_state` and `do_stop`, dropping the `agent` column
 from `do_start`'s two jq reads and the agent pair from `open_iterm_tabs`.
 
-## 2026-09-15 — a remembered model is keyed by name, in its own file
 ## 2026-09-15 — a remembered model is keyed by agent AND name, in its own file
 
 **Chose:** `cl model [--codex|--claude] <name> <id>` stores the choice in
