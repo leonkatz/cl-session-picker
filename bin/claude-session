@@ -24,8 +24,15 @@
 #   claude-session            # picker (fzf if available, numbered menu otherwise)
 #   claude-session <name>     # launch that named session directly
 #   claude-session --codex <name>   # same, when a name exists for both agents
+#   claude-session model      # list the model remembered per agent + session
+#   claude-session model [--codex|--claude] <name> <model-id>
+#                             #   start that session with this model. The agent
+#                             #   is inferred when the name is unique, and the
+#                             #   command refuses an ambiguous one, like `cl <name>`.
+#   claude-session model <name> -            # forget it (back to the agent default)
 #   claude-session new "Name" [dir|-d]  # create a fully-named session in one step
 #                             #   (no /rename); dir = $PWD, -d uses $CL_DEFAULT_DIR
+#   claude-session new [--model <id>] "Name" [dir|-d]   # …and remember a model
 #   claude-session new --codex "Name" [dir|-d]  # fresh codex; the name labels
 #                             #   the tab only until you /rename inside codex
 #   claude-session --list     # print discovered sessions (--codex/--claude to filter)
@@ -55,6 +62,26 @@ STATE="$HOME/.config/claude-session/state.json"
 # Rotating history of past state files — a safety net against a failed `cl start`
 # (which deletes STATE) or a corrupted write. Newest STATE_HISTORY_KEEP kept.
 STATE_HISTORY_DIR="$HOME/.config/claude-session/history"
+
+# Remembered model per session, as {"<agent>": {"<name>": "<model-id>"}}.
+#
+# Keyed by AGENT AND NAME, because that is the session identity everywhere else
+# in this tool — tmux names, the launch registry, the picker's rows. Keying on
+# the name alone crossed that boundary: with a Claude session and a Codex
+# session both called "API", `cl --claude API` unambiguously selects the Claude
+# one and would still have picked up a model set for the Codex one, launching
+# `claude --model <a-codex-model>`. An agent-qualified launch must not be
+# corrupted by a preference the store could not qualify.
+#
+# A file of its own rather than a field in state.json, for two reasons. The
+# state file is a snapshot of what was live at the last `cl stop` — it is
+# consumed and deleted by `cl start`, and rebuilt from discovery, so a
+# preference stored in it would be erased by the next cycle. And a model can be
+# chosen for a session that does not exist yet (`cl new --model`), which has no
+# state record to attach to. Keyed by name because that is what the user types
+# and what survives a session being stopped, restored, or resumed under a new
+# transcript id.
+MODELS="$HOME/.config/claude-session/models.json"
 STATE_HISTORY_KEEP=10
 
 # Every discover* function emits:  name<TAB>sid<TAB>cwd<TAB>epoch<TAB>agent
@@ -285,13 +312,206 @@ codex_cmd() {
 # design and is documented in DECISIONS.md rather than silently changed.)
 codex_args() { printf '%s' "${CL_CODEX_ARGS:-}"; }
 
+# --- per-session model -------------------------------------------------------
+# A remembered model is spliced into shell command strings (tmux's command
+# argument, cmux --command, and the exec paths), so it is validated on the way
+# IN and quoted on the way out. The charset allows what real model identifiers
+# use — letters, digits, dot, underscore, hyphen, colon, slash, so both a plain
+# id and a fully qualified cloud resource name pass — and excludes everything a
+# shell would act on. Refusing at set time means the stored file can never hold
+# something dangerous, and the quoting at use time is the second line rather
+# than the only one.
+valid_model() {
+  case "$1" in
+    '') return 1 ;;
+    *[!A-Za-z0-9._:/-]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# model_for <name> <agent>: the remembered model, or nothing.
+model_for() {
+  [ -r "$MODELS" ] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  local m
+  m=$(jq -r --arg a "${2:-claude}" --arg n "$1" '.[$a][$n] // empty' "$MODELS" 2>/dev/null) || return 0
+  # Re-validate on the way out: the file is user-editable, and a hand-edited
+  # value must not reach a command line just because it is on disk.
+  valid_model "$m" || { [ -n "$m" ] && printf 'claude-session: ignoring unsafe model for "%s" in %s\n' "$1" "$MODELS" >&2; return 0; }
+  printf '%s' "$m"
+}
+
+# model_flag <agent> <model>: the flag pair that selects a model, quoted, with
+# a leading space — or nothing when there is no model to apply.
+model_flag() {
+  local agent="$1" model="$2"
+  [ -n "$model" ] || return 0
+  case "$agent" in
+    codex)
+      # CL_CODEX_ARGS is trusted verbatim shell syntax the user controls. If it
+      # already names a model, that is an explicit choice made later than this
+      # one; adding a second flag would either conflict or silently win.
+      # Codex parses with clap, which accepts -m VALUE, -mVALUE, --model VALUE
+      # and --model=VALUE. Recognising only the space-separated forms let
+      # CL_CODEX_ARGS='--model=x' through, and then BOTH options reached codex —
+      # so the documented "explicit choice wins" rule silently did not hold.
+      case " $(codex_args) " in
+        *' -m '*|*' --model '*|*' --model='*|*' -m'[!' ']*)
+          printf 'claude-session: CL_CODEX_ARGS already sets a model — leaving the remembered one unused\n' >&2
+          return 0 ;;
+      esac
+      printf ' -m %s' "$(printf '%q' "$model")" ;;
+    *) printf ' --model %s' "$(printf '%q' "$model")" ;;
+  esac
+}
+
+# An atomic rename keeps the file from tearing; it does NOT stop two shells
+# from each reading the same object, editing a different key, and the later
+# rename dropping the earlier edit. The whole read-modify-write is serialised.
+#
+# Same ownership rule as the launch registry: the lock names its holder, and is
+# reclaimed only on PROOF the holder is gone (its start token no longer
+# matches), never on age.
+models_lock() {
+  local lock="$MODELS.lock" holder hpid me i=0
+  # Fail closed on our own identity FIRST: a lock created from an empty token
+  # publishes a weak "PID:" holder that the next writer reads as stale.
+  me=$(claim_token)
+  case "$me" in
+    *:) echo "claude-session: cannot read this process's start time — refusing to update $MODELS unowned" >&2
+        return 1 ;;
+  esac
+  while [ "$i" -lt 100 ]; do
+    ln -s "$me" "$lock" 2>/dev/null && return 0
+    holder=$(readlink "$lock" 2>/dev/null) || { i=$((i+1)); sleep 0.05; continue; }
+    hpid=${holder%%:*}
+    # A stale lock is NEVER unlinked automatically — the same rule, and the
+    # same reason, as acquire_launch. Validating the symlink and then removing
+    # its PATHNAME are two operations: between them another waiter can reclaim
+    # and establish a live claim, and this delete would destroy THAT claim,
+    # putting two writers inside the read-modify-write together. The start-token
+    # proof authenticates the object read, not the object later unlinked, and
+    # portable shell has no compare-and-swap to close the gap.
+    #
+    # I implemented the rejected pattern here while the analysis rejecting it
+    # sat forty lines above (caught in review, 2026-09-21). Report it and let a
+    # person clear it; a writer has to die inside a few-millisecond window to
+    # leave one.
+    case "$hpid" in
+      ''|*[!0-9]*)
+        echo "claude-session: $lock is malformed — clear it, then retry:" >&2
+        echo "  rm -f $(printf '%q' "$lock")" >&2
+        return 1 ;;
+    esac
+    if [ "$(start_token "$hpid")" != "${holder#*:}" ]; then
+      echo "claude-session: a previous writer (pid $hpid) died holding the model lock — clear it, then retry:" >&2
+      echo "  rm -f $(printf '%q' "$lock")" >&2
+      return 1
+    fi
+    sleep 0.05
+    i=$((i+1))
+  done
+  echo "claude-session: another process is updating $MODELS — try again" >&2
+  return 1
+}
+# Releasing is safe where reclaiming is not: this unlinks only while the link
+# still names US, so it cannot delete a successor's lock.
+models_unlock() {
+  local lock="$MODELS.lock"
+  [ "$(readlink "$lock" 2>/dev/null)" = "$(claim_token)" ] && rm -f "$lock"
+  return 0
+}
+
+# set_model <agent> <name> <model|->: remember or forget. '-' clears.
+set_model() {
+  local agent="$1" name="$2" model="$3" tmp rc=0
+  command -v jq >/dev/null 2>&1 || { echo "claude-session: model needs jq (brew install jq)" >&2; return 1; }
+  [ -n "$name" ] || { echo "claude-session: model needs a session name" >&2; return 1; }
+  [ "$model" = "-" ] || valid_model "$model" \
+    || { echo "claude-session: refusing model \"$model\" — allowed: letters, digits, . _ - : /" >&2; return 1; }
+  mkdir -p "$(dirname "$MODELS")" || { echo "claude-session: cannot create state dir" >&2; return 1; }
+  models_lock || return 1
+  [ -r "$MODELS" ] || printf '{}\n' > "$MODELS"
+  if ! jq empty "$MODELS" 2>/dev/null; then
+    echo "claude-session: $MODELS is not valid JSON — left unchanged" >&2
+    models_unlock; return 1
+  fi
+  tmp="$MODELS.tmp.$$"
+  if [ "$model" = "-" ]; then
+    if jq --arg a "$agent" --arg n "$name" 'if (.[$a] | type) == "object" then (.[$a] |= del(.[$n])) else . end | with_entries(select((.value | length) > 0))' \
+         "$MODELS" > "$tmp" 2>/dev/null; then
+      mv "$tmp" "$MODELS"; printf 'forgot the model for %s "%s"\n' "$agent" "$name"
+    else rc=1; fi
+  else
+    if jq --arg a "$agent" --arg n "$name" --arg m "$model" '.[$a] //= {} | .[$a][$n] = $m' \
+         "$MODELS" > "$tmp" 2>/dev/null; then
+      mv "$tmp" "$MODELS"; printf '%s "%s" will start with %s\n' "$agent" "$name" "$model"
+    else rc=1; fi
+  fi
+  [ "$rc" -eq 0 ] || { rm -f "$tmp"; echo "claude-session: failed to update $MODELS" >&2; }
+  models_unlock
+  return "$rc"
+}
+
+# model_agent_for <name>: which agent a bare name means, or nothing when that
+# cannot be answered. Mirrors `cl <name>`: infer when the name is unique among
+# discovered sessions, refuse when it is held by both. Guessing here is exactly
+# how a Codex model would end up on a Claude launch.
+model_agent_for() {
+  local matches
+  matches=$(discover | awk -F'\t' -v n="$1" '$1==n {print $5}' | sort -u)
+  case "$(printf '%s' "$matches" | grep -c .)" in
+    1) printf '%s' "$matches" ;;
+    *) return 1 ;;
+  esac
+}
+
+# do_model: no args lists what is remembered; [--claude|--codex] <name>
+# <model|-> sets or clears.
+do_model() {
+  local agent=""
+  while :; do
+    case "${1:-}" in
+      --codex)  agent="codex";  shift ;;
+      --claude) agent="claude"; shift ;;
+      *) break ;;
+    esac
+  done
+
+  if [ "$#" -eq 0 ]; then
+    command -v jq >/dev/null 2>&1 || { echo "claude-session: model needs jq (brew install jq)" >&2; exit 1; }
+    if [ ! -r "$MODELS" ] || [ "$(jq -r '[.[] | length] | add // 0' "$MODELS" 2>/dev/null || echo 0)" = "0" ]; then
+      printf 'no session models remembered.\n  set one with: cl model [--codex] <name> <model-id>\n'
+      return 0
+    fi
+    jq -r 'to_entries | sort_by(.key)[] as $a | $a.value | to_entries | sort_by(.key)[]
+           | "  \($a.key)\t\(.key)\t\(.value)"' "$MODELS" 2>/dev/null \
+      | while IFS=$'\t' read -r a n m; do printf '%-8s %-26s %s\n' "$a" "$n" "$m"; done
+    return 0
+  fi
+
+  local name="$1" model="${2:-}"
+  [ -n "$model" ] || { echo 'usage: cl model [--codex|--claude] <name> <model-id|->' >&2; return 1; }
+  if [ -z "$agent" ]; then
+    agent=$(model_agent_for "$name") || {
+      echo "claude-session: '$name' exists for more than one agent (or none) — say which: cl model --claude \"$name\" …  or  cl model --codex \"$name\" …" >&2
+      return 1
+    }
+  fi
+  set_model "$agent" "$name" "$model"
+}
+
 # resume_cmd <agent> <sid>: the shell command string that resumes a session.
 # Used verbatim as a tmux/cmux pane command; for exec paths the same words
 # are re-split by the caller.
+# A third argument supplies the session NAME, which is what a remembered model
+# is keyed by; without it the command is built exactly as before.
 resume_cmd() {
+  local mf=""
+  [ -n "${3:-}" ] && mf=$(model_flag "$1" "$(model_for "$3" "$1")")
   case "$1" in
-    codex) printf '%s %s resume %s' "$(codex_cmd)" "$(codex_args)" "$(printf '%q' "$2")" ;;
-    *)     printf '%s --resume %s --dangerously-skip-permissions' "$(claude_cmd)" "$(printf '%q' "$2")" ;;
+    codex) printf '%s %s resume %s%s' "$(codex_cmd)" "$(codex_args)" "$(printf '%q' "$2")" "$mf" ;;
+    *)     printf '%s --resume %s --dangerously-skip-permissions%s' "$(claude_cmd)" "$(printf '%q' "$2")" "$mf" ;;
   esac
 }
 
@@ -626,7 +846,7 @@ OSA
 launch_session() { # name sid cwd [agent]
   local name="$1" sid="$2" cwd="$3" agent="${4:-claude}" t pid cmd
   t=$(tmux_name "$name" "$agent"); [ -d "$cwd" ] || cwd="$HOME"
-  cmd=$(resume_cmd "$agent" "$sid")
+  cmd=$(resume_cmd "$agent" "$sid" "$name")
   # `tmux new-session -A` attaches instead of duplicating; nothing does that
   # for us otherwise, so a second launch has to be refused here. cmux keeps the
   # plain check (it owns its own workspace lifecycle); the bare path below uses
@@ -684,26 +904,87 @@ launch_new() { # cwd [agent]
 #           session / cmux tab only; the thread is unnamed (and invisible to
 #           `cl --list`) until the user runs /rename inside codex. Said so
 #           on screen rather than pretended.
+# agent_cmd_word <agent>: the first word of the command that launches it —
+# claude_cmd/codex_cmd can be wrappers with arguments, and only the first word is
+# something to resolve.
+agent_cmd_word() {
+  local c
+  case "$1" in codex) c=$(codex_cmd) ;; *) c=$(claude_cmd) ;; esac
+  printf '%s' "${c%% *}"
+}
+
+# _agent_executable <agent>: is the configured agent launchable at all? The exec
+# paths commit a model preference immediately before replacing themselves with
+# the agent, so this is the last thing they can check on its behalf.
+_agent_executable() {
+  local w; w=$(agent_cmd_word "$1")
+  [ -n "$w" ] || return 1
+  command -v "$w" >/dev/null 2>&1
+}
+
 launch_named() { # name cwd [agent]
-  local name="$1" cwd="$2" agent="${3:-claude}" t qname cmd
+  local name="$1" cwd="$2" agent="${3:-claude}" t qname cmd mf
   [ -d "$cwd" ] || cwd="$HOME"
   qname=$(printf '%q' "$name")
+  # CL_PENDING_MODEL is a model chosen on THIS command line that is not stored
+  # yet. It is used for the launch either way; it is committed only where the
+  # backend has accepted, below.
+  if [ -n "${CL_PENDING_MODEL:-}" ]; then mf=$(model_flag "$agent" "$CL_PENDING_MODEL")
+  else                                    mf=$(model_flag "$agent" "$(model_for "$name" "$agent")"); fi
+  commit_pending_model() {
+    [ -n "${CL_PENDING_MODEL:-}" ] || return 0
+    set_model "$agent" "$name" "$CL_PENDING_MODEL" >/dev/null || return 0
+    return 0
+  }
   case "$agent" in
     codex)
-      cmd="$(codex_cmd) $(codex_args)"
+      cmd="$(codex_cmd) $(codex_args)$mf"
       printf 'note: codex cannot be named at launch — run /rename %s inside codex so cl can find it.\n' "$qname" >&2
       ;;
-    *) cmd="$(claude_cmd) --name $qname --dangerously-skip-permissions" ;;
+    *) cmd="$(claude_cmd) --name $qname --dangerously-skip-permissions$mf" ;;
   esac
+  # The exec paths below can never observe the agent running — they become it.
+  # What they CAN establish is that every launcher-side refusal has passed and the
+  # agent is actually executable, so that is what they check before committing,
+  # and it is what the contract claims. An agent that fails after exec still
+  # leaves a stored preference; closing that would need the agent to report back.
+  if ! _agent_executable "$agent"; then
+    printf 'claude-session: cannot run %s — nothing was started%s\n' "$(agent_cmd_word "$agent")" \
+      "$( [ -n "${CL_PENDING_MODEL:-}" ] && printf ', and --model was not stored' )" >&2
+    exit 1
+  fi
   if in_cmux; then
     cmux rename-tab "$name" >/dev/null 2>&1
-    cd "$cwd" || exit 1; eval "exec $cmd"
+    cd "$cwd" || exit 1
+    commit_pending_model
+    eval "exec $cmd"
   fi
   t=$(tmux_name "$name" "$agent")
   in_iterm && tag_iterm_session "$t"
   if use_tmux; then
     tmux_setup
-    exec tmux new-session -A -s "$t" -c "$cwd" "$cmd"
+    # `new-session -A` folded two different outcomes into one command: it
+    # CREATES, or it silently ATTACHES an existing session. Attaching is not
+    # creating, and a model chosen on this command line must not be recorded
+    # for a session this invocation did not make. Splitting them also makes the
+    # attach visible rather than inferred.
+    if tmux has-session -t "=${t}" 2>/dev/null; then
+      printf 'attaching the existing "%s" — nothing was created%s\n' "$name" \
+        "$( [ -n "${CL_PENDING_MODEL:-}" ] && printf ', and --model was not stored' )" >&2
+      exec tmux attach-session -t "=${t}"
+    fi
+    # CREATE DETACHED, then commit, then attach. `exec tmux new-session -s` is
+    # the interactive form: it replaces this process, so a failure is discovered
+    # after the model has already been stored for a session that was never made.
+    # Creating with -d gives a status to branch on, which is the ordering the
+    # stacked lifecycle branch already uses.
+    if ! tmux new-session -d -s "$t" -c "$cwd" "$cmd"; then
+      printf 'claude-session: tmux could not create "%s" — nothing was started%s\n' "$t" \
+        "$( [ -n "${CL_PENDING_MODEL:-}" ] && printf ', and --model was not stored' )" >&2
+      exit 1
+    fi
+    commit_pending_model
+    exec tmux attach-session -t "=${t}"
   else
     local owner arc
     owner=$(acquire_launch "$name" "$agent"); arc=$?
@@ -713,7 +994,9 @@ launch_named() { # name cwd [agent]
     elif [ "$arc" -ne 0 ]; then
       exit 1
     fi
-    drop_cmux_env; cd "$cwd" || exit 1; eval "exec $cmd"
+    drop_cmux_env; cd "$cwd" || exit 1
+    commit_pending_model
+    eval "exec $cmd"
   fi
 }
 
@@ -726,13 +1009,32 @@ launch_named() { # name cwd [agent]
 # Interactive → create + attach. No TTY (script / a Claude Bash call) → create
 # detached and print how to attach, so the caller isn't left hanging.
 do_new() {
-  local agent="claude"
-  case "${1:-}" in
-    --codex)  agent="codex";  shift ;;
-    --claude) agent="claude"; shift ;;
-  esac
+  local agent="claude" model=""
+  # Flags may lead in any order; --model is remembered for the NAME, so it also
+  # applies to every later resume of the session, not just this launch.
+  while :; do
+    case "${1:-}" in
+      --codex)  agent="codex";  shift ;;
+      --claude) agent="claude"; shift ;;
+      # No `|| true` on a parser state transition: with a trailing `--model`
+      # there is nothing to shift, bash leaves the arguments untouched, and the
+      # loop sees the same flag forever. Check first, fail with usage.
+      --model)
+        [ "$#" -ge 2 ] || { echo 'usage: cl new [--codex] [--model <model-id>] "Session Name" [dir | -d]' >&2; exit 1; }
+        model="$2"; shift 2 ;;
+      --model=*) model="${1#--model=}"; shift ;;
+      *) break ;;
+    esac
+  done
   local name="${1:-}" arg="${2:-}" cwd
-  [ -n "$name" ] || { echo 'usage: cl new [--codex] "Session Name" [dir | -d]' >&2; exit 1; }
+  [ -n "$name" ] || { echo 'usage: cl new [--codex] [--model <model-id>] "Session Name" [dir | -d]' >&2; exit 1; }
+  # The model is validated here but NOT stored yet: everything below can still
+  # refuse to create the session (no such directory, no CL_DEFAULT_DIR, no TTY
+  # and no tmux). Persisting first left a preference behind for a session that
+  # was never created — a half-done transaction presented as one step.
+  if [ -n "$model" ]; then
+    valid_model "$model" || { echo "claude-session: refusing model \"$model\" — allowed: letters, digits, . _ - : /" >&2; exit 1; }
+  fi
   case "$arg" in
     -d|--default)
       cwd="${CL_DEFAULT_DIR:-}"
@@ -743,13 +1045,25 @@ do_new() {
   esac
   [ -d "$cwd" ] || { echo "claude-session: no such directory: $cwd" >&2; exit 1; }
 
-  local t qname cmd
+  local t qname cmd mf
   t=$(tmux_name "$name" "$agent")
   qname=$(printf '%q' "$name")   # safe to embed in the tmux command string
+  # A model given on this command line applies to THIS launch even though it is
+  # not stored yet — storing happens only where a launch is actually attempted.
+  if [ -n "$model" ]; then mf=$(model_flag "$agent" "$model")
+  else                     mf=$(model_flag "$agent" "$(model_for "$name" "$agent")"); fi
+  # remember_model: called at each point where creation is committed, so a run
+  # that refuses to create anything leaves no preference behind.
+  remember_model() { [ -n "$model" ] && set_model "$agent" "$name" "$model" >/dev/null; return 0; }
+  # The interactive paths do not call this: they hand off to launch_named,
+  # which can still refuse (an existing owner, a claim it cannot take) and which
+  # attaches rather than creates when a tmux session is already there. It
+  # persists for itself, after the last refusal and immediately before exec.
+  export CL_PENDING_MODEL="$model"
   case "$agent" in
-    codex) cmd="$(codex_cmd) $(codex_args)"
+    codex) cmd="$(codex_cmd) $(codex_args)$mf"
            echo "note: codex cannot be named at launch — run /rename $qname inside codex so cl can find it." >&2 ;;
-    *)     cmd="$(claude_cmd) --name $qname --dangerously-skip-permissions" ;;
+    *)     cmd="$(claude_cmd) --name $qname --dangerously-skip-permissions$mf" ;;
   esac
 
   if in_cmux; then
@@ -759,7 +1073,7 @@ do_new() {
       # no TTY (script / Claude Bash call): open a fresh cmux workspace so the
       # caller isn't blocked, mirroring the detached-tmux path below.
       cmux new-workspace --name "$name" --cwd "$cwd" --command "$cmd" >/dev/null \
-        && echo "created cmux workspace '$name' in $cwd"
+        && { remember_model; echo "created cmux workspace '$name' in $cwd"; }
     fi
     exit 0
   fi
@@ -781,7 +1095,7 @@ do_new() {
       echo "session '$name' already exists — attach with: cl \"$name\""
     else
       tmux new-session -d -s "$t" -c "$cwd" "$cmd" \
-        && echo "created '$name' in $cwd — attach with: cl \"$name\""
+        && { remember_model; echo "created '$name' in $cwd — attach with: cl \"$name\""; }
     fi
   fi
 }
@@ -1056,7 +1370,7 @@ do_start() {
       else
         [ -d "$cwd" ] || cwd="$HOME"
         cmux new-workspace --name "$name" --cwd "$cwd" --focus false \
-            --command "$(claude_cmd) --resume $(printf '%q' "$sid") --dangerously-skip-permissions" >/dev/null \
+            --command "$(claude_cmd) --resume $(printf '%q' "$sid") --dangerously-skip-permissions$(model_flag claude "$(model_for "$name" claude)")" >/dev/null \
           && { printf '✓ opened %s  (%s)\n' "$name" "$cwd"; i=$((i+1)); }
       fi
     done < <(jq -r '.[] | [.name, .sid, .cwd] | @tsv' "$STATE")
@@ -1088,7 +1402,7 @@ do_start() {
       printf '● %s already live\n' "$name"
       live_names="${live_names}${name}"$'\n'
     else
-      tmux new-session -d -s "$t" -c "$cwd" "claude --resume $(printf '%q' "$sid") --dangerously-skip-permissions" \
+      tmux new-session -d -s "$t" -c "$cwd" "claude --resume $(printf '%q' "$sid") --dangerously-skip-permissions$(model_flag claude "$(model_for "$name" claude)")" \
         && printf '✓ prepared %s  (%s)\n' "$name" "$cwd"
     fi
     i=$((i+1))
@@ -1202,6 +1516,8 @@ esac
 
 case "${1:-}" in
   new)     shift; do_new "$@"; exit 0 ;;
+  # exit $? and not 0: a refused or failed set must be visible to the caller.
+  model)   shift; do_model "$@"; exit $? ;;
   stop)    do_stop "${2:-}"; exit 0 ;;
   start)   do_start; exit 0 ;;
   restore) do_restore "${2:-}"; exit 0 ;;
