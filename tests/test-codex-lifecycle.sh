@@ -406,5 +406,33 @@ check "…and it is not saved either" "" \
   "$(jq -r '.[] | select(.name=="Historical") | .name' "$STATE" 2>/dev/null)"
 
 
+
+echo "a refused tmux creation says so, instead of blaming a missing session"
+# The helper fell through to `attach-session` after a failed create, so tmux
+# reported "can't find session" — the consequence of the previous line, not the
+# problem. Nothing was stamped or committed either way; the diagnostic was the
+# defect.
+FT="$FIX/failtmux"; mkdir -p "$FT/bin"
+cat > "$FT/bin/tmux" <<'TM'
+#!/bin/sh
+case "$1" in
+  has-session) exit 1 ;;
+  new-session) exit 1 ;;
+esac
+exit 0
+TM
+chmod +x "$FT/bin/tmux"
+fn="$FIX/fail-seam.sh"
+awk '!inf && /^tmux_start_and_attach\(\)/ { print; inf=1; next } inf { print; if ($0 ~ /^}$/) inf=0 }' "$CL" > "$fn"
+printf 'tmux_owned() { return 1; }\ntmux_claim() { :; }\ncommit_pending_model() { :; }\n' >> "$fn"
+bash -n "$fn" || { fail=$((fail+1)); printf '  FAIL %s\n' "the helper seam parses"; }
+out=$(env -i PATH="$FT/bin:/usr/bin:/bin" bash -c '. "$1"; tmux_start_and_attach T C "cmd" claude; echo "rc=$?"' _ "$fn" 2>&1)
+case "$out" in *'could not create'*) pass=$((pass+1)); printf '  ok   %s\n' "a refused create is reported plainly" ;;
+  *) fail=$((fail+1)); printf '  FAIL %s\n       got: %s\n' "a refused create is reported plainly" "$out" ;; esac
+case "$out" in *"can't find session"*|*"no server"*) fail=$((fail+1)); printf '  FAIL %s\n' "…without attaching to nothing afterwards" ;;
+  *) pass=$((pass+1)); printf '  ok   %s\n' "…without attaching to nothing afterwards" ;; esac
+case "$out" in *'rc=1'*) pass=$((pass+1)); printf '  ok   %s\n' "…and returns non-zero for the caller" ;;
+  *) fail=$((fail+1)); printf '  FAIL %s\n       got: %s\n' "…and returns non-zero for the caller" "$out" ;; esac
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

@@ -867,10 +867,18 @@ tmux_start_and_attach() { # t cwd cmd agent [sid] [display-name]
       "$t" "$( [ -n "${CL_PENDING_MODEL:-}" ] && printf ' and --model was not stored' )" >&2
     exec tmux attach-session -t "=${t}"
   fi
-  if tmux new-session -d -s "$t" -c "$cwd" "$cmd"; then
-    tmux_claim "$t" "$agent" "$sid"
-    commit_pending_model "$agent" "${6:-}"
+  if ! tmux new-session -d -s "$t" -c "$cwd" "$cmd"; then
+    # Say what happened, and stop. Falling through to `attach-session` after a
+    # failed create made tmux report "can't find session" — which describes the
+    # consequence of the previous line rather than the problem, and looked like a
+    # missing session rather than a refused creation. Nothing is stamped and
+    # nothing is committed on this path either way.
+    printf 'claude-session: tmux could not create "%s" — nothing was started%s\n' "$t" \
+      "$( [ -n "${CL_PENDING_MODEL:-}" ] && printf ', and --model was not stored' )" >&2
+    return 1
   fi
+  tmux_claim "$t" "$agent" "$sid"
+  commit_pending_model "$agent" "${6:-}"
   exec tmux attach-session -t "=${t}"
 }
 
@@ -1015,7 +1023,7 @@ launch_session() { # name sid cwd [agent]
   in_iterm && tag_iterm_session "$t"
   if use_tmux; then
     tmux_setup
-    tmux_start_and_attach "$t" "$cwd" "$cmd" "$agent" "$sid" "$name"
+    tmux_start_and_attach "$t" "$cwd" "$cmd" "$agent" "$sid" "$name" || exit 1
   else
     pid=$(acquire_launch "$name" "$agent" "$sid"); local arc=$?
     if [ "$arc" -eq 1 ]; then
@@ -1040,7 +1048,7 @@ launch_new() { # cwd [agent]
   t="$agent-$(basename "$cwd")"
   if use_tmux; then
     tmux_setup
-    tmux_start_and_attach "$t" "$cwd" "$cmd" "$agent" "-" ""
+    tmux_start_and_attach "$t" "$cwd" "$cmd" "$agent" "-" "" || exit 1
   else
     drop_cmux_env; cd "$cwd" || exit 1; eval "exec $cmd"
   fi
@@ -1081,7 +1089,7 @@ launch_named() { # name cwd [agent]
   in_iterm && tag_iterm_session "$t"
   if use_tmux; then
     tmux_setup
-    tmux_start_and_attach "$t" "$cwd" "$cmd" "$agent" "-" "$name"
+    tmux_start_and_attach "$t" "$cwd" "$cmd" "$agent" "-" "$name" || exit 1
   else
     local owner arc
     owner=$(acquire_launch "$name" "$agent"); arc=$?
