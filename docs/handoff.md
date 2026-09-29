@@ -90,6 +90,22 @@ means it cannot overwrite anyone, and the rename means exactly one claimer wins.
 A loser releases its reservation, so no empty files accumulate. Rollback keeps
 link-then-unlink, which is safe there precisely because its source is private.
 
+### Acceptance applies to the generation that won
+
+Getting the move right is not enough. Checking the *active pathname* — is it
+complete? is it stamped for the session being replaced? — and then moving it is
+still a TOCTOU: a writer can publish a different generation in between, the
+rename correctly takes the new one, and the caller's success was decided about
+the old one. Both guards were bypassable that way: a handoff validated as
+complete could be replaced by a truncated one, and a handoff stamped for one
+session by a handoff stamped for its predecessor.
+
+So the rename establishes identity, and every policy check runs against the
+**stable archived path** it returns. A generation that fails acceptance after
+winning is moved on to `incomplete/` rather than left in `consumed/`, so
+`consumed/` keeps meaning "a replacement actually started from this". The
+pre-move check survives only as a cheap early exit, never as the decision.
+
 Archive names are therefore unique because a creation **succeeded**, not because
 a name looked free. Composing one from timestamp, pid and random draws and
 calling that "unique by construction" is not: those are finite and reused, and

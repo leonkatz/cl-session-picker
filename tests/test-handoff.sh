@@ -12,6 +12,28 @@ HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 CL="$HERE/../bin/claude-session"
 FIX="$(mktemp -d "${TMPDIR:-/tmp}/cl-handoff.XXXXXX")"; trap 'rm -rf "$FIX"' EXIT
 
+# extract_fns <file> <name>... : the named shell functions, verbatim.
+#
+# A `sed -n "/^name/,/^}/p"` range is wrong for a ONE-LINER like
+# `handoff_path() { ...; }`: the range opens on it and runs to the next line that
+# is just `}`, swallowing whole functions in between and producing text that does
+# not parse. (Hit twice now — first with _prompt_flatten.) This tracks the shape
+# of each definition instead.
+extract_fns() {
+  local f="$1"; shift
+  local n
+  for n in "$@"; do
+    awk -v n="$n" '
+      !inf && $0 ~ "^"n"\\(\\)" {
+        print
+        if ($0 ~ /}[[:space:]]*$/) next
+        inf = 1; next
+      }
+      inf { print; if ($0 ~ /^}$/) inf = 0 }
+    ' "$f"
+  done
+}
+
 pass=0; fail=0
 ok()  { pass=$((pass+1)); printf '  ok   %s\n' "$1"; }
 bad() { fail=$((fail+1)); printf '  FAIL %s\n       %s\n' "$1" "$2"; }
@@ -1143,6 +1165,93 @@ lost=$(env -i HOME="$HOME" PATH="$BASEPATH" bash -c '
   ls "$d/consumed" | grep -c . ' _ "$CL" "$LOSE")
 contains "a claim of a vanished source fails" "$lost" "rc=2"
 check "…and leaves consumed/ empty" "1" "$(printf '%s\n' "$lost" | tail -1 | grep -c '^0$')"
+
+
+# ===========================================================================
+# Acceptance must apply to the generation that WON, not the one inspected.
+# ===========================================================================
+# The probes below run under `env -i bash -c`, which inherits no shell functions,
+# so the bundles are written here in the parent and sourced there.
+FNS_CLAIM="$FIX/fns-claim.sh"
+extract_fns "$CL" handoff_path name_component handoff_marker handoff_is_complete \
+  marker_sid _reserve_and_move _link_noclobber _archive_move quarantine_handoff \
+  _reject_claimed claim_handoff > "$FNS_CLAIM"
+FNS_PLAN="$FIX/fns-plan.sh"
+extract_fns "$CL" handoff_path name_component handoff_marker handoff_is_complete \
+  _reserve_and_move _link_noclobber _archive_move quarantine_handoff \
+  _reject_claimed consume_handoff plan_rotation > "$FNS_PLAN"
+bash -n "$FNS_CLAIM" || { echo "FIXTURE FAILED: claim bundle does not parse" >&2; exit 2; }
+bash -n "$FNS_PLAN"  || { echo "FIXTURE FAILED: plan bundle does not parse"  >&2; exit 2; }
+# Validating the active pathname and then moving it is a TOCTOU: a writer can
+# publish a different generation in between, the rename correctly takes the NEW
+# one, and the caller's success was decided about the OLD one. That bypassed both
+# the completeness guard and the foreign-session guard.
+#
+# Driven through a `claim_handoff` whose _archive_move is wrapped so the swap
+# happens exactly between validation and the rename — deterministic, not a sleep.
+swap_probe() { # <store> <replacement-content> <want_sid>  -> rc + stderr
+  env -i HOME="$HOME" PATH="$BASEPATH" FNS_CLAIM="$FNS_CLAIM" bash -c '
+    . "$FNS_CLAIM"
+    CONSUMED_SUBDIR=consumed; INCOMPLETE_SUBDIR=incomplete
+    MANUAL_MARKER_PREFIX="<!-- cl:manual:"
+    root="$2"
+    # Swap the active generation at the last possible moment: after
+    # claim_handoff has validated it, before the rename runs.
+    eval "_orig_archive_move() $(declare -f _archive_move | tail -n +2)"
+    _archive_move() {
+      # The swap lands here: after claim_handoff validated the active path and
+      # before the rename takes whatever is there now.
+      printf "%s" "$SWAP" > "$root/T-Swap.md"
+      _orig_archive_move "$@"
+    }
+    SWAP="$3" claim_handoff "$root" "T-Swap" "$4" >/dev/null 2>&1
+    echo "rc=$?"' _ "$CL" "$1" "$2" "${3:-}" 2>&1
+}
+
+echo "a generation swapped in before the rename is not rotated from (no marker)"
+SW1="$FIX/swap-markerless"; mkdir -p "$SW1"
+printf 'validated and complete\n\n<!-- cl:clho:1:1:1:1 -->\n' > "$SW1/T-Swap.md"
+r1=$(swap_probe "$SW1" 'truncated replacement with no mark')
+contains "the claim is refused" "$r1" "rc=1"
+check "…nothing is filed as consumed" "0" "$(ls "$SW1/consumed" 2>/dev/null | grep -c .)"
+check "…and the arrived generation is quarantined, not lost" "1" "$(ls "$SW1/incomplete" 2>/dev/null | grep -c .)"
+contains "…with its content preserved" "$(cat "$SW1/incomplete"/* 2>/dev/null)" "truncated replacement"
+
+echo "…nor one stamped for a DIFFERENT session"
+SW2="$FIX/swap-foreign"; mkdir -p "$SW2"
+printf 'validated for sid-A\n\n<!-- cl:manual:2026-09-28T00:00:00Z@sid-A -->\n' > "$SW2/T-Swap.md"
+r2=$(swap_probe "$SW2" 'from the previous occupant
+<!-- cl:manual:2026-09-28T00:00:01Z@sid-B -->' 'sid-A')
+contains "a foreign-stamped replacement is refused" "$r2" "rc=1"
+check "…nothing is filed as consumed" "0" "$(ls "$SW2/consumed" 2>/dev/null | grep -c .)"
+check "…and it is quarantined" "1" "$(ls "$SW2/incomplete" 2>/dev/null | grep -c .)"
+
+echo "…and the same swap through ordinary plan_rotation is refused too"
+# cl start goes through plan_rotation, not claim_handoff, and had the identical
+# check-then-consume shape.
+SW3="$FIX/swap-plan"; mkdir -p "$SW3"
+printf 'validated and complete\n\n<!-- cl:clho:2:2:2:2 -->\n' > "$SW3/T-Swap.md"
+r3=$(env -i HOME="$HOME" PATH="$BASEPATH" FNS_PLAN="$FNS_PLAN" bash -c '
+  . "$FNS_PLAN"
+  CONSUMED_SUBDIR=consumed; INCOMPLETE_SUBDIR=incomplete
+  root="$2"
+  eval "_orig_archive_move() $(declare -f _archive_move | tail -n +2)"
+  _archive_move() { printf "markerless swap\n" > "$root/T-Swap.md"; _orig_archive_move "$@"; }
+  plan_rotation "$root" "T-Swap" >/dev/null 2>&1; echo "rc=$?"' _ "$CL" "$SW3" 2>&1)
+contains "plan_rotation refuses the swapped generation" "$r3" "rc=1"
+check "…nothing filed as consumed" "0" "$(ls "$SW3/consumed" 2>/dev/null | grep -c .)"
+check "…and it is quarantined" "1" "$(ls "$SW3/incomplete" 2>/dev/null | grep -c .)"
+
+echo "…while an unswapped claim still succeeds"
+# The control: acceptance-after-the-move must not reject everything.
+SW4="$FIX/swap-none"; mkdir -p "$SW4"
+printf 'complete and unswapped\n\n<!-- cl:clho:3:3:3:3 -->\n' > "$SW4/T-Swap.md"
+r4=$(env -i HOME="$HOME" PATH="$BASEPATH" FNS_CLAIM="$FNS_CLAIM" bash -c '
+  . "$FNS_CLAIM"
+  CONSUMED_SUBDIR=consumed; INCOMPLETE_SUBDIR=incomplete
+  claim_handoff "$2" "T-Swap" >/dev/null 2>&1; echo "rc=$?"' _ "$CL" "$SW4" 2>&1)
+contains "an unswapped complete handoff is claimed" "$r4" "rc=0"
+check "…and filed as consumed" "1" "$(ls "$SW4/consumed" 2>/dev/null | grep -c .)"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

@@ -422,26 +422,62 @@ consume_handoff() {
 # So the pathname handed to another process is never renamed again. "Claiming"
 # and "consuming" are the same move, and the only recovery is rollback — which
 # is why rollback has to be careful (see below).
+# _reject_claimed <root> <name> <archived> <why>: an archived generation that
+# failed acceptance. It is already out of the active path, so it cannot be left
+# there — it is moved to incomplete/ and reported, and consumed/ keeps its meaning
+# of "a replacement actually started from this".
+_reject_claimed() {
+  local root="$1" name="$2" arch="$3" why="$4" moved
+  if moved=$(_archive_move "$root" "$INCOMPLETE_SUBDIR" "$name" "$arch"); then
+    printf '⚠ the handoff for "%s" is %s.\n' "$name" "$why" >&2
+    printf '   Not rotating from it; resuming the session as it was. Moved to %s\n' "$name" >&2
+    printf '   (%s)\n' "$moved" >&2
+  else
+    printf '⚠ the handoff for "%s" is %s, and could not be filed — it is at %s\n' "$name" "$why" "$arch" >&2
+  fi
+  return 0
+}
+
+# ACCEPTANCE HAPPENS AFTER THE MOVE, on the generation that actually won.
+#
+# Checking the active pathname and then moving it is a TOCTOU: a writer can
+# atomically publish a different generation in between, and `_reserve_and_move`
+# then correctly moves the NEW one while the caller's success was decided about
+# the OLD one. The concrete failure is an unauthorized generation switch — a
+# handoff validated as complete and stamped for sid-A, replaced by one stamped
+# sid-B (or truncated, with no marker at all), and the replacement started from
+# that instead. The foreign-session and completeness guards were both bypassable
+# this way.
+#
+# So the rename establishes identity first, and every policy check runs against
+# the stable archived path it returns. The pre-move check below is kept only to
+# avoid a pointless move in the common case; it is not the acceptance boundary.
 claim_handoff() {
   local root="$1" name="$2" want_sid="${3:-}" hp dest got_sid
   hp=$(handoff_path "$root" "$name")
   [ -f "$hp" ] || return 1
+  # Cheap early exit, not authorization.
   if ! handoff_is_complete "$hp"; then
     quarantine_handoff "$root" "$name" >/dev/null
     return 1
   fi
-  # A handoff stamped with a DIFFERENT session id belongs to a previous
-  # occupant of this name, not to the session about to be replaced.
-  if [ -n "$want_sid" ] && got_sid=$(marker_sid "$hp") && [ "$got_sid" != "$want_sid" ]; then
-    quarantine_handoff "$root" "$name" \
-      "from a DIFFERENT session ($got_sid, not $want_sid) — a previous occupant of this name" >/dev/null
+  if ! dest=$(_archive_move "$root" "$CONSUMED_SUBDIR" "$name" "$hp"); then
+    printf '⚠ could not claim the handoff for "%s" (%s) — not rotating it; resuming as-is\n' "$name" "$hp" >&2
+    return 2
+  fi
+  # From here on, $dest is stable: nothing else can replace it.
+  if ! handoff_is_complete "$dest"; then
+    _reject_claimed "$root" "$name" "$dest" \
+      'INCOMPLETE — it was replaced between validation and the claim, and the generation that arrived has no completion marker'
     return 1
   fi
-  if dest=$(_archive_move "$root" "$CONSUMED_SUBDIR" "$name" "$hp"); then
-    printf '%s' "$dest"; return 0
+  if [ -n "$want_sid" ] && got_sid=$(marker_sid "$dest") && [ "$got_sid" != "$want_sid" ]; then
+    _reject_claimed "$root" "$name" "$dest" \
+      "from a DIFFERENT session ($got_sid, not $want_sid) — a previous occupant of this name"
+    return 1
   fi
-  printf '⚠ could not claim the handoff for "%s" (%s) — not rotating it; resuming as-is\n' "$name" "$hp" >&2
-  return 2
+  printf '%s' "$dest"
+  return 0
 }
 
 # commit_claim <root> <name> <claim-path> [reason]: the replacement is running.
@@ -488,18 +524,26 @@ rollback_claim() {
 # "resume it as it was" — the safe direction, taken whenever there is no
 # handoff, no store, or a handoff that could not be cleared.
 plan_rotation() {
-  local root="$1" name="$2" hp
+  local root="$1" name="$2" hp dest
   [ -n "$root" ] || return 1
   hp=$(handoff_path "$root" "$name")
   [ -f "$hp" ] || return 1
-  # Completeness, not just presence. An unusable file is quarantined rather
-  # than consumed, so the session falls to the floor — a plain resume, with the
-  # whole transcript intact — instead of starting fresh from a truncation.
+  # Same discipline as claim_handoff: the check below is an early exit, and the
+  # acceptance check is on the archived generation. Validating the active path and
+  # then consuming it let an incomplete replacement win in between and be rotated
+  # from — the truncation case this whole guard exists for.
   if ! handoff_is_complete "$hp"; then
     quarantine_handoff "$root" "$name" >/dev/null
     return 1
   fi
-  consume_handoff "$root" "$name" "rotating on start"
+  dest=$(consume_handoff "$root" "$name" "rotating on start") || return $?
+  if ! handoff_is_complete "$dest"; then
+    _reject_claimed "$root" "$name" "$dest" \
+      'INCOMPLETE — it was replaced between validation and the claim, and the generation that arrived has no completion marker'
+    return 1
+  fi
+  printf '%s' "$dest"
+  return 0
 }
 
 # handoff_age_human <path>: "3 minutes"/"19 days" for a file, or "" if unknown.
