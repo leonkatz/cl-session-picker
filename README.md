@@ -221,6 +221,52 @@ and bind the `{slot}` placeholders (`{issue-tracker}`, `{chat}`, `{notes}`, …)
 to your own tools beneath the import. See [`framework/README.md`](framework/README.md).
 `--no-framework` skips this step.
 
+## Per-session model — `cl model`
+
+A session can remember which model it should start with. The choice is keyed by
+**agent and name** — the same identity the rest of the tool uses — so it
+survives the session being stopped, restarted, or resumed under a new
+transcript id, and a Claude session never picks up a Codex session's model
+because they happen to share a name.
+
+```bash
+cl model                          # what is remembered, per agent and session
+cl model "API Work" opus          # this session starts with that model
+cl model --codex "API Work" gpt-5 # the Codex session of the same name
+cl model "API Work" -             # forget it — back to the agent's default
+cl new --model opus "Scratch"     # remember it and use it from the first launch
+```
+
+The agent is inferred when the name belongs to exactly one session, and a name
+held by both is refused — `cl model <name> <id>` fails the same way
+`cl <name>` does, rather than guessing.
+
+The remembered model is applied at every launch path — `cl <name>`, `cl start`,
+the picker, and the tmux/cmux/iTerm variants of each. A session with no
+remembered model launches exactly as it did before: no flag is added.
+
+It becomes `--model <id>` for Claude and `-m <id>` for Codex. If
+`CL_CODEX_ARGS` already names a model — in any form Codex accepts: `-m V`,
+`-mV`, `--model V` or `--model=V` — that explicit choice wins and the
+remembered one is skipped rather than passed as a second flag.
+
+`cl new --model` stores the choice only once the session is actually created:
+a run that refuses (no such directory, no `CL_DEFAULT_DIR`, no TTY and no tmux)
+leaves nothing behind.
+
+Values are stored in `~/.config/claude-session/models.json` and are restricted
+to letters, digits and `. _ - : /` — enough for a plain id or a fully qualified
+cloud resource name, and not enough to act as shell syntax when the value is
+spliced into a launch command. A value that fails the check is refused when set,
+and ignored (with a warning) if one is hand-edited into the file.
+
+Updates take a lock, so two shells setting different sessions cannot lose each
+other's change — an atomic rename keeps the file whole but does not prevent a
+lost update. The lock names its holder and is reclaimed only on proof that
+holder is gone.
+
+This file is yours and is never read from or written to the repository.
+
 ## start / stop
 
 `cl stop` / `cl start` tear down and rebuild your whole working set — for a
@@ -240,7 +286,7 @@ it launched with; only a fresh launch upgrades).
   shares one handoff budget (`CL_HANDOFF_BUDGET`, default 300s total — not per
   session). It then writes the live sessions to
   `~/.config/claude-session/state.json` (one record per session: name, session
-  id, cwd), and kills them. Before killing a session that still looks
+  id, cwd, agent), and kills them. Before killing a session that still looks
   **mid-task** after the handoff wait, it asks `Kill it anyway? [y/N]`; answer
   no and that session is left running while the rest are killed. Re-run
   `cl stop` once it's idle to catch it. Needs `jq`.
@@ -252,7 +298,9 @@ it launched with; only a fresh launch upgrades).
     terminals can't be scripted this way) and best-effort; pass `--keep-tabs`
     to leave all tabs open.
 - **`cl start`** reads the state file and, for each session, reattaches if it's
-  already live. Otherwise **the handoff decides how it comes back**: if a
+  already live, as the agent it was saved under. Rotation is a Claude
+  mechanism, so a Codex row always resumes as itself; for a Claude session
+  **the handoff decides how it comes back**: if a
   *complete* one is waiting, that session starts *fresh* under the same name and
   directory, told to read the handoff and continue; otherwise it resumes the
   pinned conversation by id, exactly as before. A handoff counts as complete
@@ -269,8 +317,11 @@ it launched with; only a fresh launch upgrades).
     exactly one rotation and one ordinary resume.
   - Which way a session comes back is **recorded on its saved row**, not guessed
     from whichever file survived: `cl stop` marks it resume-only when no handoff
-    arrived or `--no-handoff` was used, and `cl start` obeys that. Then attach with `tmux attach` (or `tmux -CC attach` in
-  iTerm for native tabs).
+    arrived or `--no-handoff` was used, and `cl start` obeys that.
+  - A row is **consumed only when its session really exists**. One that looked
+    live, and one whose launch was refused, both stay in `state.json`, so the
+    next `cl start` picks them up — you do not have to know to run `cl restore`.
+  Then attach with `tmux attach` (or `tmux -CC attach` in iTerm for native tabs).
 - **`cl handoff`** — run *inside* a session to write its handoff by hand; the
   way out when a pane can't be reached. Pipe the text in (`cl handoff < notes.md`)
   or run it bare to be told where to write.
@@ -278,6 +329,53 @@ it launched with; only a fresh launch upgrades).
   without stopping anything else (see [Rotation hint](#rotation-hint) below).
   The old session id is never lost — see
   [Handoff and rotation](docs/handoff.md#2-rotation-on-cl-start).
+
+### Codex sessions: what stop/start covers, and what it doesn't
+
+Both cover **Codex sessions that `cl` launched**, and deliberately nothing else.
+
+For Claude, an argv match (`--resume <id>`) identifies the process well enough
+to signal it. For Codex it does not: threads also run through a shared
+app-server daemon, the Desktop app and `--remote` clients — none of which carry
+`resume <id>` in their argv — and the npm launcher is a node wrapper plus a
+native child that *both* match. Signalling on that basis can hit an unrelated
+process.
+
+So `cl stop` uses only the launch registry: a pid `cl` itself recorded, with a
+process start token, under that exact agent, name **and thread id** — names are
+not unique over time, and a newer thread with the same name wins discovery, so
+a name-only record could have stopped one session while saving another.
+
+Before signalling, it re-checks that the pid is still running that agent: a
+start token is second-resolution and a launcher can `exec` something else
+without changing pid or start time. Afterwards it checks that no child of the
+process survived — the npm launcher is a wrapper plus a native child, and
+killing the wrapper alone would leave a client on the transcript. If one
+survives, the stop is reported incomplete and ownership is kept so a retry can
+finish it.
+
+A tmux-hosted Codex session is only killed if it carries `cl`'s own ownership
+stamp (`@cl_agent` / `@cl_sid`, set when `cl` creates the session). A matching
+tmux *name* is not proof: the name is derived from the display name and the
+derivation collides.
+
+A Codex session it has no record for is reported and left running, with its own
+tab to close — but only when something suggests it is actually being served.
+Stored threads with no process produce no warning at all:
+
+```
+⚠ leaving Review — something looks like it is running this Codex thread, but cl
+  has no launch record for it and cannot identify the process safely. Close it
+  in its own tab.
+```
+
+Such a session is also **not** written to the state file, because `cl start`
+would later resume a thread that is still open somewhere `cl` cannot see — two
+clients on one transcript.
+
+`cl start` is the reverse case and uses the looser test on purpose: any sign of
+life means skip. A false positive costs a tab you reopen by hand; a false
+negative starts a second client on a live transcript.
 
 ### Rotation hint
 

@@ -4,6 +4,130 @@ Form-factor choices that could have gone another way. Each entry records what
 was chosen, what it forecloses, and what would reverse it — so a later change
 is a deliberate reversal, not an accident.
 
+## 2026-09-15 — stop/start manage the Codex sessions cl launched, and only those
+
+**Chose:** `cl stop` signals a Codex process only when the launch registry names
+it — a pid cl recorded, with a process start token, under that agent and exact
+name. With no record, the session is reported and left running, and is not
+written to the state file either.
+
+Why not the argv match that works for Claude: Codex threads also run through a
+shared app-server daemon, the Desktop app and `--remote` clients, none of which
+carry `resume <id>` in argv, and the npm launcher is a node wrapper plus a
+native child that both match. `session_pid` documents this already and says the
+pid must never be used as a kill target; this honours that rather than quietly
+making an exception for stop.
+
+Not saving an unmanaged session is the other half: a saved row means `cl start`
+resumes it later, and resuming a thread still open in the Desktop app puts two
+clients on one transcript.
+
+`cl start` uses the looser test deliberately — argv match, registry, or tmux —
+because its two failure directions are not symmetric. A false positive costs a
+tab reopened by hand; a false negative starts a second client on a live session.
+
+**Forecloses:** a one-command teardown of a Codex session started outside cl.
+That remains manual, and says so on screen — when there is any sign it is
+running. A stored thread with no process is not mentioned at all; `discover`
+lists every thread ever named, and a warning per row would bury the real ones.
+
+**Sharpened after review (2026-09-17):** the record binds the THREAD as well as
+the agent and name, because a newer same-named thread wins discovery and a
+name-only record could stop one session while saving another. A tmux session is
+killed only if it carries cl's own `@cl_agent`/`@cl_sid` stamp — a matching name
+is not proof, since the derivation collides. The pid is re-checked to still be
+running that agent immediately before the signal (a start token is
+second-resolution, and a launcher can `exec` something else without changing
+either), and children captured before the signal are checked after it, so a
+surviving native client is reported instead of being called "killed".
+
+**Sharpened again after review (2026-09-21):** `new-session -A` was creating
+OR attaching, and the helper stamped the result either way — manufacturing the
+ownership proof the stamp exists to provide, on a session cl had merely found.
+Create and attach are now separate calls; an existing session is attached,
+reported as not-ours, and never stamped. `save_state` demands the same stamp the
+kill path does, so an unstamped collision is no longer saved as a restart row.
+A row is consumed only once its session exists, and a failure while filtering
+leaves the restart list untouched rather than deleting the only copy.
+
+**Known gap, stated rather than hidden:** the same tmux name-equality hazard
+exists for Claude, which predates this and is unchanged here. Claude's bare-mode
+path is covered by the registry; its tmux path still trusts the name.
+
+**Reverses by:** deleting `agent_live`, restoring the `[ "$agent" = "claude" ] ||
+continue` filters in `save_state` and `do_stop`, dropping the `agent` column
+from `do_start`'s two jq reads and the agent pair from `open_iterm_tabs`.
+
+## 2026-09-15 — a remembered model is keyed by agent AND name, in its own file
+
+**Chose:** `cl model [--codex|--claude] <name> <id>` stores the choice in
+`~/.config/claude-session/models.json` as `{"<agent>": {"<name>": "<id>"}}`,
+separate from `state.json`.
+
+Keyed by agent as well as name, corrected after review (2026-09-17). Name alone
+crossed the agent boundary: with a Claude and a Codex session both called
+`API`, `cl --claude API` resolves the ambiguity for the launch and would still
+have been handed the Codex model — `claude --model <a-codex-model>`. Session
+identity is `(agent, name)` everywhere else here; the store now matches, and a
+bare name that two agents share is refused rather than guessed.
+
+Not a field in `state.json`, which was the obvious place: that file is a
+snapshot of what was live at the last `cl stop`, and `cl start` consumes and
+deletes it. A preference kept there would be erased by the first stop/start
+cycle — and `cl new --model` names a session that has no state record yet.
+
+Keyed by name rather than session id because the name is what the user types
+and what stays stable; a session resumed into a new transcript keeps its name
+and should keep its model.
+
+**Forecloses:** little now. A session must be discoverable for the agent to be
+inferred; otherwise the flag is required.
+
+**Reverses by:** deleting `valid_model`/`model_for`/`model_flag`/`set_model`/
+`do_model`, the `model` dispatcher arm, the `--model` flag in `do_new`, the
+third argument to `resume_cmd`, and the two `model_flag` calls in `do_start`.
+The file itself can be left behind; nothing else reads it.
+
+## 2026-09-15 — the model charset is validated, and that makes the quoting untestable
+
+**Chose:** a model id must match `[A-Za-z0-9._:/-]+`, checked both when set and
+when read back, and is `printf %q`-quoted where it is spliced into a command
+string.
+
+**The honest part:** every value that passes the charset check is already
+shell-safe, so the quoting is a no-op and removing it leaves the test suite
+green. It is kept as the layer that matters if the charset is ever widened —
+a model id containing a space, say. Widening the charset without testing the
+quoting would be the actual mistake.
+
+**Forecloses:** model identifiers containing spaces, quotes, `@`, `+`, `=`, or
+`#`. No current agent uses such an id; a future one would need the charset
+widened deliberately, with a test for the quoting added at the same time.
+
+**Reverses by:** relaxing `valid_model` — and writing the quoting test that
+becomes possible at that moment.
+
+## 2026-09-21 — the model lock refuses a stale lock rather than reclaiming it
+
+**Chose:** `models_lock` reports a dead holder's lock and exits, printing the
+`rm -f` to clear it. It never unlinks one automatically.
+
+Validating a symlink and then removing its pathname are two operations, and
+between them another waiter can acquire — the delete would then destroy a live
+claim and put two writers inside the read-modify-write together. The
+start-token proof authenticates the object read, not the object later unlinked,
+and portable shell has no compare-and-swap.
+
+`acquire_launch` reached this conclusion first and documents it; I implemented
+the pattern it rejects, forty lines below the paragraph rejecting it. Caught in
+review 2026-09-21.
+
+**Forecloses:** unattended recovery from a writer that died inside a
+few-millisecond window. The trade is the same one the launch lock already makes.
+
+**Reverses by:** finding a primitive with atomic ownership transfer — at which
+point both locks should change together, not just this one.
+
 ## 2026-08-28 — Codex support is a per-session `agent` field, not a second script
 
 **Chose:** `discover()` emits a fifth column, `agent` (`claude` | `codex`), and
