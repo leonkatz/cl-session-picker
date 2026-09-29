@@ -263,7 +263,7 @@ printf '%s\n' "\$*" >> "$FIX/tmux.calls"
 case "\$1" in
   has-session)  exit 0 ;;                        # something IS sitting there
   show-option)  [ -f "$FIX/stamped" ] || exit 0  # unstamped: print nothing
-                # `tmux show-option -qv -t <target> <option>`: the option name
+                # 'tmux show-option -qv -t <target> <option>': the option name
                 # is the FIFTH argument, not the fourth (that is the target).
                 case "\$5" in @cl_agent) echo codex ;; @cl_sid) echo "$SID_MINE" ;; esac ;;
 esac
@@ -433,6 +433,21 @@ case "$out" in *"can't find session"*|*"no server"*) fail=$((fail+1)); printf ' 
   *) pass=$((pass+1)); printf '  ok   %s\n' "…without attaching to nothing afterwards" ;; esac
 case "$out" in *'rc=1'*) pass=$((pass+1)); printf '  ok   %s\n' "…and returns non-zero for the caller" ;;
   *) fail=$((fail+1)); printf '  FAIL %s\n       got: %s\n' "…and returns non-zero for the caller" "$out" ;; esac
+
+# A suite that emits a shell error must not report clean. This file reported all
+# assertions passing while the outer shell was failing to parse a heredoc comment
+# — a false green of exactly the kind these suites exist to prevent. Re-running
+# itself once, with a marker, keeps the check honest without recursing.
+if [ -z "${CL_SELFCHECK:-}" ]; then
+  _self=$(CL_SELFCHECK=1 bash "$0" 2>&1 >/dev/null | grep -ciE 'syntax error|unexpected token' || true)
+  if [ "${_self:-0}" -gt 0 ]; then
+    fail=$((fail+1))
+    printf '  FAIL %s\n       the shell reported %s parse error(s) while every assertion passed\n' \
+      "this suite emits no shell errors" "$_self"
+  else
+    pass=$((pass+1)); printf '  ok   %s\n' "this suite emits no shell errors"
+  fi
+fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
