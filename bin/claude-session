@@ -1449,6 +1449,109 @@ acquire_launch() {
   return 0
 }
 
+# ack_state_row <name> [agent]: remove this session's row from STATE, as the
+# ACKNOWLEDGEMENT that a launch really happened.
+#
+# ── WHY THE CHILD DOES THIS AND NOT `cl start` ───────────────────────────────
+#
+# On the iTerm/no-tmux path `cl start` does not launch anything: it writes
+# `cl "<name>"` into a new tab and that tab launches the agent. So the parent
+# cannot know whether a launch succeeded — "AppleScript accepted the text" is
+# not "an agent started" — and consuming the row there loses the session
+# whenever a tab never runs.
+#
+# Keeping the row instead is not a fix on its own, which is the defect this
+# function closes (found in Codex review, 2026-09-29). `cl start` also keeps the
+# row for a session it skips as already live, so "keep it and let a later start
+# sort it out" has no exit: skipping is another keep. The row would survive
+# forever, turning a one-shot stop snapshot into a permanent desired-state list
+# that resurrects sessions the user deliberately closed.
+#
+# The missing operation is an acknowledgement from the process that actually
+# knows. acquire_launch granting ownership is that proof: it is the gate that
+# refuses a second agent on one name, and this shell is about to exec the agent
+# with the same pid and start time the record names. Rotation already commits
+# its handoff claim at exactly this point, so state and handoff are acknowledged
+# together, under the same rule.
+#
+# ── WHY IT LOCKS ─────────────────────────────────────────────────────────────
+#
+# `cl start` opens every tab at once, so N children reach this concurrently.
+# Unserialised read-modify-write on one JSON file silently loses removals: two
+# children each read the same array, each drop their own row, and the second
+# write restores the first's. Same symlink-claim discipline as acquire_launch —
+# atomic `ln -s` carrying the owner's identity, no automatic breaking of a lock
+# whose holder is still alive, bounded waiting.
+#
+# Every failure leaves the row in place. A stale row costs one duplicate tab on
+# the next start; deleting the wrong row costs a session.
+ack_state_row() {
+  local name="$1" agent="${2:-claude}" lock tries=0 envfail=0 holder hpid hstart tmp
+  # Nothing to acknowledge: no snapshot, or no jq to rewrite it with. Neither is
+  # an error — a launch outside a stop/start cycle has no row at all.
+  [ -f "$STATE" ] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  lock="${STATE}.acklock"
+  if [ -e "$lock" ] && [ ! -L "$lock" ]; then
+    printf 'claude-session: %s exists and is not a claim lock — remove it; until then "%s" stays in the restart list\n' "$lock" "$name" >&2
+    return 1
+  fi
+  while ! ln -s "$(claim_token)" "$lock" 2>/dev/null; do
+    holder=$(readlink "$lock" 2>/dev/null)
+    if [ -z "$holder" ]; then
+      # Either it vanished between the attempt and the read (retry), or links
+      # cannot be made here at all — in which case looping would never end.
+      if [ ! -L "$lock" ] && [ ! -e "$lock" ]; then
+        envfail=$((envfail+1))
+        if [ "$envfail" -gt 5 ]; then
+          printf 'claude-session: cannot create %s — "%s" stays in the restart list\n' "$lock" "$name" >&2
+          return 1
+        fi
+      fi
+      sleep 0.05; continue
+    fi
+    hpid=${holder%%:*}; hstart=${holder#*:}
+    case "$hpid" in
+      ''|*[!0-9]*)
+        printf 'claude-session: %s is malformed — clear it:\n  rm -f %s\n' "$lock" "$(printf '%q' "$lock")" >&2
+        return 1 ;;
+    esac
+    # Reclaim only on proof the holder is gone. Age is not proof, and the
+    # validate-then-unlink race is why a stale lock is reported, never broken:
+    # between the check and the rm another waiter can establish a live claim,
+    # and the delete would destroy THAT one.
+    if [ "$(start_token "$hpid")" != "$hstart" ]; then
+      printf 'claude-session: a process (pid %s) died holding %s — clear it:\n  rm -f %s\n' "$hpid" "$lock" "$(printf '%q' "$lock")" >&2
+      return 1
+    fi
+    tries=$((tries+1))
+    if [ "$tries" -gt "${CL_ACK_WAIT_TRIES:-100}" ]; then
+      printf 'claude-session: another launch (pid %s) still holds %s — "%s" stays in the restart list\n' "$hpid" "$lock" "$name" >&2
+      return 1
+    fi
+    sleep 0.05
+  done
+
+  tmp="$STATE.ack.$$"
+  if jq --arg n "$name" --arg a "$agent" \
+       '[ .[] | select( ((.agent // "claude") == $a and .name == $n) | not ) ]' \
+       "$STATE" > "$tmp" 2>/dev/null; then
+    # An empty array is a consumed snapshot, not an empty list to keep: `cl
+    # start` treats a missing STATE as "nothing to restore" and a present one as
+    # a list to work through.
+    if [ "$(jq 'length' "$tmp" 2>/dev/null || echo -1)" = "0" ]; then
+      rm -f "$tmp" "$STATE" 2>/dev/null
+    else
+      mv "$tmp" "$STATE" 2>/dev/null || rm -f "$tmp"
+    fi
+  else
+    rm -f "$tmp" 2>/dev/null
+    printf 'claude-session: could not acknowledge "%s" in %s — it stays in the restart list, so a later cl start may open it again\n' "$name" "$STATE" >&2
+  fi
+  rm -f "$lock" 2>/dev/null
+  return 0
+}
+
 session_pid() { # sid [agent] [name]
   local pid
   case "${2:-claude}" in
@@ -1685,6 +1788,9 @@ launch_session() { # name sid cwd [agent]
     elif [ "$arc" -ne 0 ]; then
       exit 1   # acquire_launch already said exactly what went wrong
     fi
+    # Ownership granted, so this launch is real: acknowledge the restart row
+    # before exec, which is the last moment any code here runs.
+    ack_state_row "$name" "$agent"
     drop_cmux_env; cd "$cwd" || exit 1; eval "exec $cmd"
   fi
 }
@@ -1874,6 +1980,9 @@ launch_fresh() {
       exit 1
     fi
     [ -n "$claim" ] && commit_claim "$root" "$name" "$claim" "rotating now"
+    # Same instant as the claim commit: the handoff and the restart row are two
+    # records of one launch, so they are acknowledged on the same proof.
+    ack_state_row "$name" claude
     drop_cmux_env; eval "exec $cmd"
   fi
 }

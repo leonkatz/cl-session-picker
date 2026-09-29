@@ -4,6 +4,45 @@ Form-factor choices that could have gone another way. Each entry records what
 was chosen, what it forecloses, and what would reverse it — so a later change
 is a deliberate reversal, not an accident.
 
+## 2026-09-29 — a restart row is cleared by the process that launched it
+
+**Chose:** where `cl start` creates the session itself (tmux, cmux) it consumes
+the row immediately, because the create answers that shell. Where it opens an
+iTerm tab instead, the **child** clears its own row (`ack_state_row`) once
+`acquire_launch` grants it ownership of the name — the same proof, at the same
+moment, that lets it claim the handoff.
+
+Two rejected alternatives, and why:
+
+**Consume on delegation.** "AppleScript accepted the text" is not "an agent
+started". A tab that never runs would lose both the restart row and, under
+rotation, the handoff the tab was going to claim — recoverable only by knowing
+to run `cl restore`.
+
+**Keep the row and let a later start sort it out.** This is what the handoff
+branch did when it merged with main, and it is wrong in a way that looked
+self-correcting: a `cl start` that finds a session live *also* keeps its row, so
+skipping is another keep and there is no transition that ever clears it. The
+snapshot stops being a one-shot stop record and becomes a permanent
+desired-state list — which resurrects a session the user deliberately closed the
+next time they run `cl start` for something else. Found in Codex review,
+2026-09-29, against a tree whose tests asserted the false property.
+
+**Forecloses:** the parent can no longer be the single writer of `state.json`
+during a start, so the file needs a lock. It reuses the launch registry's
+symlink claim (atomic `ln -s` carrying the owner's identity, a live holder's lock
+never broken automatically, bounded waiting) rather than inventing a second
+locking style.
+
+**Failure direction is fixed:** every way the acknowledgement can fail leaves the
+row. A stale row costs one duplicate tab on the next start; deleting the wrong
+row costs a session. The match is keyed by agent *and* name, because a name held
+by both agents is ordinary here.
+
+**Would reverse it:** `cl start` gaining a way to observe a delegated launch
+directly — then the parent could consume rows itself and the child would not need
+to write shared state at all.
+
 ## 2026-09-15 — stop/start manage the Codex sessions cl launched, and only those
 
 **Chose:** `cl stop` signals a Codex process only when the launch registry names

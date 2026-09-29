@@ -143,6 +143,16 @@ in another process: "the terminal accepted the text" is not "an agent started",
 so there the parent leaves the handoff untouched and the tab claims it after
 `acquire_launch` grants ownership. A tab that never runs spends nothing.
 
+The session's **restart row** is settled at that same instant and on that same
+proof. The parent cannot consume it — it does not know whether the tab launched
+anything — and merely keeping it would never end, because a later `cl start`
+that finds the session live and skips it keeps the row as well. So the row would
+outlive the session forever and `cl start` would eventually reopen one the user
+had deliberately closed. Instead the child acknowledges its own row once it owns
+the name (`ack_state_row`), under the same symlink claim lock as the launch
+registry, keyed by agent *and* name. Every failure leaves the row: a duplicate
+tab costs a keystroke, a wrongly deleted row costs a session.
+
 ### Which way a session comes back is recorded, not inferred
 
 `cl stop` writes `resume_only` on the saved row when it could not get a handoff,

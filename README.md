@@ -318,9 +318,16 @@ it launched with; only a fresh launch upgrades).
   - Which way a session comes back is **recorded on its saved row**, not guessed
     from whichever file survived: `cl stop` marks it resume-only when no handoff
     arrived or `--no-handoff` was used, and `cl start` obeys that.
-  - A row is **consumed only when its session really exists**. One that looked
-    live, and one whose launch was refused, both stay in `state.json`, so the
-    next `cl start` picks them up — you do not have to know to run `cl restore`.
+  - A row is **consumed only once some process has confirmed the launch**. Where
+    `cl start` creates the session itself (tmux, cmux) it confirms it directly.
+    Where it opens an iTerm tab instead, the tab does the launching, so the row
+    is cleared by that child once it has been granted ownership of the name —
+    the same proof, and the same moment, that lets it claim the handoff. A row
+    whose launch was refused, or that looked live and was skipped, stays in
+    `state.json` until then, so the next `cl start` picks it up and you do not
+    have to know to run `cl restore`. The acknowledgement is keyed by agent and
+    name and fails closed: if it cannot be written the row simply stays, because
+    a duplicate tab is cheap and a dropped session is not.
   Then attach with `tmux attach` (or `tmux -CC attach` in iTerm for native tabs).
 - **`cl handoff`** — run *inside* a session to write its handoff by hand; the
   way out when a pane can't be reached. Pipe the text in (`cl handoff < notes.md`)
