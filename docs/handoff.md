@@ -68,10 +68,27 @@ active file gone, `consumed/` one file richer — and passed throughout. What
 none of them checked was whether the path in the agent's own argv still
 resolved.
 
-Every move that must not overwrite uses **hard-link-then-unlink**, not `mv`.
-`ln` fails outright when the target exists, in one operation, so the check *is*
-the move. `mv -n`, and `[ -e ] && mv`, are check-then-rename: another writer can
-create the target between the two steps and the rename destroys it.
+The two moves involved need **different** guarantees, and one primitive cannot
+serve both:
+
+| | source | what must be atomic |
+|---|---|---|
+| **claiming** | the shared active path, which other writers can replace | *from the source* — exactly one caller may win |
+| **rolling back** | our own private claim path, which nobody else touches | *at the destination* — never overwrite a newer handoff |
+
+`mv` is atomic from the source — a second rename of the same source fails,
+because the first removed it — but it overwrites its destination. `ln` refuses an
+existing destination but is not a move: the unlink that follows is a separate
+step, so two callers can both link one source to different destinations and both
+then "succeed" at removing it (`rm -f` reports success on an absent path). Worse,
+unlinking *by pathname* can remove a newer file that replaced the source in
+between, destroying it while reporting the older one claimed.
+
+So claiming reserves its destination exclusively first (`set -C` makes `>` fail if
+it exists) and then renames the source onto that reservation: the reservation
+means it cannot overwrite anyone, and the rename means exactly one claimer wins.
+A loser releases its reservation, so no empty files accumulate. Rollback keeps
+link-then-unlink, which is safe there precisely because its source is private.
 
 Archive names are therefore unique because a creation **succeeded**, not because
 a name looked free. Composing one from timestamp, pid and random draws and

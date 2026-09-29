@@ -291,22 +291,49 @@ handoff_is_manual()   { case "$(handoff_marker "$1" 2>/dev/null)" in manual:?*) 
 # it failed to clear: the file would still be sitting there next time and the
 # session would rotate again, forever, off an ever-staler file. Declining to
 # rotate degrades to a plain resume, which loses nothing.
-# _link_noclobber <src> <dest>: move src to dest, atomically REFUSING if dest
-# already exists.
+# The two moves this file needs have DIFFERENT atomicity requirements, and one
+# primitive cannot serve both. Getting that wrong let two claimers each take the
+# same handoff and report success.
 #
-# `mv` cannot express this. `mv -n` and `[ -e "$dest" ] && mv` are both
-# check-then-rename: another writer can create dest between the two steps, and
-# the rename then overwrites it. `ln` fails outright when the target exists, in
-# ONE operation — the check IS the move — so there is no window.
+#   claiming    source is the shared ACTIVE path, which other writers can replace.
+#               Must be atomic FROM THE SOURCE: exactly one caller may win.
+#   rolling back  source is our own private claim path, which nobody else can
+#               touch. Must be atomic AT THE DESTINATION: never overwrite a newer
+#               handoff published while the claim was out.
 #
-# Same-filesystem only, which holds: every path here is under the same store.
-#   0  moved
-#   1  dest already existed (nothing changed)
-#   2  linked but the source could not be removed, so both now exist
+# `mv` is atomic from the source — a second rename of the same source fails,
+# because the first removed it — but it OVERWRITES its destination.
+# `ln` refuses an existing destination but is not a move at all: the unlink that
+# follows is a separate step, so two callers can both link the same source to
+# different destinations and both then "succeed" at removing it (`rm -f` reports
+# success on an already-absent path). Worse, unlinking BY PATHNAME can remove a
+# newer file that replaced the source in between — destroying the newer handoff
+# while reporting the older one claimed.
+
+# _link_noclobber <src> <dest>: link src to dest, refusing if dest exists, then
+# unlink src. ONLY safe where src is private to this process — see above.
+#   0  moved   1  dest already existed   2  linked but src could not be removed
 _link_noclobber() {
   ln "$1" "$2" 2>/dev/null || return 1
   rm -f "$1" 2>/dev/null || return 2
   return 0
+}
+
+# _reserve_and_move <src> <dest>: claim src exclusively into dest.
+#
+# Two steps, each atomic, in the order that makes both properties hold:
+#   1. create dest exclusively (`set -C` makes `>` fail if it exists), so this
+#      move can never overwrite another writer's file;
+#   2. `mv` src onto our own reservation, which is atomic from the source — so if
+#      another claimer already took src, this rename fails and that claimer won.
+# The reservation is released on failure so a lost race leaves no empty file.
+#
+#   0  claimed   1  dest was taken   2  src was gone (someone else won), or error
+_reserve_and_move() {
+  ( set -C; : > "$2" ) 2>/dev/null || return 1
+  if mv "$1" "$2" 2>/dev/null; then return 0; fi
+  rm -f "$2" 2>/dev/null
+  return 2
 }
 
 # _archive_move <root> <subdir> <name> <src>: move src into <root>/<subdir>
@@ -324,11 +351,11 @@ _archive_move() {
   stamp=$(date +%Y%m%d-%H%M%S 2>/dev/null || echo unknown)
   while [ "$tries" -lt 50 ]; do
     cand="$root/$subdir/$base-$stamp-$$$RANDOM$RANDOM.md"
-    _link_noclobber "$src" "$cand"; rc=$?
+    _reserve_and_move "$src" "$cand"; rc=$?
     case "$rc" in
       0) printf '%s' "$cand"; return 0 ;;
-      1) tries=$((tries+1)); continue ;;   # taken: draw another
-      *) return 2 ;;
+      1) tries=$((tries+1)); continue ;;   # name taken: draw another
+      *) return 2 ;;                        # source gone: another claimer won
     esac
   done
   return 2
@@ -437,10 +464,11 @@ rollback_claim() {
   local root="$1" name="$2" claim="$3" hp rc
   [ -f "$claim" ] || return 1
   hp=$(handoff_path "$root" "$name")
-  # ATOMIC, not check-then-move. Testing `[ -e "$hp" ]` and then `mv` leaves a
-  # window in which the old session (or `cl handoff`) publishes a newer handoff
-  # at the now-free path and the restore overwrites it — destroying the more
-  # recent answer, which is the whole thing this guard exists to prevent.
+  # link-then-unlink is correct HERE and only here: the source is our own claim
+  # path under consumed/, which no other writer can replace, so unlinking it by
+  # pathname cannot remove someone else's file. What must not be overwritten is
+  # the DESTINATION — a newer handoff published at the active path while this
+  # claim was out — and a link that refuses an existing target is exactly that.
   _link_noclobber "$claim" "$hp"; rc=$?
   if [ "$rc" -eq 1 ]; then
     printf 'ℹ not restoring the handoff for "%s": a newer one is already there. The older one stays filed at %s\n' \

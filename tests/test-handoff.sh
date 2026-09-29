@@ -948,7 +948,7 @@ AR="$FIX/archive-collide"; mkdir -p "$AR/consumed"
 printf 'PRECIOUS existing file\n' > "$AR/src-a.md"
 printf 'SECOND file\n' > "$AR/src-b.md"
 arch=$(env -i HOME="$HOME" PATH="$BASEPATH" bash -c '
-  eval "$(sed -n "/^_link_noclobber/,/^}/p;/^_archive_move/,/^}/p;/^name_component/,/^}/p" "$1")"
+  eval "$(sed -n "/^_link_noclobber/,/^}/p;/^_reserve_and_move/,/^}/p;/^_archive_move/,/^}/p;/^name_component/,/^}/p" "$1")"
   # Force the first candidate to be occupied by seeding a file at every name the
   # generator could pick this second is impossible; instead prove the primitive:
   # linking onto an existing path must FAIL rather than replace it.
@@ -960,7 +960,7 @@ contains "linking onto an occupied path is refused, not silently overwritten" "$
 contains "…and the occupant is untouched" "$arch" "one"
 # And the wrapper still succeeds by drawing another name.
 both=$(env -i HOME="$HOME" PATH="$BASEPATH" bash -c '
-  eval "$(sed -n "/^_link_noclobber/,/^}/p;/^_archive_move/,/^}/p;/^name_component/,/^}/p" "$1")"
+  eval "$(sed -n "/^_link_noclobber/,/^}/p;/^_reserve_and_move/,/^}/p;/^_archive_move/,/^}/p;/^name_component/,/^}/p" "$1")"
   a=$(_archive_move "$2" consumed "T-Big" "$2/src-a.md")
   b=$(_archive_move "$2" consumed "T-Big" "$2/src-b.md")
   [ "$a" != "$b" ] && echo DISTINCT
@@ -1083,6 +1083,66 @@ check "…the handoff is back at its active path" "1" \
 check "…and nothing was filed as consumed" "0" "$(ls "$OCC/consumed" 2>/dev/null | grep -c .)"
 rtmux kill-session -t "T-Occupied" >/dev/null 2>&1 || true
 rm -f "$HOME/.claude/projects/p1/sid-occ.jsonl"
+
+
+# ===========================================================================
+# Exactly one claimer. The property a no-clobber destination does NOT give you.
+# ===========================================================================
+echo "two claimers racing for one handoff: exactly one wins"
+# `ln src dest; rm -f src` is atomic only about the DESTINATION. Two claimers get
+# different destination names, both links succeed against the same source, and
+# both `rm -f` report success — the second because -f ignores an absent path. So
+# both claimed the same handoff and both could launch a replacement from it.
+# Claiming has to be atomic FROM THE SOURCE, which is what rename gives.
+CLM="$FIX/two-claimers"; mkdir -p "$CLM/consumed"
+printf 'the one handoff\n\n<!-- cl:clho:9:9:9:9 -->\n' > "$CLM/active.md"
+race=$(env -i HOME="$HOME" PATH="$BASEPATH" bash -c '
+  eval "$(sed -n "/^_link_noclobber/,/^}/p;/^_reserve_and_move/,/^}/p" "$1")"
+  d="$2"
+  # Both claimers pick their destination first, then contend for the source —
+  # the interleaving that made link-then-unlink report two winners.
+  ( _reserve_and_move "$d/active.md" "$d/consumed/A.md"; echo "A:$?" ) > "$d/ra" 2>&1 &
+  ( _reserve_and_move "$d/active.md" "$d/consumed/B.md"; echo "B:$?" ) > "$d/rb" 2>&1 &
+  wait
+  cat "$d/ra" "$d/rb"' _ "$CL" "$CLM")
+wins=$(printf '%s\n' "$race" | grep -c ':0$' || true)
+check "exactly one claimer reports success" "1" "$wins"
+check "…and exactly one archive file exists" "1" "$(ls "$CLM/consumed" 2>/dev/null | grep -c .)"
+check "…the active handoff is gone, not duplicated" "0" "$([ -e "$CLM/active.md" ] && echo 1 || echo 0)"
+contains "…and the surviving archive holds the handoff" \
+  "$(cat "$CLM/consumed"/* 2>/dev/null)" "the one handoff"
+
+echo "a newer handoff published mid-claim is never destroyed"
+# Unlinking the source BY PATHNAME does not prove which inode it removes: a newer
+# generation published at the active path between the link and the unlink was
+# deleted, while the claim reported the older one taken. A rename moves whatever
+# is at the source at that instant, so nothing is silently dropped.
+MID="$FIX/mid-claim"; mkdir -p "$MID/consumed"
+printf 'OLDER generation\n\n<!-- cl:clho:1:1:1:1 -->\n' > "$MID/active.md"
+mid=$(env -i HOME="$HOME" PATH="$BASEPATH" bash -c '
+  eval "$(sed -n "/^_reserve_and_move/,/^}/p" "$1")"
+  d="$2"
+  # Reserve the destination, then let a writer replace the active path before the
+  # move completes — the window that used to lose the newer file.
+  ( set -C; : > "$d/consumed/X.md" ) 2>/dev/null
+  printf "NEWER generation\n" > "$d/new.tmp"; mv "$d/new.tmp" "$d/active.md"
+  mv "$d/active.md" "$d/consumed/X.md" 2>/dev/null && echo moved
+  cat "$d/consumed/X.md" 2>/dev/null' _ "$CL" "$MID")
+contains "the claim completes" "$mid" "moved"
+contains "…and the NEWER content is what landed, not a deleted file" "$mid" "NEWER generation"
+check "…with nothing left stale at the active path" "0" "$([ -e "$MID/active.md" ] && echo 1 || echo 0)"
+
+echo "a lost claimer leaves no empty reservation behind"
+# The reservation is created before the move, so a claimer that loses the race
+# must release it or consumed/ fills with zero-byte files that look like handoffs.
+LOSE="$FIX/lost-claim"; mkdir -p "$LOSE/consumed"
+lost=$(env -i HOME="$HOME" PATH="$BASEPATH" bash -c '
+  eval "$(sed -n "/^_reserve_and_move/,/^}/p" "$1")"
+  d="$2"
+  _reserve_and_move "$d/nonexistent.md" "$d/consumed/orphan.md"; echo "rc=$?"
+  ls "$d/consumed" | grep -c . ' _ "$CL" "$LOSE")
+contains "a claim of a vanished source fails" "$lost" "rc=2"
+check "…and leaves consumed/ empty" "1" "$(printf '%s\n' "$lost" | tail -1 | grep -c '^0$')"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
