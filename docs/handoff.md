@@ -68,33 +68,44 @@ active file gone, `consumed/` one file richer — and passed throughout. What
 none of them checked was whether the path in the agent's own argv still
 resolved.
 
-Destination names are unique **by construction** (timestamp, pid, two random
-draws). A check-then-move — "pick a name nothing occupies, then rename onto it"
-— is not collision-safe: two writers in the same second can both see the same
-free name.
+Every move that must not overwrite uses **hard-link-then-unlink**, not `mv`.
+`ln` fails outright when the target exists, in one operation, so the check *is*
+the move. `mv -n`, and `[ -e ] && mv`, are check-then-rename: another writer can
+create the target between the two steps and the rename destroys it.
 
-The move is a `rename`, so claiming is atomic: two starts racing for one
-handoff produce exactly one rotation and one ordinary resume.
+Archive names are therefore unique because a creation **succeeded**, not because
+a name looked free. Composing one from timestamp, pid and random draws and
+calling that "unique by construction" is not: those are finite and reused, and
+the following `mv` would overwrite. On a collision the next name is drawn.
 
-**Rolling back.** If the launch is refused, the handoff goes back to the active
-path — but **only if nothing newer is there**. While a rotation is in flight the
-old session (or `cl handoff`) can publish a newer handoff at the freed path, and
-moving the older one back on top of it would destroy the more recent answer. In
-that case the older one stays filed and says so.
+**Rolling back.** If the launch is refused, the handoff returns to the active
+path — but only if nothing is there. While a rotation is in flight the old
+session (or `cl handoff`) can publish a newer handoff at the freed path, and
+restoring the older one on top would destroy the more recent answer. Since the
+restore is a no-clobber link, a newer file simply makes it fail, and the older
+one stays filed.
 
 **What "accepted" can honestly mean.** On an `exec` path the launcher replaces
 itself with the agent, so it can never observe the agent running. What it can
 establish is: launch ownership granted, the working directory reachable, and the
-agent binary runnable — all three preflighted, so a missing agent or a vanished
-directory rolls the handoff back instead of spending it. An `exec` that fails
-after that still spends it; closing that would need the replacement to
-acknowledge, which nothing here does. The docs say what is checked rather than
-claiming more.
+agent binary runnable — all preflighted, so a missing agent rolls the handoff
+back instead of spending it. An `exec` that fails after that still spends it;
+closing that would need the replacement to acknowledge, which nothing here does.
+
+**A rotation whose directory has gone refuses.** It does not fall back to
+`$HOME`: the handoff describes work in a specific place, and starting a
+replacement elsewhere points it at the wrong repository while handing it notes
+about a different one. A plain launch may still fall back; a rotation will not.
 
 Where the launch *is* synchronous — a detached tmux session, a cmux workspace —
-the launching process sees the backend answer, and a refusal rolls back and
-**keeps the session's row in the restart list**, so `cl start` simply retries it
-and the command exits non-zero. Without tmux the agent is started by the *tab*,
+the launching process sees the backend answer. For tmux that means **creating**
+and then attaching, never `new-session -A`: `-A` attaches to an existing session
+of the same name and returns success *without running the fresh-agent command*,
+so committing before it answered would spend a handoff on a replacement that
+never started. `new-session -d` fails when the name is taken, so its status
+distinguishes "created" from "was already there". A refusal rolls back and
+**keeps the session's row in the restart list**, so `cl start` retries it and the
+command exits non-zero. Without tmux the agent is started by the *tab*,
 in another process: "the terminal accepted the text" is not "an agent started",
 so there the parent leaves the handoff untouched and the tab claims it after
 `acquire_launch` grants ownership. A tab that never runs spends nothing.

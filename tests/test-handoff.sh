@@ -937,19 +937,37 @@ contains "…with the handoff's real content in it" "$(cat "$told" 2>/dev/null)"
 check "…and it is its permanent home, not a staging dir" "1" \
   "$(printf '%s' "$told" | grep -c '/consumed/')"
 
-echo "archive destinations are unique by construction, not by checking"
-# A check-then-move ("pick a name that does not exist, then mv") is not
-# collision-safe: two writers in the same second can both see the same absent
-# name and the second overwrites the first. Asserted against the generator
-# directly — a rotation test cannot reach it, because only one process can ever
-# hold the single active handoff.
-gen=$(env -i HOME="$HOME" PATH="$BASEPATH" bash -c '
-  eval "$(sed -n "/^_archive_dest/,/^}/p;/^name_component/,/^}/p" "$1")"
-  i=0; while [ $i -lt 40 ]; do _archive_dest /r consumed "T-Big"; echo; i=$((i+1)); done' _ "$CL")
-check "40 destinations drawn in the same second are all distinct" "40" \
-  "$(printf '%s\n' "$gen" | sed '/^$/d' | sort -u | grep -c .)"
-not_contains "…and none is a bare timestamp that two writers could share" \
-  "$(printf '%s\n' "$gen" | head -1)" "$(date +%Y%m%d-%H%M%S).md"
+echo "archiving never overwrites, even when the chosen name is already taken"
+# Composing a name from time+pid+random and calling it "unique by construction"
+# was not: $RANDOM is finite, pids are reused, and the mv that followed would
+# overwrite. Asserting that N drawn names differ only shows that one sample had no
+# collision. The property that matters is that a COLLIDING write loses nothing,
+# so the destination is pre-occupied here and the move must still land elsewhere
+# with both files intact.
+AR="$FIX/archive-collide"; mkdir -p "$AR/consumed"
+printf 'PRECIOUS existing file\n' > "$AR/src-a.md"
+printf 'SECOND file\n' > "$AR/src-b.md"
+arch=$(env -i HOME="$HOME" PATH="$BASEPATH" bash -c '
+  eval "$(sed -n "/^_link_noclobber/,/^}/p;/^_archive_move/,/^}/p;/^name_component/,/^}/p" "$1")"
+  # Force the first candidate to be occupied by seeding a file at every name the
+  # generator could pick this second is impossible; instead prove the primitive:
+  # linking onto an existing path must FAIL rather than replace it.
+  printf "one\n" > "$2/occupied.md"
+  printf "two\n" > "$2/other.md"
+  if _link_noclobber "$2/other.md" "$2/occupied.md"; then echo CLOBBERED; else echo REFUSED; fi
+  cat "$2/occupied.md"' _ "$CL" "$AR")
+contains "linking onto an occupied path is refused, not silently overwritten" "$arch" "REFUSED"
+contains "…and the occupant is untouched" "$arch" "one"
+# And the wrapper still succeeds by drawing another name.
+both=$(env -i HOME="$HOME" PATH="$BASEPATH" bash -c '
+  eval "$(sed -n "/^_link_noclobber/,/^}/p;/^_archive_move/,/^}/p;/^name_component/,/^}/p" "$1")"
+  a=$(_archive_move "$2" consumed "T-Big" "$2/src-a.md")
+  b=$(_archive_move "$2" consumed "T-Big" "$2/src-b.md")
+  [ "$a" != "$b" ] && echo DISTINCT
+  cat "$a" "$b"' _ "$CL" "$AR")
+contains "two archives of the same name land in different files" "$both" "DISTINCT"
+contains "…with the first still intact"  "$both" "PRECIOUS"
+contains "…and the second too"           "$both" "SECOND"
 
 echo "rollback never overwrites a newer handoff"
 # While a claim is out, the old session can publish a NEWER handoff at the now
@@ -958,9 +976,12 @@ NW="$FIX/newer-wins"; mkdir -p "$NW/consumed"
 printf 'OLDER\n\n<!-- cl:clho:6:6:6:6 -->\n' > "$NW/claimed.md"
 printf 'NEWER\n\n<!-- cl:clho:7:7:7:7 -->\n' > "$NW/T-Big.md"
 rb2=$(env -i HOME="$HOME" PATH="$NOTMUX_PATH" CL_HANDOFF_DIR="$NW" bash -c '
-  eval "$(sed -n "/^rollback_claim/,/^}/p;/^handoff_path/,/^}/p;/^name_component/,/^}/p" "$1")"
+  # _link_noclobber too: rollback_claim delegates the atomic move to it, and an
+  # extraction missing it would fail with "command not found" rather than test
+  # the guard.
+  eval "$(sed -n "/^_link_noclobber/,/^}/p;/^rollback_claim/,/^}/p;/^handoff_path/,/^}/p;/^name_component/,/^}/p" "$1")"
   CL_HANDOFF_DIR="$2" rollback_claim "$2" "T-Big" "$2/claimed.md"' _ "$CL" "$NW" 2>&1)
-contains "it declines, saying a newer one exists" "$rb2" "newer one has been written"
+contains "it declines, saying a newer one exists" "$rb2" "newer one is already there"
 contains "…and the newer handoff is untouched"   "$(cat "$NW/T-Big.md" 2>/dev/null)" "NEWER"
 check "…while the older claim stays filed"       "1" "$([ -f "$NW/claimed.md" ] && echo 1 || echo 0)"
 
@@ -1017,6 +1038,51 @@ check "the row still records resume-only" "1" \
   "$(jq -r '.[]|select(.name=="SkipHard")|.resume_only' "$STATEDIR/state.json" 2>/dev/null | grep -c true)"
 rtmux kill-session -t SkipHard >/dev/null 2>&1 || true
 rm -f "$HOME/.claude/projects/p1/sid-skiphard.jsonl"
+
+
+echo "a rotation into a directory that has gone refuses, rather than relocating"
+# The docs said a vanished cwd rolls the handoff back. The code substituted $HOME
+# for it FIRST and then preflighted the substitute — so a project directory that
+# disappeared between state capture and launch started the replacement in $HOME,
+# pointing it at the wrong repository while handing it a handoff about a different
+# one. A plain launch may still fall back; a rotation must not.
+GONE="$FIX/gone-store"; mkdir -p "$GONE"
+printf 'work\n\n<!-- cl:clho:5:5:5:5 -->\n' > "$GONE/T-Gone.md"
+mkdir -p "$FIX/vanishing"
+printf '{"cwd":"%s"}\n{"customTitle":"T-Gone"}\n' "$FIX/vanishing" > "$HOME/.claude/projects/p1/sid-gone.jsonl"
+rmdir "$FIX/vanishing"
+gone_out=$(env -i HOME="$HOME" PATH="$NOTMUX_PATH" CL_HANDOFF_DIR="$GONE" \
+  CL_HANDOFF_FALLBACK_BASE="$FIX/gone-fb" CL_AGENT_REC="$FIX/gone-argv" \
+  bash "$CL" "T-Gone" --rotate-from "$GONE/T-Gone.md" 2>&1)
+contains "it says the directory is gone" "$gone_out" "no longer exists"
+not_contains "…and does not claim to have started anything" "$gone_out" "consumed handoff"
+check "…the handoff is back at its active path, not spent" "1" \
+  "$([ -f "$GONE/T-Gone.md" ] && echo 1 || echo 0)"
+check "…and nothing was filed as consumed" "0" "$(ls "$GONE/consumed" 2>/dev/null | grep -c .)"
+rm -f "$HOME/.claude/projects/p1/sid-gone.jsonl"
+
+echo "a rotation does not attach to an existing tmux session and call it a launch"
+# `new-session -A` attaches to a same-named session and returns SUCCESS without
+# running the fresh-agent command, so committing the claim before that answered
+# spent the handoff on a replacement that never started. Creation and attachment
+# have to be distinguishable.
+rtmux new-session -d -s "T-Occupied" -c "$FIX" 'sleep 30'
+printf '{"cwd":"%s"}\n{"customTitle":"T-Occupied"}\n' "$FIX" > "$HOME/.claude/projects/p1/sid-occ.jsonl"
+OCC="$FIX/occupied-store"; mkdir -p "$OCC"
+printf 'work\n\n<!-- cl:clho:8:8:8:8 -->\n' > "$OCC/T-Occupied.md"
+# $NOTMUX first, for the stand-in agent, then $BASEPATH for real tmux. Without a
+# runnable agent the preflight refuses earlier and the tmux guard is never
+# reached — the assertion would pass for the wrong reason.
+occ_out=$(env -i HOME="$HOME" PATH="$NOTMUX:$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
+  CL_HANDOFF_DIR="$OCC" CL_HANDOFF_FALLBACK_BASE="$FIX/occ-fb" \
+  CL_AGENT_REC="$FIX/occ-argv" \
+  bash "$CL" "T-Occupied" --rotate-from "$OCC/T-Occupied.md" 2>&1)
+contains "an occupied tmux name is refused, not attached to" "$occ_out" "already exists"
+check "…the handoff is back at its active path" "1" \
+  "$([ -f "$OCC/T-Occupied.md" ] && echo 1 || echo 0)"
+check "…and nothing was filed as consumed" "0" "$(ls "$OCC/consumed" 2>/dev/null | grep -c .)"
+rtmux kill-session -t "T-Occupied" >/dev/null 2>&1 || true
+rm -f "$HOME/.claude/projects/p1/sid-occ.jsonl"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

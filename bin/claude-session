@@ -291,17 +291,47 @@ handoff_is_manual()   { case "$(handoff_marker "$1" 2>/dev/null)" in manual:?*) 
 # it failed to clear: the file would still be sitting there next time and the
 # session would rotate again, forever, off an ever-staler file. Declining to
 # rotate degrades to a plain resume, which loses nothing.
-# _archive_dest <root> <subdir> <name>: a destination unique BY CONSTRUCTION.
+# _link_noclobber <src> <dest>: move src to dest, atomically REFUSING if dest
+# already exists.
 #
-# A check-then-move ("pick a name that does not exist, then mv to it") is not
-# collision-safe: two writers in the same second can both see the same absent
-# name and the second mv silently overwrites the first. Including the pid and
-# two random draws removes the check entirely — there is nothing to race.
-_archive_dest() {
-  local stamp
+# `mv` cannot express this. `mv -n` and `[ -e "$dest" ] && mv` are both
+# check-then-rename: another writer can create dest between the two steps, and
+# the rename then overwrites it. `ln` fails outright when the target exists, in
+# ONE operation — the check IS the move — so there is no window.
+#
+# Same-filesystem only, which holds: every path here is under the same store.
+#   0  moved
+#   1  dest already existed (nothing changed)
+#   2  linked but the source could not be removed, so both now exist
+_link_noclobber() {
+  ln "$1" "$2" 2>/dev/null || return 1
+  rm -f "$1" 2>/dev/null || return 2
+  return 0
+}
+
+# _archive_move <root> <subdir> <name> <src>: move src into <root>/<subdir>
+# under a unique name, printing where it went.
+#
+# Uniqueness comes from a successful atomic creation, not from hoping two
+# timestamps-plus-randoms never coincide. The previous version composed a name
+# from time, pid and two $RANDOM draws and called that "unique by construction";
+# it is not — $RANDOM is finite, pids are reused, and the subsequent `mv` would
+# overwrite. Drawing again on collision is what actually guarantees it.
+_archive_move() {
+  local root="$1" subdir="$2" name="$3" src="$4" base stamp cand tries=0 rc
+  mkdir -p "$root/$subdir" 2>/dev/null || return 2
+  base=$(name_component "$name")
   stamp=$(date +%Y%m%d-%H%M%S 2>/dev/null || echo unknown)
-  printf '%s/%s/%s-%s-%s%s%s.md' "$1" "$2" "$(name_component "$3")" \
-    "$stamp" "$$" "$RANDOM" "$RANDOM"
+  while [ "$tries" -lt 50 ]; do
+    cand="$root/$subdir/$base-$stamp-$$$RANDOM$RANDOM.md"
+    _link_noclobber "$src" "$cand"; rc=$?
+    case "$rc" in
+      0) printf '%s' "$cand"; return 0 ;;
+      1) tries=$((tries+1)); continue ;;   # taken: draw another
+      *) return 2 ;;
+    esac
+  done
+  return 2
 }
 
 # quarantine_handoff <root> <name>: move an INCOMPLETE handoff out of the way.
@@ -313,8 +343,7 @@ quarantine_handoff() {
   hp=$(handoff_path "$root" "$name")
   [ -f "$hp" ] || return 1
   [ -n "$why" ] || why='INCOMPLETE (no completion marker on its last line) — most likely written straight to the file and cut off by the kill'
-  dest=$(_archive_dest "$root" "$INCOMPLETE_SUBDIR" "$name")
-  if mkdir -p "$root/$INCOMPLETE_SUBDIR" 2>/dev/null && mv "$hp" "$dest" 2>/dev/null; then
+  if dest=$(_archive_move "$root" "$INCOMPLETE_SUBDIR" "$name" "$hp"); then
     printf '⚠ the handoff for "%s" is %s.\n' "$name" "$why" >&2
     printf '   Not rotating from it; resuming the session as it was. Moved to %s\n' "$dest" >&2
     return 0
@@ -327,8 +356,7 @@ consume_handoff() {
   local root="$1" name="$2" reason="${3:-}" hp dest
   hp=$(handoff_path "$root" "$name")
   [ -f "$hp" ] || return 1
-  dest=$(_archive_dest "$root" "$CONSUMED_SUBDIR" "$name")
-  if mkdir -p "$root/$CONSUMED_SUBDIR" 2>/dev/null && mv "$hp" "$dest" 2>/dev/null; then
+  if dest=$(_archive_move "$root" "$CONSUMED_SUBDIR" "$name" "$hp"); then
     printf 'ℹ consumed handoff for "%s"%s → %s\n' "$name" "${reason:+ ($reason)}" "$dest" >&2
     printf '%s\n' "$dest"
     return 0
@@ -382,8 +410,7 @@ claim_handoff() {
       "from a DIFFERENT session ($got_sid, not $want_sid) — a previous occupant of this name" >/dev/null
     return 1
   fi
-  dest=$(_archive_dest "$root" "$CONSUMED_SUBDIR" "$name")
-  if mkdir -p "$root/$CONSUMED_SUBDIR" 2>/dev/null && mv "$hp" "$dest" 2>/dev/null; then
+  if dest=$(_archive_move "$root" "$CONSUMED_SUBDIR" "$name" "$hp"); then
     printf '%s' "$dest"; return 0
   fi
   printf '⚠ could not claim the handoff for "%s" (%s) — not rotating it; resuming as-is\n' "$name" "$hp" >&2
@@ -407,15 +434,20 @@ commit_claim() {
 # claim back on top of it would silently destroy the more recent answer. In
 # that case the claim stays filed and says so.
 rollback_claim() {
-  local root="$1" name="$2" claim="$3" hp
+  local root="$1" name="$2" claim="$3" hp rc
   [ -f "$claim" ] || return 1
   hp=$(handoff_path "$root" "$name")
-  if [ -e "$hp" ]; then
-    printf 'ℹ not restoring the handoff for "%s": a newer one has been written since. The older one stays filed at %s\n' \
+  # ATOMIC, not check-then-move. Testing `[ -e "$hp" ]` and then `mv` leaves a
+  # window in which the old session (or `cl handoff`) publishes a newer handoff
+  # at the now-free path and the restore overwrites it — destroying the more
+  # recent answer, which is the whole thing this guard exists to prevent.
+  _link_noclobber "$claim" "$hp"; rc=$?
+  if [ "$rc" -eq 1 ]; then
+    printf 'ℹ not restoring the handoff for "%s": a newer one is already there. The older one stays filed at %s\n' \
       "$name" "$claim" >&2
     return 0
   fi
-  if mv "$claim" "$hp" 2>/dev/null; then
+  if [ "$rc" -eq 0 ]; then
     printf 'ℹ put the handoff for "%s" back — nothing was started, so nothing is spent\n' "$name" >&2
     return 0
   fi
@@ -1287,7 +1319,19 @@ launch_named() { # name cwd [agent]
 # close that without the replacement acknowledging back.
 launch_fresh() {
   local name="$1" cwd="$2" prompt="$3" root="${4:-}" claim="${5:-}" t cmd
-  [ -d "$cwd" ] || cwd="$HOME"
+  # A ROTATION must not silently relocate. Substituting $HOME for a missing cwd
+  # and then "preflighting" the substitute is how the docs came to promise that a
+  # vanished directory rolls back while the code started the replacement in $HOME
+  # — pointing it at the wrong repository with a handoff about a different one.
+  # A plain launch may still fall back; a rotation refuses.
+  if [ ! -d "$cwd" ]; then
+    if [ -n "$claim" ]; then
+      rollback_claim "$root" "$name" "$claim"
+      echo "claude-session: \"$name\" was rotating in $cwd, which no longer exists — not starting fresh somewhere else" >&2
+      exit 1
+    fi
+    cwd="$HOME"
+  fi
   cmd=$(fresh_cmd "$name" "$prompt")
   export CL_SESSION_NAME="$name"
   # Preflight what is knowable BEFORE the handoff is treated as spent.
@@ -1310,8 +1354,19 @@ launch_fresh() {
   in_iterm && tag_iterm_session "$t"
   if use_tmux; then
     tmux_setup
+    # CREATE, then attach — not `new-session -A`, which attaches to an existing
+    # session of the same name and returns success WITHOUT running the fresh-agent
+    # command. Committing before that answered meant a race-window collision, or
+    # an outright failure, spent the handoff on a replacement that never started.
+    # `new-session -d` fails if the name is taken, so its status distinguishes
+    # "created" from "was already there".
+    if ! tmux new-session -d -s "$t" -c "$cwd" "$(env_prefix "$name")$cmd" 2>/dev/null; then
+      [ -n "$claim" ] && rollback_claim "$root" "$name" "$claim"
+      echo "claude-session: a tmux session named \"$t\" already exists — not starting fresh over it" >&2
+      exit 1
+    fi
     [ -n "$claim" ] && commit_claim "$root" "$name" "$claim" "rotating now"
-    exec tmux new-session -A -s "$t" -c "$cwd" "$(env_prefix "$name")$cmd"
+    exec tmux attach-session -t "=${t}"
   else
     # acquire_launch is the real gate on this path — it is what refuses a
     # second agent on one name. Commit only AFTER it grants ownership, and put
@@ -2717,7 +2772,21 @@ case "${1:-}" in
       [ -n "$rotate_from" ] || { echo "claude-session: --rotate-from needs a path" >&2; exit 1; }
       rrow=$(discover | awk -F'\t' -v n="$1" '$1==n && $5=="claude" {print; exit}')
       rcwd=$(printf '%s' "$rrow" | cut -f3); rsid=$(printf '%s' "$rrow" | cut -f2)
-      [ -d "$rcwd" ] || rcwd="$HOME"
+      # REFUSE rather than relocate, and refuse BEFORE claiming. Substituting
+      # $HOME here is what made the guard inside launch_fresh unreachable: by the
+      # time it ran, the missing directory had already become $HOME, so a
+      # rotation whose project directory had gone started the replacement in the
+      # home directory and handed it a handoff about a different repository.
+      #
+      # An empty rcwd means the session was not discovered at all — `discover`
+      # drops rows whose cwd no longer exists — which is the same situation and
+      # must fail the same way.
+      if [ -z "$rcwd" ] || [ ! -d "$rcwd" ]; then
+        echo "claude-session: \"$1\" cannot be rotated: its directory ${rcwd:-(unknown)} no longer exists." >&2
+        echo "  Not starting a replacement somewhere else — its handoff is about work in that directory." >&2
+        echo "  The handoff is untouched; resume the session directly, or fix the path and retry." >&2
+        exit 1
+      fi
       if ! handoff_root >/dev/null; then
         echo "claude-session: no usable handoff store — resuming \"$1\" instead of rotating" >&2
         exec "$0" "$1"
