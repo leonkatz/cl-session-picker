@@ -150,7 +150,12 @@ that finds the session live and skips it keeps the row as well. So the row would
 outlive the session forever and `cl start` would eventually reopen one the user
 had deliberately closed. Instead the child acknowledges its own row once it owns
 the name (`ack_state_row`), under the same symlink claim lock as the launch
-registry, keyed by agent *and* name. Every failure leaves the row: a duplicate
+registry, keyed by agent, name *and thread id*. The thread is not decoration:
+`cl start` may write a bare `cl "<name>"` into a tab while the saved row names
+one thread, a newer same-named thread can win discovery before that tab runs, and
+acknowledging by name alone would then delete the older row — a restart row
+destroyed for a session nobody started. Given no thread id it acknowledges
+nothing, since it cannot tell the generations apart. Every failure leaves the row: a duplicate
 tab costs a keystroke, a wrongly deleted row costs a session.
 
 ### Which way a session comes back is recorded, not inferred

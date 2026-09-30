@@ -325,9 +325,12 @@ it launched with; only a fresh launch upgrades).
     the same proof, and the same moment, that lets it claim the handoff. A row
     whose launch was refused, or that looked live and was skipped, stays in
     `state.json` until then, so the next `cl start` picks it up and you do not
-    have to know to run `cl restore`. The acknowledgement is keyed by agent and
-    name and fails closed: if it cannot be written the row simply stays, because
-    a duplicate tab is cheap and a dropped session is not.
+    have to know to run `cl restore`. The acknowledgement is keyed by agent,
+    name **and thread id** — a name is not unique over time, so matching without
+    the thread could clear the row of a *different* session that happens to share
+    the name, one nobody started. With no thread id it acknowledges nothing at
+    all. It fails closed throughout: if it cannot be written the row simply
+    stays, because a duplicate tab is cheap and a dropped session is not.
   Then attach with `tmux attach` (or `tmux -CC attach` in iTerm for native tabs).
 - **`cl handoff`** — run *inside* a session to write its handoff by hand; the
   way out when a pane can't be reached. Pipe the text in (`cl handoff < notes.md`)

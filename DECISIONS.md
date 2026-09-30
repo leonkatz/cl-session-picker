@@ -36,12 +36,24 @@ locking style.
 
 **Failure direction is fixed:** every way the acknowledgement can fail leaves the
 row. A stale row costs one duplicate tab on the next start; deleting the wrong
-row costs a session. The match is keyed by agent *and* name, because a name held
-by both agents is ordinary here.
+row costs a session.
+
+**The match is keyed by agent, name AND thread id — all three.** Agent matters
+because a name held by both agents is ordinary here. The thread id matters
+because a name is not unique *over time*, and two fields were demonstrably
+unsafe: `cl start` writes a bare `cl "<name>"` into a tab while the saved row
+names one thread, a newer same-named thread can win discovery before the tab
+runs, and the tab would then launch the new one and delete the old one's restart
+row — a row destroyed for a session nobody started, which is exactly the
+direction this design exists to avoid. Given no thread id, nothing is
+acknowledged. This is the same generation problem the launch registry already
+solved for ownership; it was reopened here and closed in review on 2026-09-29.
+**Do not simplify this back to agent and name.**
 
 **Would reverse it:** `cl start` gaining a way to observe a delegated launch
 directly — then the parent could consume rows itself and the child would not need
-to write shared state at all.
+to write shared state at all. That would not license dropping the thread id from
+any acknowledgement that remained.
 
 ## 2026-09-15 — stop/start manage the Codex sessions cl launched, and only those
 
