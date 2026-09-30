@@ -424,6 +424,21 @@ cl --codex Shared >/dev/null 2>&1
 check "acknowledging codex leaves the same-named claude row" "claude" \
   "$(jq -r '.[].agent' "$STATE" 2>/dev/null | tr '\n' ' ' | sed 's/ $//')"
 pkill -f "codex resume $SID_SHARED" 2>/dev/null
+# Step 5: the acknowledgement is keyed by THREAD as well, and that is a race
+# rather than a nicety. `cl start` writes a bare `cl --codex <name>` into a tab
+# while the saved row names one thread; a newer same-named thread can win
+# discovery before that tab runs, so the tab launches the NEW one. Deleting the
+# old row then would destroy a restart row for a session nobody started — the
+# unsafe direction this code exists to avoid. The row must survive.
+rm -f "$PIDDIR"/* "$STATE"
+printf '[{"name":"Mine","sid":"%s","cwd":"%s","agent":"codex"}]\n' \
+  01dddddd-0000-7000-8000-0000000000dd "$FIX/work" > "$STATE"
+cl --codex Mine >/dev/null 2>&1
+check "a launch of a different generation leaves the old row" "1" \
+  "$(jq '[.[] | select(.name=="Mine")] | length' "$STATE" 2>/dev/null)"
+check "…and it is still the generation that was saved" "01dddddd-0000-7000-8000-0000000000dd" \
+  "$(jq -r '.[] | select(.name=="Mine") | .sid' "$STATE" 2>/dev/null)"
+pkill -f "codex resume $SID_MINE" 2>/dev/null
 
 printf 'a start that fails keeps its row, and a filter failure keeps the file\n'
 # Two ways a restart list was lost: a row whose create FAILED was consumed as

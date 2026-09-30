@@ -1449,8 +1449,8 @@ acquire_launch() {
   return 0
 }
 
-# ack_state_row <name> [agent]: remove this session's row from STATE, as the
-# ACKNOWLEDGEMENT that a launch really happened.
+# ack_state_row <name> <agent> <sid>: remove this session's row from STATE, as
+# the ACKNOWLEDGEMENT that a launch really happened.
 #
 # ── WHY THE CHILD DOES THIS AND NOT `cl start` ───────────────────────────────
 #
@@ -1486,17 +1486,23 @@ acquire_launch() {
 # Every failure leaves the row in place. A stale row costs one duplicate tab on
 # the next start; deleting the wrong row costs a session.
 ack_state_row() {
-  local name="$1" agent="${2:-claude}" lock tries=0 envfail=0 holder hpid hstart tmp
+  local name="$1" agent="${2:-claude}" sid="${3:-}" lock mine tries=0 envfail=0 holder hpid hstart tmp
   # Nothing to acknowledge: no snapshot, or no jq to rewrite it with. Neither is
   # an error — a launch outside a stop/start cycle has no row at all.
   [ -f "$STATE" ] || return 0
   command -v jq >/dev/null 2>&1 || return 0
+  # Without a thread id this cannot tell one GENERATION of a name from another,
+  # and names are not unique over time. The row it would delete might belong to a
+  # session that was never started, so it deletes nothing. (Codex review,
+  # 2026-09-29 — see the sid qualification below.)
+  case "$sid" in ''|'-') return 0 ;; esac
   lock="${STATE}.acklock"
+  mine=$(claim_token)
   if [ -e "$lock" ] && [ ! -L "$lock" ]; then
     printf 'claude-session: %s exists and is not a claim lock — remove it; until then "%s" stays in the restart list\n' "$lock" "$name" >&2
     return 1
   fi
-  while ! ln -s "$(claim_token)" "$lock" 2>/dev/null; do
+  while ! ln -s "$mine" "$lock" 2>/dev/null; do
     holder=$(readlink "$lock" 2>/dev/null)
     if [ -z "$holder" ]; then
       # Either it vanished between the attempt and the read (retry), or links
@@ -1533,8 +1539,15 @@ ack_state_row() {
   done
 
   tmp="$STATE.ack.$$"
-  if jq --arg n "$name" --arg a "$agent" \
-       '[ .[] | select( ((.agent // "claude") == $a and .name == $n) | not ) ]' \
+  # Matched on agent AND name AND sid. Agent qualification alone stops a
+  # cross-AGENT deletion but not a cross-GENERATION one, and that is a real race
+  # rather than a tidiness point: `cl start` may write `cl "<name>"` into a tab
+  # while the saved row names sid-old, a newer same-named thread can win
+  # discovery before the tab runs, and the tab would then launch sid-new and
+  # delete sid-old's row — a restart row destroyed for a session nobody started.
+  # Requiring the sid makes that case a no-op, leaving the old row recoverable.
+  if jq --arg n "$name" --arg a "$agent" --arg s "$sid" \
+       '[ .[] | select( ((.agent // "claude") == $a and .name == $n and .sid == $s) | not ) ]' \
        "$STATE" > "$tmp" 2>/dev/null; then
     # An empty array is a consumed snapshot, not an empty list to keep: `cl
     # start` treats a missing STATE as "nothing to restore" and a present one as
@@ -1548,7 +1561,11 @@ ack_state_row() {
     rm -f "$tmp" 2>/dev/null
     printf 'claude-session: could not acknowledge "%s" in %s — it stays in the restart list, so a later cl start may open it again\n' "$name" "$STATE" >&2
   fi
-  rm -f "$lock" 2>/dev/null
+  # Unlink only a lock that still names THIS owner. An unconditional rm would
+  # delete a successor's lock if ours had been cleared or replaced meanwhile,
+  # letting two acknowledgements into the critical section at once — the same
+  # rule models_unlock follows.
+  [ "$(readlink "$lock" 2>/dev/null)" = "$mine" ] && rm -f "$lock" 2>/dev/null
   return 0
 }
 
@@ -1632,6 +1649,20 @@ tmux_start_and_attach() { # t cwd cmd agent [sid] [display-name]
   fi
   tmux_claim "$t" "$agent" "$sid"
   commit_pending_model "$agent" "${6:-}"
+  # `new-session -d` succeeding IS the proof this arm exists to establish, so a
+  # restart row outstanding for this session is acknowledged here too.
+  #
+  # This matters for a mode transition, not just for tidiness: `cl start` may run
+  # without tmux — delegating each launch to a tab and RETAINING the row, because
+  # it cannot see acceptance — while the new interactive tab sources a shell
+  # config that sets CL_TMUX=1 and so takes this path instead. The child then has
+  # the proof the parent lacked, and without this call the row would never be
+  # cleared, which is the permanent-desired-state bug all over again for that
+  # combination. (Codex review, 2026-09-29.)
+  #
+  # An ordinary launch has no matching row and the pre-created `cl start` path
+  # has already consumed its own, so this is a no-op in both.
+  [ -n "${6:-}" ] && ack_state_row "${6}" "$agent" "$sid"
   exec tmux attach-session -t "=${t}"
 }
 
@@ -1789,8 +1820,10 @@ launch_session() { # name sid cwd [agent]
       exit 1   # acquire_launch already said exactly what went wrong
     fi
     # Ownership granted, so this launch is real: acknowledge the restart row
-    # before exec, which is the last moment any code here runs.
-    ack_state_row "$name" "$agent"
+    # before exec, which is the last moment any code here runs. The sid is the
+    # one actually being resumed, so a row for a different generation of this
+    # name is left alone.
+    ack_state_row "$name" "$agent" "$sid"
     drop_cmux_env; cd "$cwd" || exit 1; eval "exec $cmd"
   fi
 }
@@ -1916,7 +1949,12 @@ launch_named() { # name cwd [agent]
 # fails after all of that still spends it, and no amount of checking here can
 # close that without the replacement acknowledging back.
 launch_fresh() {
-  local name="$1" cwd="$2" prompt="$3" root="${4:-}" claim="${5:-}" t cmd
+  # old_sid (arg 6) is the RETIRING session's thread id — the one whose restart
+  # row this launch replaces. A rotation starts a new transcript, so there is no
+  # new sid to acknowledge with; the row being consumed is the old session's, and
+  # naming it explicitly is what keeps a rotation from deleting the row of a
+  # different generation of the same name.
+  local name="$1" cwd="$2" prompt="$3" root="${4:-}" claim="${5:-}" old_sid="${6:-}" t cmd
   # A ROTATION must not silently relocate. Substituting $HOME for a missing cwd
   # and then "preflighting" the substitute is how the docs came to promise that a
   # vanished directory rolls back while the code started the replacement in $HOME
@@ -1982,7 +2020,7 @@ launch_fresh() {
     [ -n "$claim" ] && commit_claim "$root" "$name" "$claim" "rotating now"
     # Same instant as the claim commit: the handoff and the restart row are two
     # records of one launch, so they are acknowledged on the same proof.
-    ack_state_row "$name" claude
+    ack_state_row "$name" claude "$old_sid"
     drop_cmux_env; eval "exec $cmd"
   fi
 }
@@ -3328,7 +3366,7 @@ EOF
   # where "about to exec" is still not "running".
   local prompt
   prompt=$(build_resume_prompt "$claim")
-  launch_fresh "$name" "$cwd" "$prompt" "$root" "$claim"
+  launch_fresh "$name" "$cwd" "$prompt" "$root" "$claim" "$sid"
 }
 
 # do_handoff [--path] [name]: write this session's handoff BY HAND, from
@@ -3598,7 +3636,7 @@ case "${1:-}" in
       # old transcript, and a recovery pointer written for a rotation that
       # never happened would be a lie.
       [ -n "$rsid" ] && record_fresh_history "$1" "$rsid" "$rcwd"
-      launch_fresh "$1" "$rcwd" "$(build_resume_prompt "$rclaim")" "$rroot" "$rclaim"
+      launch_fresh "$1" "$rcwd" "$(build_resume_prompt "$rclaim")" "$rroot" "$rclaim" "$rsid"
       exit 0
     fi
     # direct launch by name. A name held by BOTH agents is refused unless
