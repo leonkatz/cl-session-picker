@@ -143,6 +143,18 @@ has "a flag also outranks CL_ROTATE" "$out" "rotation off"
 out=$(CL_ROTATE=banana cl stop --dry-run 2>&1)
 has "an unparseable CL_ROTATE is reported" "$out" "ignoring CL_ROTATE"
 has "…and the stored value is used instead" "$out" "rotation on"
+check "…and it is reported exactly once, not per session" "1" \
+  "$(printf '%s' "$out" | grep -c 'ignoring CL_ROTATE')"
+# Behaviour right, record wrong is still wrong: an ignored value must not be
+# logged as the layer that decided, or the provenance in a measurement week lies.
+rm -f "$LOG"
+CL_ROTATE=banana cl stop --keep-tabs >/dev/null 2>&1
+check "an ignored CL_ROTATE is not recorded as the source" "default" \
+  "$(awk -F'\t' 'NR==2{print $3}' "$LOG")"
+rm -f "$LOG"
+CL_ROTATE=0 cl stop --keep-tabs >/dev/null 2>&1
+check "…while a valid one is" "env" "$(awk -F'\t' 'NR==2{print $3}' "$LOG")"
+rm -f "$LOG"
 
 printf 'rotation off means the handoff is never REQUESTED\n'
 # Half the measurement: the request is itself a model call per session, so an
@@ -152,7 +164,7 @@ out=$(cl stop --dry-run 2>&1)
 hasnt "no handoff is requested when off" "$out" "asked"
 cl rotate on >/dev/null
 out=$(cl stop --dry-run 2>&1)
-has "…and one is when on" "$out" 'would ask "Alpha" to write handoff' 
+has "…and one is when on" "$out" 'would ask "Alpha" to write handoff'
 
 printf 'the log records a stop, including an off one\n'
 rm -f "$LOG"
@@ -183,6 +195,29 @@ check "mode is mixed when sessions disagreed" "mixed" "$(awk -F'\t' 'NR==2{print
 check "…and the source says so too" "mixed" "$(awk -F'\t' 'NR==2{print $3}' "$LOG")"
 cl rotate clear Alpha >/dev/null
 
+printf 'an override is recorded even when it agrees with the default\n'
+# The defect this catches: source used to be folded into the MODE comparison, so
+# with the default on and one session explicitly on, every effective mode was
+# "on" and the row recorded whichever source came first in discovery order. A week
+# containing a deliberate override then read as a clean A/B sample.
+for who in Alpha Beta; do
+  rm -f "$LOG"; cl rotate on >/dev/null; cl rotate on "$who" >/dev/null
+  cl stop --keep-tabs >/dev/null 2>&1
+  check "same-mode override on $who is still flagged" "mixed" "$(awk -F'\t' 'NR==2{print $3}' "$LOG")"
+  check "…with the mode itself still plain on" "on" "$(awk -F'\t' 'NR==2{print $2}' "$LOG")"
+  out=$(cl rotate stats)
+  check "…and stats does not call that week clean" "yes" \
+    "$(printf '%s' "$out" | awk 'NR==2{print $6}')"
+  cl rotate clear "$who" >/dev/null
+done
+# All sessions overridden to the same value is also not a clean sample.
+rm -f "$LOG"; cl rotate on Alpha >/dev/null; cl rotate on Beta >/dev/null
+cl stop --keep-tabs >/dev/null 2>&1
+check "every session overridden is flagged too" "session" "$(awk -F'\t' 'NR==2{print $3}' "$LOG")"
+check "…and stats flags that week" "yes" "$(cl rotate stats | awk 'NR==2{print $6}')"
+cl rotate clear Alpha >/dev/null; cl rotate clear Beta >/dev/null
+rm -f "$LOG"
+
 printf 'an unwritable log never blocks a stop\n'
 # A measurement must not be able to stop you shutting down. This is the one
 # failure in the feature whose direction is not negotiable.
@@ -198,28 +233,46 @@ chmod 644 "$LOG" 2>/dev/null; rm -f "$LOG"
 printf 'stats group by the Monday a week starts on\n'
 # The regression that matters: a Mon-Fri run must be ONE row. Day-of-year
 # arithmetic split it in two, mixing the arms of the comparison.
-printf 'timestamp\tmode\tsource\tsessions\thandoffs\tresume_only\tkept\tctx_total\tctx_median\n' > "$LOG"
-for d in 2026-09-28 2026-09-29 2026-09-30 2026-10-01 2026-10-02; do
-  printf '%sT09:00:00Z\ton\tdefault\t6\t6\t0\t0\t372000\t62000\n' "$d" >> "$LOG"
-done
-for d in 2026-10-05 2026-10-09; do
-  printf '%sT09:00:00Z\toff\tdefault\t6\t0\t6\t0\t1086000\t181000\n' "$d" >> "$LOG"
-done
-printf '2026-10-12T09:00:00Z\tmixed\tsession\t6\t3\t3\t0\t720000\t120000\n' >> "$LOG"
+# ctx_all carries every session's context, so the weekly figure can be a real
+# median. The rows below use UNEQUAL stop medians and UNEQUAL session counts on
+# purpose: with identical ones a median and an average of per-stop medians give
+# the same answer, which is why the first version of this test could not tell
+# that the code computed the latter while the header claimed the former.
+printf 'timestamp\tmode\tsource\tsessions\thandoffs\tresume_only\tkept\tctx_total\tctx_median\tctx_all\n' > "$LOG"
+# Week of Mon 2026-09-28. Sessions across the week: 10k,20k,30k (one stop) and
+# 1000k (a single-session stop). Sorted: 10,20,30,1000 -> lower median 20k.
+# An average of the two stop medians would be (20k + 1000k)/2 = 510k.
+printf '2026-09-28T09:00:00Z\ton\tdefault\t3\t3\t0\t0\t60000\t20000\t10000,20000,30000\n' >> "$LOG"
+printf '2026-10-02T09:00:00Z\ton\tdefault\t1\t1\t0\t0\t1000000\t1000000\t1000000\n' >> "$LOG"
+# Week of Mon 2026-10-05, two stops either side of the week.
+printf '2026-10-05T09:00:00Z\toff\tdefault\t2\t0\t2\t0\t360000\t180000\t180000,180000\n' >> "$LOG"
+printf '2026-10-09T09:00:00Z\toff\tdefault\t2\t0\t2\t0\t364000\t182000\t182000,182000\n' >> "$LOG"
+printf '2026-10-12T09:00:00Z\tmixed\tsession\t2\t1\t1\t0\t240000\t120000\t120000,120000\n' >> "$LOG"
 out=$(cl rotate stats)
 check "the Mon-Fri run is one week, not two" "1" "$(printf '%s' "$out" | grep -c '^2026-09-28')"
-check "…with all five cycles in it" "5" "$(printf '%s' "$out" | awk '/^2026-09-28/{print $3}')"
-check "…and all thirty sessions" "30" "$(printf '%s' "$out" | awk '/^2026-09-28/{print $4}')"
+check "…with both cycles in it" "2" "$(printf '%s' "$out" | awk '/^2026-09-28/{print $3}')"
+check "…and all four sessions" "4" "$(printf '%s' "$out" | awk '/^2026-09-28/{print $4}')"
+# THE statistic assertion: 20k is the median of the week's sessions; 510k would be
+# the average of the per-stop medians. Only one of those is what the header says.
+check "the weekly figure is a median of sessions, not a mean of stop medians" "20k" \
+  "$(printf '%s' "$out" | awk '/^2026-09-28/{print $5}')"
 check "Mon and Fri of the next week group together" "2" "$(printf '%s' "$out" | awk '/^2026-10-05/{print $3}')"
-check "the rotating week reports its median context" "62k" "$(printf '%s' "$out" | awk '/^2026-09-28/{print $5}')"
-check "…and the non-rotating week its larger one" "181k" "$(printf '%s' "$out" | awk '/^2026-10-05/{print $5}')"
+check "…and that week reports its own larger median" "180k" \
+  "$(printf '%s' "$out" | awk '/^2026-10-05/{print $5}')"
 check "a week with overrides is flagged" "yes" "$(printf '%s' "$out" | awk '/^2026-10-12/{print $6}')"
 check "…and a clean week is not" "-" "$(printf '%s' "$out" | awk '/^2026-09-28/{print $6}')"
-has "stats refuses to pretend it knows cost" "$out" "context each session had grown to"
+has "stats refuses to pretend it knows cost" "$out" "not money"
+# A row from before ctx_all existed: its distribution is gone, so the week is
+# marked approximate rather than silently reconstructed.
+printf '2026-10-19T09:00:00Z\ton\tdefault\t4\t4\t0\t0\t400000\t100000\n' >> "$LOG"
+out=$(cl rotate stats)
+check "a legacy row without ctx_all is marked approximate" "~100k" \
+  "$(printf '%s' "$out" | awk '/^2026-10-19/{print $5}')"
+has "…and the legend explains the marker" "$out" "~ prefix"
 # A log containing junk must not take the report down with it.
 printf 'garbage line with no tabs\n' >> "$LOG"
 out=$(cl rotate stats 2>&1)
-check "a malformed line is skipped, not fatal" "5" "$(printf '%s' "$out" | awk '/^2026-09-28/{print $3}')"
+check "a malformed line is skipped, not fatal" "2" "$(printf '%s' "$out" | awk '/^2026-09-28/{print $3}')"
 
 printf 'the listing shows policy and pending state separately\n'
 rm -f "$LOG"; cl rotate on >/dev/null

@@ -1147,18 +1147,33 @@ rotate_source() {
   printf 'default'
 }
 
+# rotate_env_value -> on | off | (nothing)
+#
+# The environment layer, validated in ONE place. It has to be separable from
+# rotate_effective because the stop path needs to know whether the environment
+# actually decided: an unparseable CL_ROTATE changes nothing, so recording it as
+# the deciding layer would put a false provenance in the measurement log —
+# behaviour right, record wrong. (Codex review, 2026-10-01.)
+#
+# Silent by design; do_stop warns once per invocation rather than once per
+# session, which is why the complaint does not live here.
+rotate_env_value() {
+  case "${CL_ROTATE:-}" in
+    0|off|no) printf 'off' ;;
+    1|on|yes) printf 'on' ;;
+  esac
+  return 0
+}
+rotate_env_valid() { [ -n "$(rotate_env_value)" ]; }
+
 # rotate_effective <name> <agent> -> on | off
 # Adds the environment layer, for the stop path. A stop FLAG outranks all of
 # this and is applied by do_stop itself, where the flag is in scope.
 rotate_effective() {
-  local name="$1" agent="${2:-claude}"
+  local name="$1" agent="${2:-claude}" v
   [ "$agent" = "claude" ] || { printf 'off'; return 0; }
-  case "${CL_ROTATE:-}" in
-    0|off|no)   printf 'off'; return 0 ;;
-    1|on|yes)   printf 'on';  return 0 ;;
-    '')         : ;;
-    *) printf 'claude-session: ignoring CL_ROTATE="%s" (expected 0/1, on/off) \n' "$CL_ROTATE" >&2 ;;
-  esac
+  v=$(rotate_env_value)
+  [ -n "$v" ] && { printf '%s' "$v"; return 0; }
   rotate_for "$name" "$agent"
 }
 
@@ -1197,26 +1212,33 @@ rotate_write() {
 rotation_log_append() {
   local mode="$1" source="$2" sessions="$3" handoffs="$4" ronly="$5" kept="$6"
   shift 6
-  local total=0 n=0 med=0 c sorted
+  local total=0 n=0 med=0 c sorted all=""
   for c in "$@"; do
     case "$c" in ''|*[!0-9]*) continue ;; esac
     total=$((total+c)); n=$((n+1))
   done
   if [ "$n" -gt 0 ]; then
+    sorted=$(printf '%s\n' "$@" | grep -E '^[0-9]+$' | sort -n)
     # Median, not mean: one enormous session should not make a whole week look
     # expensive. On an EVEN count this takes the lower of the two middles — with
     # two sessions either is defensible, so the choice is stated here rather than
     # left as an accident of the arithmetic.
-    sorted=$(printf '%s\n' "$@" | grep -E '^[0-9]+$' | sort -n | awk -v n="$n" 'NR==int((n+1)/2){print; exit}')
-    med="${sorted:-0}"
+    med=$(printf '%s\n' "$sorted" | awk -v n="$n" 'NR==int((n+1)/2){print; exit}')
+    med="${med:-0}"
+    # Every session's context, comma-separated, so a WEEK's median can be a real
+    # median rather than an average of per-stop medians. Those are different
+    # numbers, and the average also weights a one-session stop exactly like a
+    # ten-session one. Keeping the distribution is the only way the reported
+    # statistic can be the one named. (Codex review, 2026-10-01.)
+    all=$(printf '%s\n' "$sorted" | paste -sd, - 2>/dev/null)
   fi
   mkdir -p "$(dirname "$ROTATION_LOG")" 2>/dev/null || { _rotation_log_warn; return 0; }
   if [ ! -e "$ROTATION_LOG" ]; then
-    printf 'timestamp\tmode\tsource\tsessions\thandoffs\tresume_only\tkept\tctx_total\tctx_median\n' \
+    printf 'timestamp\tmode\tsource\tsessions\thandoffs\tresume_only\tkept\tctx_total\tctx_median\tctx_all\n' \
       >> "$ROTATION_LOG" 2>/dev/null || { _rotation_log_warn; return 0; }
   fi
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$mode" "$source" "$sessions" "$handoffs" "$ronly" "$kept" "$total" "$med" \
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$mode" "$source" "$sessions" "$handoffs" "$ronly" "$kept" "$total" "$med" "$all" \
     >> "$ROTATION_LOG" 2>/dev/null || _rotation_log_warn
   return 0
 }
@@ -1338,13 +1360,22 @@ rotate_stats() {
     }
     NR==1 && $1=="timestamp" { next }
     $1 ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]/ {
-      mode=$2; src=$3; sess=$4+0; med=$9+0
+      mode=$2; src=$3; sess=$4+0; med=$9+0; allf=$10
       split(substr($1,1,10), p, "-")
       dn = days_from_civil(p[1]+0, p[2]+0, p[3]+0)
       # 1970-01-01 was a Thursday, so (dn+3)%7 is 0 on a Monday.
       key = civil_from_days(dn - ((dn % 7) + 3) % 7)
       cycles[key]++; sessions[key]+=sess
-      if (med>0) { medsum[key]+=med; medn[key]++ }
+      # Accumulate EVERY session context for the week, so the figure printed is
+      # the median of the sessions rather than an average of per-stop medians.
+      if (allf != "") {
+        cnt = split(allf, cs, ",")
+        for (ci=1; ci<=cnt; ci++) if (cs[ci]+0 > 0) { ctx[key] = ctx[key] "," (cs[ci]+0) }
+      } else if (med > 0) {
+        # A row written before ctx_all existed. Its distribution is gone, so the
+        # week is marked approximate rather than quietly reconstructed.
+        ctx[key] = ctx[key] "," med; approx[key]="yes"
+      }
       if (src=="session" || src=="mixed") ovr[key]="yes"
       if (modes[key]=="") modes[key]=mode
       else if (modes[key]!=mode) modes[key]="mixed"
@@ -1353,14 +1384,23 @@ rotate_stats() {
       n=0; for (k in cycles) keys[n++]=k
       for (i=0;i<n;i++) for (j=i+1;j<n;j++) if (keys[i]>keys[j]) { t=keys[i];keys[i]=keys[j];keys[j]=t }
       for (i=0;i<n;i++) { k=keys[i]
-        avg = (medn[k]>0) ? int(medsum[k]/medn[k]) : 0
+        m = 0
+        if (ctx[k] != "") {
+          cn = split(substr(ctx[k],2), v, ",")
+          # insertion sort: these are per-week session counts, not a data set
+          for (a=2; a<=cn; a++) { x=v[a]+0; b=a-1; while (b>0 && v[b]+0>x) { v[b+1]=v[b]; b-- } v[b+1]=x }
+          m = v[int((cn+1)/2)] + 0
+        }
         printf "%-14s %-8s %7d %9d %11s %10s\n", k, modes[k], cycles[k], sessions[k],
-          (avg>0 ? sprintf("%dk", int(avg/1000)) : "-"), (ovr[k]=="yes" ? "yes" : "-")
+          (m>0 ? sprintf("%s%dk", (approx[k]=="yes" ? "~" : ""), int(m/1000)) : "-"),
+          (ovr[k]=="yes" ? "yes" : "-")
       }
     }' "$ROTATION_LOG"
-  printf '\nCTX MEDIAN is the context each session had grown to at stop time — the per-call\n'
-  printf 'cost rotation removes. OVERRIDES=yes means per-session settings were in play that\n'
-  printf 'week, so it is not a clean A/B sample.\n'
+  printf '\nCTX MEDIAN is the median across every session stopped that week — the context each\n'
+  printf 'had grown to, which is the per-call cost rotation removes. A ~ prefix means some\n'
+  printf 'rows predate the per-session figures and only their own medians were available.\n'
+  printf 'OVERRIDES=yes means per-session settings or a stop flag were in play that week, so\n'
+  printf 'it is not a clean A/B sample. This reports the mechanism, not money.\n'
   return 0
 }
 
@@ -3136,7 +3176,14 @@ do_stop() {
   # the stored policy can carry per-session overrides, so the mode recorded for
   # the whole stop is "mixed" when they disagreed — a week containing a mixed
   # stop is not a clean A/B sample and `cl rotate stats` says so.
-  local sess_rotate log_mode="" log_src="" n_sessions=0 n_handoffs=0 n_ronly=0 ctxs=""
+  local sess_rotate sess_src log_mode="" log_src="" n_sessions=0 n_handoffs=0 n_ronly=0 ctxs=""
+  # Validated ONCE for the whole stop, not once per session: the complaint is
+  # about the environment, not about any particular session, and repeating it per
+  # row would bury the sessions it sits between.
+  local env_rotate; env_rotate=$(rotate_env_value)
+  if [ -n "${CL_ROTATE:-}" ] && [ -z "$env_rotate" ]; then
+    printf 'claude-session: ignoring CL_ROTATE="%s" (expected 0/1, on/off, no/yes) — using the stored setting\n' "$CL_ROTATE" >&2
+  fi
   # Resolved once for the whole stop so --no-handoff can clear a stale handoff
   # without every session re-resolving the store in a subshell.
   _CL_STOP_ROOT=""
@@ -3154,20 +3201,29 @@ do_stop() {
     # everything, because it is the most explicit thing the operator can say;
     # below that, CL_ROTATE for a one-off, then the stored setting.
     if [ "$agent" != "claude" ]; then
-      sess_rotate="n/a"
+      sess_rotate="n/a"; sess_src=""
     elif [ "$no_handoff" = "1" ]; then
-      sess_rotate="off"; log_src="${log_src:-flag}"
+      sess_rotate="off"; sess_src="flag"
     elif [ "$require_handoff" = "1" ]; then
-      sess_rotate="on";  log_src="${log_src:-flag}"
+      sess_rotate="on";  sess_src="flag"
+    elif [ -n "$env_rotate" ]; then
+      sess_rotate="$env_rotate"; sess_src="env"
     else
-      sess_rotate=$(rotate_effective "$name" "$agent")
-      if [ -n "${CL_ROTATE:-}" ]; then log_src="${log_src:-env}"
-      else log_src="${log_src:-$(rotate_source "$name" "$agent")}"; fi
+      sess_rotate=$(rotate_for "$name" "$agent")
+      sess_src=$(rotate_source "$name" "$agent")
     fi
     if [ "$sess_rotate" != "n/a" ]; then
       n_sessions=$((n_sessions+1))
+      # SOURCE is tracked per session, independently of mode. Folding it into the
+      # mode comparison hid the case this exists to catch: with the default on and
+      # one session explicitly overridden to on, every effective mode is "on", so
+      # the row recorded whichever source happened to come first in discovery
+      # order — and a week containing a deliberate override was reported as a
+      # clean A/B sample. (Codex review, 2026-10-01.)
+      if [ -z "$log_src" ]; then log_src="$sess_src"
+      elif [ "$log_src" != "$sess_src" ]; then log_src="mixed"; fi
       if [ -z "$log_mode" ]; then log_mode="$sess_rotate"
-      elif [ "$log_mode" != "$sess_rotate" ]; then log_mode="mixed"; log_src="mixed"; fi
+      elif [ "$log_mode" != "$sess_rotate" ]; then log_mode="mixed"; fi
       # Read BEFORE the session is killed: afterwards the transcript stops
       # growing, but this is the figure that matters — what this session had
       # grown to, i.e. what each further call would have carried on a resume.

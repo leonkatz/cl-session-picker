@@ -409,9 +409,13 @@ its use — otherwise you would pay rotation's cost while measuring its absence.
 
 Every `cl stop` appends one line to
 `~/.config/claude-session/rotation-log.tsv`: how the stop ran, which layer
-decided, how many sessions, how many handoffs landed, and the **context sizes at
-stop time** — the per-call cost rotation removes. `cl rotate stats` groups it by
-the Monday each week starts on:
+decided, how many sessions, how many handoffs landed, and **every session's
+context size at stop time** — the per-call cost rotation removes. Keeping each
+size, rather than just a per-stop summary, is what lets the weekly figure be a
+real median across sessions instead of an average of per-stop averages (which
+would also weight a one-session stop like a ten-session one).
+
+`cl rotate stats` groups by the Monday each week starts on:
 
 ```
 WEEK FROM      MODE      CYCLES  SESSIONS  CTX MEDIAN  OVERRIDES
@@ -419,12 +423,18 @@ WEEK FROM      MODE      CYCLES  SESSIONS  CTX MEDIAN  OVERRIDES
 2026-10-05     off            5        30        181k          -
 ```
 
+`CTX MEDIAN` is the median across every session stopped that week. A `~` prefix
+means some rows predate the per-session figures, so only their own medians were
+available and the number is approximate.
+
 This reports the **mechanism, not money** — `cl` cannot see a bill. It tells you
 how much context you were carrying each way, and how much work was in each week,
 so a difference in spend can be attributed instead of guessed at. Alternate over
 several weeks rather than one each: a single week's volume varies enough to swamp
-the effect. A week where per-session overrides were active is flagged
-`OVERRIDES=yes`, because it is not a clean sample.
+the effect. A week is flagged `OVERRIDES=yes` whenever a per-session setting or a
+stop flag was in play — even if every session still ended up rotating the same
+way, because the *decision* was no longer uniform and the week is not a clean
+sample.
 
 The `HANDOFF` column in `cl` and `cl --list` shows each session's setting, with
 `↻` when a complete handoff is already waiting — so `off↻` means someone wrote

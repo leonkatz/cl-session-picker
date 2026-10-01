@@ -353,12 +353,19 @@ Resolved per session, highest first: a flag on the stop (`--no-handoff`,
 discarding would pay rotation's cost while measuring its absence.
 
 `rotation-log.tsv` gets one line per stop — mode, which layer decided, sessions,
-handoffs obtained, and the **context sizes at stop time**. That last field is the
-point. A rotate/resume count next to a bill cannot separate rotation from a busier
-week, whereas context size is the per-call multiplier rotation actually removes.
-`cl rotate stats` groups by the Monday each week starts on and marks any week
-where per-session overrides were in play, since those are not clean samples. It
-reports the mechanism and nothing about money, because the tool cannot see a bill.
+handoffs obtained, and **every session's context size at stop time**. That last
+field is the point. A rotate/resume count next to a bill cannot separate rotation
+from a busier week, whereas context size is the per-call multiplier rotation
+actually removes. Each size is kept rather than only a per-stop summary, so a
+week's figure can be a true median across sessions: an average of per-stop
+medians is a different number, and weights a one-session stop like a ten-session
+one.
+
+`cl rotate stats` groups by the Monday each week starts on, and marks a week
+whenever a per-session override or a stop flag was in play — even if every
+session still rotated the same way, because the decision was no longer uniform.
+It reports the mechanism and nothing about money, because the tool cannot see a
+bill.
 
 Codex threads are `n/a` rather than `off`: a handoff is a Claude session
 summarising itself, so there is no mechanism there to enable. `cl stop` never asks

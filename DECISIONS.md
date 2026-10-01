@@ -8,8 +8,8 @@ is a deliberate reversal, not an accident.
 
 **Chose:** a global default plus optional per-session overrides
 (`rotate.json`), resolved as **flag > `CL_ROTATE` > stored > on**, and one
-appended line per `cl stop` in `rotation-log.tsv` carrying the **context sizes at
-stop time**.
+appended line per `cl stop` in `rotation-log.tsv` carrying **every stopped
+session's context size**.
 
 Why a toggle at all: rotation is a trade, not a free win. It spends one handoff
 request per session per stop — a real call — to make every later call carry a
@@ -26,6 +26,20 @@ bill cannot distinguish rotation from a busier week. Context size is the actual
 mechanism — the per-call multiplier rotation reduces — so it is what makes a
 spend difference attributable. `context_size` already existed for the `cl --list`
 hint; this reuses it rather than inventing a second measure.
+
+**And it records EVERY session's size, not a per-stop summary.** The first version
+stored one median per stop and then averaged those, under a heading that said
+median. An average of medians is neither the median of the sessions nor the median
+stop, and it weights a one-session stop exactly like a ten-session one. The test
+could not tell, because every stop in its fixture week had the same median.
+Keeping the distribution is the only way the number printed can be the number
+named. (Codex review, 2026-10-01.)
+
+**A week is marked unclean whenever the DECISION was not uniform**, not merely
+when the outcome differed. With the default on and one session explicitly set to
+on, every effective mode is on — but the week still contains a deliberate
+override, and reporting it as a clean A/B sample would be a lie of omission. So
+source is tracked per session, independently of mode.
 
 **It reports the mechanism and refuses to imply it knows cost.** This tool cannot
 see money. Printing anything shaped like a saving would be a number nobody could
