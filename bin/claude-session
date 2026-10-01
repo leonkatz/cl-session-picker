@@ -1291,9 +1291,20 @@ _rotation_log_migrate() {
   if ! store_lock "$ROTATION_LOG" >/dev/null 2>&1; then
     _rotation_log_schema_warn; return 0
   fi
-  # Re-read under the lock: another process may have migrated it meanwhile.
+  # Re-read under the lock and repeat the WHOLE classification, not just the
+  # already-migrated case. The reason to look again is that the pre-lock evidence
+  # may no longer describe the file: between the first read and owning the lock,
+  # anything could have replaced it — including with a header that is not ours.
+  # Checking only "is it already current?" and otherwise proceeding meant a file
+  # that had become foreign while we waited was replaced anyway, which is the
+  # data loss the exact matching above exists to prevent, reintroduced through the
+  # back door. (Codex review, 2026-10-01.)
   first=$(head -1 "$ROTATION_LOG" 2>/dev/null)
-  if [ "$first" = "$_ROTATION_LOG_HEADER" ]; then store_unlock "$ROTATION_LOG"; return 0; fi
+  case "$first" in
+    "$_ROTATION_LOG_HEADER")    store_unlock "$ROTATION_LOG"; return 0 ;;
+    "$_ROTATION_LOG_HEADER_V1") : ;;
+    *)                          store_unlock "$ROTATION_LOG"; return 0 ;;
+  esac
   tmp="$ROTATION_LOG.mig.$$"
   if ! { printf '%s\n' "$_ROTATION_LOG_HEADER"; tail -n +2 "$ROTATION_LOG"; } > "$tmp" 2>/dev/null \
      || [ ! -s "$tmp" ]; then

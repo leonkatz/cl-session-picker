@@ -324,11 +324,45 @@ if command -v chflags >/dev/null 2>&1; then
   check "…leaving the original header intact" "$LEGACY_HEADER" "$(head -1 "$LOG")"
   check "…and no temp file left behind" "0" \
     "$(ls "$HOME/.config/claude-session"/*.mig.* 2>/dev/null | grep -c . | tr -d ' ')"
+  # An immutable log also refuses the APPEND, so unlike the lock case above this
+  # fixture cannot assert the row was recorded. What it can assert is that the
+  # failure is reported rather than swallowed — the property that matters when a
+  # stop cannot record itself. (I had claimed this fixture checked the row too;
+  # it does not, and saying so here is cheaper than a note that drifts.)
+  has "…and the lost row is reported, not swallowed" "$out" "not in the rotation log"
 else
   # Reported, not skipped silently: a quiet skip is indistinguishable from a pass.
   printf '  SKIP no chflags here — the refused-replacement path is unexercised on this platform\n'
 fi
 rm -f "$LOG"
+printf 'the file is reclassified under the lock, not just before it\n'
+# The reason to re-read after acquiring the lock is that the pre-lock evidence may
+# no longer describe the file. Checking only "has it already been migrated?" and
+# otherwise proceeding meant a log that became FOREIGN while we waited for the lock
+# was replaced anyway — the same data loss exact matching prevents, through the back
+# door. A static foreign file cannot reach this branch: the file has to change
+# between the two reads.
+#
+# Staged with a lock held by a LIVE process, so the stop genuinely blocks in
+# store_lock while the swap happens.
+start_token() { ps -o lstart= -p "${1:-$$}" 2>/dev/null | tr -s ' ' | tr ' ' '_'; }
+printf '%s\n' "$LEGACY_HEADER" > "$LOG"
+printf '2026-09-21T09:00:00Z\ton\tdefault\t4\t4\t0\t0\t400000\t100000\n' >> "$LOG"
+sleep 30 & HOLDER=$!
+ln -s "$HOLDER:$(start_token "$HOLDER")" "$LOG.lock" 2>/dev/null \
+  || setup_failed "could not plant a live migration lock"
+cl stop --keep-tabs >/dev/null 2>&1 &
+STOPPER=$!
+# It classifies the V1 header, then waits on the lock. Swap the file underneath it.
+sleep 2
+FOREIGN='timestamp_ms	event	value'
+printf '%s\nsomeone elses row\n' "$FOREIGN" > "$LOG"
+# Release, so the waiting stop acquires the lock and re-reads.
+rm -f "$LOG.lock"; kill "$HOLDER" 2>/dev/null; wait "$STOPPER" 2>/dev/null
+check "a file that turned foreign while we waited is not rewritten" "$FOREIGN" "$(head -1 "$LOG")"
+check "…and its row survives" "someone elses row" "$(sed -n '2p' "$LOG")"
+rm -f "$LOG" "$LOG.lock"
+
 # The third point — the temp file cannot be created at all — shares the same
 # warning and is not given its own case: isolating it needs the log's directory
 # unwritable, which also stops save_state writing state.json and makes `cl stop`
