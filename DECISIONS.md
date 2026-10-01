@@ -35,6 +35,16 @@ could not tell, because every stop in its fixture week had the same median.
 Keeping the distribution is the only way the number printed can be the number
 named. (Codex review, 2026-10-01.)
 
+**Clean means the stored policy decided every stop, and nothing else.** A
+per-session override, a stop flag and a `CL_ROTATE` all contaminate a week, even
+when every session rotated the same way, because the decision was not uniform. The
+rule is expressed as "anything but the stored policy" rather than as a list of
+contaminating sources: the list form had already lost `flag`, which let a week of
+flag-driven stops be reported as a clean sample while the raw log said otherwise.
+An exported `CL_ROTATE` held for a whole week would genuinely be a clean arm, but
+nothing can distinguish that from a value typed once, and guessing optimistically
+is how a contaminated week gets believed.
+
 **A week is marked unclean whenever the DECISION was not uniform**, not merely
 when the outcome differed. With the default on and one session explicitly set to
 on, every effective mode is on — but the week still contains a deliberate

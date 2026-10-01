@@ -218,6 +218,62 @@ check "…and stats flags that week" "yes" "$(cl rotate stats | awk 'NR==2{print
 cl rotate clear Alpha >/dev/null; cl rotate clear Beta >/dev/null
 rm -f "$LOG"
 
+printf 'a week is clean only when the stored policy decided it\n'
+# The rule is "anything but default contaminates", and it is asserted on the
+# OVERRIDES CELL rather than on the raw source: provenance was already correct in
+# the log while the summary still called a flag-driven week clean, which is the
+# failure that actually misleads.
+for flagcase in "--no-handoff" "--require-handoff"; do
+  rm -f "$LOG"; cl rotate on >/dev/null
+  cl stop --keep-tabs $flagcase >/dev/null 2>&1
+  check "$flagcase records itself as the source" "flag" "$(awk -F'\t' 'NR==2{print $3}' "$LOG")"
+  check "…and stats does NOT call that week clean" "yes" "$(cl rotate stats | awk 'NR==2{print $6}')"
+done
+# A valid CL_ROTATE is a one-off layer too, and is treated the same way. `cl rotate
+# off` is the documented way to set an arm for a week; an exported CL_ROTATE held
+# all week would in fact be clean, but nothing can distinguish that from a value
+# typed once, so it is marked.
+rm -f "$LOG"
+CL_ROTATE=0 cl stop --keep-tabs >/dev/null 2>&1
+check "a valid CL_ROTATE is recorded as env" "env" "$(awk -F'\t' 'NR==2{print $3}' "$LOG")"
+check "…and marks the week as not clean" "yes" "$(cl rotate stats | awk 'NR==2{print $6}')"
+# …and the clean case really is clean, so the flag above is not just "always yes".
+rm -f "$LOG"
+cl stop --keep-tabs >/dev/null 2>&1
+check "the stored policy alone leaves the week clean" "default" "$(awk -F'\t' 'NR==2{print $3}' "$LOG")"
+check "…and stats says so" "-" "$(cl rotate stats | awk 'NR==2{print $6}')"
+rm -f "$LOG"
+
+printf 'a log from the previous version is migrated, not corrupted\n'
+# ctx_all was added after this log first shipped. Appending a ten-column row under
+# a nine-column header leaves a file the built-in parser happens to read but whose
+# header lies to a human or any other tool.
+printf 'timestamp\tmode\tsource\tsessions\thandoffs\tresume_only\tkept\tctx_total\tctx_median\n' > "$LOG"
+printf '2026-09-21T09:00:00Z\ton\tdefault\t4\t4\t0\t0\t400000\t100000\n' >> "$LOG"
+cl rotate on >/dev/null
+cl stop --keep-tabs >/dev/null 2>&1
+check "the header gains the new column" "ctx_all" "$(head -1 "$LOG" | awk -F'\t' '{print $10}')"
+check "…and there is still exactly one header" "1" "$(grep -c '^timestamp' "$LOG")"
+check "…the legacy row is kept" "1" "$(grep -c '^2026-09-21' "$LOG")"
+# Every row must now agree with the header, or the file is still mislabelled. The
+# legacy row has nine fields, which reads as an empty ctx_all — the case stats
+# already treats as "distribution unavailable".
+check "no row claims more fields than the header" "0" \
+  "$(awk -F'\t' 'NR==1{h=NF;next} NF>h{c++} END{print c+0}' "$LOG")"
+check "the new row carries its distribution" "2" \
+  "$(awk -F'\t' 'NR==3{n=split($10,a,","); print n}' "$LOG")"
+out=$(cl rotate stats)
+check "the legacy week is still reported, marked approximate" "~100k" \
+  "$(printf '%s' "$out" | awk '/^2026-09-21/{print $5}')"
+# Migration is idempotent: a second stop must not add another header.
+cl stop --keep-tabs >/dev/null 2>&1
+check "a second stop does not re-migrate" "1" "$(grep -c '^timestamp' "$LOG")"
+# A file that is not ours is left completely alone.
+printf 'some other tool wrote this\nand this\n' > "$LOG"
+cl stop --keep-tabs >/dev/null 2>&1
+check "a foreign file keeps its first line" "some other tool wrote this" "$(head -1 "$LOG")"
+rm -f "$LOG"
+
 printf 'an unwritable log never blocks a stop\n'
 # A measurement must not be able to stop you shutting down. This is the one
 # failure in the feature whose direction is not negotiable.

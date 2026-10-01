@@ -1234,16 +1234,63 @@ rotation_log_append() {
   fi
   mkdir -p "$(dirname "$ROTATION_LOG")" 2>/dev/null || { _rotation_log_warn; return 0; }
   if [ ! -e "$ROTATION_LOG" ]; then
-    printf 'timestamp\tmode\tsource\tsessions\thandoffs\tresume_only\tkept\tctx_total\tctx_median\tctx_all\n' \
+    printf '%s\n' "$_ROTATION_LOG_HEADER" \
       >> "$ROTATION_LOG" 2>/dev/null || { _rotation_log_warn; return 0; }
+  else
+    _rotation_log_migrate
   fi
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$mode" "$source" "$sessions" "$handoffs" "$ronly" "$kept" "$total" "$med" "$all" \
     >> "$ROTATION_LOG" 2>/dev/null || _rotation_log_warn
   return 0
 }
+_ROTATION_LOG_HEADER='timestamp	mode	source	sessions	handoffs	resume_only	kept	ctx_total	ctx_median	ctx_all'
 _rotation_log_warn() {
   printf 'claude-session: could not append to %s — this stop is not in the rotation log\n' "$ROTATION_LOG" >&2
+}
+
+# _rotation_log_migrate: bring an older header up to the current columns.
+#
+# `ctx_all` was added after the first release of this log, so a file written by
+# the previous version has a nine-column header. Appending a ten-column row under
+# it leaves a TSV that the built-in parser happens to read correctly but that is
+# structurally mislabelled for a human or any other tool — the kind of file that
+# is fine until someone trusts the header. (Codex review, 2026-10-01.)
+#
+# Migrating FORWARD is safe in a way that migrating rows would not be: an older
+# row simply has no tenth field, which reads as an empty ctx_all, and that is
+# exactly what rotate_stats already treats as "distribution unavailable, mark the
+# week approximate". So the header gains a column and nothing is rewritten.
+#
+# ALWAYS returns 0: this runs on the stop path, and a log that cannot be migrated
+# must still be appended to rather than costing the shutdown.
+_rotation_log_migrate() {
+  local first tmp
+  [ -s "$ROTATION_LOG" ] || return 0
+  first=$(head -1 "$ROTATION_LOG" 2>/dev/null) || return 0
+  case "$first" in
+    "$_ROTATION_LOG_HEADER") return 0 ;;   # already current
+    timestamp*ctx_all*)      return 0 ;;   # current enough; leave it alone
+    timestamp*)              : ;;          # an older header of ours: migrate
+    *)                       return 0 ;;   # not a header we wrote — do not touch
+  esac
+  # Serialised, because this is the one read-modify-write on the log and two
+  # stops could reach it together. A lock we cannot take means we skip the
+  # migration and still append; the next stop tries again.
+  store_lock "$ROTATION_LOG" >/dev/null 2>&1 || return 0
+  # Re-read under the lock: another process may have migrated it meanwhile.
+  first=$(head -1 "$ROTATION_LOG" 2>/dev/null)
+  case "$first" in timestamp*ctx_all*) store_unlock "$ROTATION_LOG"; return 0 ;; esac
+  tmp="$ROTATION_LOG.mig.$$"
+  if { printf '%s\n' "$_ROTATION_LOG_HEADER"; tail -n +2 "$ROTATION_LOG"; } > "$tmp" 2>/dev/null \
+     && [ -s "$tmp" ]; then
+    mv "$tmp" "$ROTATION_LOG" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+  else
+    rm -f "$tmp" 2>/dev/null
+    printf 'claude-session: could not update the column header in %s — older rows have no ctx_all field\n' "$ROTATION_LOG" >&2
+  fi
+  store_unlock "$ROTATION_LOG"
+  return 0
 }
 
 # do_rotate: read and change the policy, and summarise what the log says.
@@ -1376,7 +1423,20 @@ rotate_stats() {
         # week is marked approximate rather than quietly reconstructed.
         ctx[key] = ctx[key] "," med; approx[key]="yes"
       }
-      if (src=="session" || src=="mixed") ovr[key]="yes"
+      # A week is clean ONLY when the stored policy decided every row, uniformly.
+      # Stated as "anything but default contaminates" rather than as a list of
+      # contaminating sources, because an allowlist is a thing to forget to
+      # update: `flag` was missing from one, and a week of flag-driven stops was
+      # reported as a clean A/B sample while the raw log said otherwise. A new
+      # source name added later is treated as suspect by default, which is the
+      # safe direction for an experiment.
+      #
+      # That deliberately includes a VALID CL_ROTATE. It is documented as the
+      # one-off layer; `cl rotate off` is the way to set an arm for a week. An
+      # exported CL_ROTATE held for a week would in fact be a clean arm, but
+      # nothing here can tell that from a value typed once, and guessing in the
+      # optimistic direction is how a contaminated week gets believed.
+      if (src != "default") ovr[key]="yes"
       if (modes[key]=="") modes[key]=mode
       else if (modes[key]!=mode) modes[key]="mixed"
     }

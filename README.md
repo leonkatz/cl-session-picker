@@ -431,10 +431,14 @@ This reports the **mechanism, not money** — `cl` cannot see a bill. It tells y
 how much context you were carrying each way, and how much work was in each week,
 so a difference in spend can be attributed instead of guessed at. Alternate over
 several weeks rather than one each: a single week's volume varies enough to swamp
-the effect. A week is flagged `OVERRIDES=yes` whenever a per-session setting or a
-stop flag was in play — even if every session still ended up rotating the same
-way, because the *decision* was no longer uniform and the week is not a clean
-sample.
+the effect.
+
+A week counts as clean **only when the stored policy decided every stop in it**.
+Anything else sets `OVERRIDES=yes` — a per-session override, a `--no-handoff` or
+`--require-handoff` on the command line, or a `CL_ROTATE` in the environment —
+even when every session still rotated the same way, because the *decision* was no
+longer uniform. So set an arm for a week with `cl rotate off`, and keep flags and
+`CL_ROTATE` for one-offs you do not mind excluding.
 
 The `HANDOFF` column in `cl` and `cl --list` shows each session's setting, with
 `↻` when a complete handoff is already waiting — so `off↻` means someone wrote

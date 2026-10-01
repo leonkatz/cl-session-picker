@@ -361,11 +361,19 @@ week's figure can be a true median across sessions: an average of per-stop
 medians is a different number, and weights a one-session stop like a ten-session
 one.
 
-`cl rotate stats` groups by the Monday each week starts on, and marks a week
-whenever a per-session override or a stop flag was in play — even if every
-session still rotated the same way, because the decision was no longer uniform.
-It reports the mechanism and nothing about money, because the tool cannot see a
-bill.
+`cl rotate stats` groups by the Monday each week starts on. A week is clean only
+when the **stored policy** decided every stop in it; a per-session override, a
+stop flag, or a `CL_ROTATE` all mark it, even when every session still rotated the
+same way, because the decision was no longer uniform. The rule is written as
+"anything but the stored policy contaminates" rather than as a list of
+contaminating sources — a list is a thing to forget to extend, and `flag` was
+once missing from one. It reports the mechanism and nothing about money, because
+the tool cannot see a bill.
+
+The log's columns gained `ctx_all` after it first shipped. A file written by the
+earlier version has its header migrated forward on the next stop; older rows
+simply have no tenth field, which reads as an empty distribution and is exactly
+what makes a week print as approximate.
 
 Codex threads are `n/a` rather than `off`: a handoff is a Claude session
 summarising itself, so there is no mechanism there to enable. `cl stop` never asks
