@@ -4,6 +4,57 @@ Form-factor choices that could have gone another way. Each entry records what
 was chosen, what it forecloses, and what would reverse it — so a later change
 is a deliberate reversal, not an accident.
 
+## 2026-09-29 — a restart row is cleared by the process that launched it
+
+**Chose:** where `cl start` creates the session itself (tmux, cmux) it consumes
+the row immediately, because the create answers that shell. Where it opens an
+iTerm tab instead, the **child** clears its own row (`ack_state_row`) once
+`acquire_launch` grants it ownership of the name — the same proof, at the same
+moment, that lets it claim the handoff.
+
+Two rejected alternatives, and why:
+
+**Consume on delegation.** "AppleScript accepted the text" is not "an agent
+started". A tab that never runs would lose both the restart row and, under
+rotation, the handoff the tab was going to claim — recoverable only by knowing
+to run `cl restore`.
+
+**Keep the row and let a later start sort it out.** This is what the handoff
+branch did when it merged with main, and it is wrong in a way that looked
+self-correcting: a `cl start` that finds a session live *also* keeps its row, so
+skipping is another keep and there is no transition that ever clears it. The
+snapshot stops being a one-shot stop record and becomes a permanent
+desired-state list — which resurrects a session the user deliberately closed the
+next time they run `cl start` for something else. Found in Codex review,
+2026-09-29, against a tree whose tests asserted the false property.
+
+**Forecloses:** the parent can no longer be the single writer of `state.json`
+during a start, so the file needs a lock. It reuses the launch registry's
+symlink claim (atomic `ln -s` carrying the owner's identity, a live holder's lock
+never broken automatically, bounded waiting) rather than inventing a second
+locking style.
+
+**Failure direction is fixed:** every way the acknowledgement can fail leaves the
+row. A stale row costs one duplicate tab on the next start; deleting the wrong
+row costs a session.
+
+**The match is keyed by agent, name AND thread id — all three.** Agent matters
+because a name held by both agents is ordinary here. The thread id matters
+because a name is not unique *over time*, and two fields were demonstrably
+unsafe: `cl start` writes a bare `cl "<name>"` into a tab while the saved row
+names one thread, a newer same-named thread can win discovery before the tab
+runs, and the tab would then launch the new one and delete the old one's restart
+row — a row destroyed for a session nobody started, which is exactly the
+direction this design exists to avoid. Given no thread id, nothing is
+acknowledged. This is the same generation problem the launch registry already
+solved for ownership; it was reopened here and closed in review on 2026-09-29.
+**Do not simplify this back to agent and name.**
+
+**Would reverse it:** `cl start` gaining a way to observe a delegated launch
+directly — then the parent could consume rows itself and the child would not need
+to write shared state at all. That would not license dropping the thread id from
+any acknowledgement that remained.
+
 ## 2026-09-15 — stop/start manage the Codex sessions cl launched, and only those
 
 **Chose:** `cl stop` signals a Codex process only when the launch registry names
@@ -518,3 +569,313 @@ path.
 tmux server?" guard compared the parent's whole command line against `*tmux*`,
 so any parent whose arguments merely mentioned tmux silently skipped the kill.
 It now compares the parent's executable name.
+
+## 2026-09-23 — Handoff is a typed-in-the-pane prompt + a per-request nonce poll, not a scraped reply
+
+**Chose:** `request_handoff` sends one literal, single-line instruction into
+the live pane (`tmux send-keys -l` at `"=name:"`, iTerm `write text` to the
+tagged session, or `cmux send` + a separate `cmux send-key enter`), then
+polls the handoff file for a fresh, per-request nonce token
+(`handoff_nonce`) for `CL_HANDOFF_TIMEOUT` seconds. It never reads the pane
+back. (Updated across three review rounds, 2026-09-23: the mechanism started
+as an mtime poll against a guessed `cmux send-text`; round 1 fixed the tmux
+target and the real cmux `send`/`send-key` contract; round 3 replaced the
+mtime/content-hash completion check with the nonce, after both a same-second
+atomic rewrite and a stale-but-byte-identical handoff proved a hash alone
+isn't a valid completion signal — see `docs/handoff.md`'s round-by-round
+sections for the full history.)
+
+**Forecloses:** any handoff signal that depends on parsing Claude's own
+terminal output.
+
+**Reverses by:** adding a scraped/ack-based confirmation instead of (or beside)
+the file check, if the file-poll proves unreliable in practice.
+
+**Why:** Claude's TUI runs on the alt-screen buffer, so `tmux capture-pane`
+already can't see it — this is the same reason `session_busy`/`claude_busy`
+inspect the process tree instead. The handoff FILE is the one externally
+observable outcome that actually matters, so that's what's polled.
+
+**Not chosen:** a SendMessage-style channel. `cl` has no agent-to-agent
+messaging primitive of its own, and building one only for this would duplicate
+what typing into the pane already achieves with tools `cl` already uses
+elsewhere (`close_iterm_tab`, `open_iterm_tabs`).
+
+## 2026-09-23 — A missed or timed-out handoff always falls back to a plain stop, never blocks one
+
+> **REVERSED 2026-09-24** by "The handoff is the hinge between two runs" below.
+> The reasoning here was sound while a handoff was only read inside a single
+> `start --fresh` command. Once `cl start` began deciding how a session comes
+> back *by whether a handoff exists*, "stop it anyway" stopped being the cheap
+> option and became a silent downgrade from rotation to plain resume.
+
+**Chose:** `request_handoff` returning non-zero (no reachable pane, or the
+timeout elapsed) changes nothing about `do_stop`'s existing kill logic — the
+same busy-check-and-prompt, same tmux/process kill, same tab/surface cleanup
+runs either way. `--no-handoff` skips the request outright.
+
+**Forecloses:** a handoff failure ever being the reason a stop doesn't happen.
+
+**Why:** the whole point is to reduce cost, not to add a new way for `cl stop`
+to strand a session running. A partial/failed handoff is a worse outcome than
+before this feature (no handoff, same as always) — never a worse outcome than
+"stop didn't happen."
+
+## 2026-09-24 — The handoff is the hinge between two runs, and there is at most one unconsumed per session
+
+**Chose:** `cl stop` writes a handoff; `cl start` decides per session how to
+bring it back — an unconsumed handoff means start a NEW agent under the same
+name seeded with that file, no handoff means `--resume <sid>` as before.
+Whatever uses a handoff moves it to `<store>/consumed/`; whatever is about to
+request one sweeps a leftover first. So the presence of `<store>/<Name>.md`
+means exactly "written, not yet used".
+
+**Forecloses:** any second source of truth about which handoffs have been used
+(a consumed-sid list in state, a timestamp comparison). The filesystem is the
+record.
+
+**Reverses by:** sessions needing more than one live handoff at a time — a
+per-request file keyed by nonce rather than by name would replace this.
+
+**Why:** rotation only pays off if it happens every cycle, and it can only
+happen every cycle if `cl start` is the thing that decides. Keying on presence
+and consuming on use is the smallest rule that makes that safe: without
+consumption, every subsequent start would rotate off the same ever-staler file
+and `--no-handoff` would quietly stop meaning anything.
+
+**Not chosen:** deleting a consumed handoff. It is moved instead — a rotation
+that turns out badly is still recoverable from the file that produced it, and
+the cost is one directory.
+
+## 2026-09-24 — `cl stop` fails closed, and `cl handoff` is the way out
+
+> **REVERSED 2026-09-25**, one day old, by "`cl stop` stops" below. The
+> `cl handoff` half survives; the fail-closed default does not. What the
+> entry below got wrong: it treated "no handoff" as a loss worth blocking on,
+> when by its own design a missing handoff costs only the optimisation. It
+> also under-counted the cost — attempts × timeout × sessions, not per
+> session — and refused hardest on exactly the wedged session a user most
+> needs stopped before a reboot.
+
+**Chose:** a session whose handoff never lands (after `CL_HANDOFF_ATTEMPTS`
+tries) is left RUNNING rather than stopped. `cl handoff`, run inside a
+session, writes one by hand and is marked as hand-written so `cl stop` honours
+it instead of sweeping it. `cl stop --no-handoff` still stops regardless.
+
+**Forecloses:** `cl stop` being guaranteed to stop everything in one pass
+without a flag.
+
+**Reverses by:** the refusal proving more annoying in practice than the silent
+downgrade it prevents — in which case the fail-open behaviour above returns,
+with rotation made conditional on something other than file presence.
+
+**Why:** under the entry above, stopping a session without a handoff is not a
+neutral act — it decides that the session will come back with its whole
+expensive transcript. That is exactly what the feature exists to avoid, and it
+is invisible at the moment it happens. Leaving the session alive costs a tab
+and keeps both options open.
+
+**Not chosen:** refusing with no route out. A fail-closed check that cannot be
+satisfied is a wedge, so the refusal names both ways forward, and `cl handoff`
+exists to make the first one real.
+
+## 2026-09-25 — A handoff is usable only if its LAST line is a valid marker
+
+**Chose:** every handoff ends with `<!-- cl:clho:… -->` (answering a stop) or
+`<!-- cl:manual:… -->` (written by `cl handoff`), and that marker must be the
+file's last non-empty line. `cl stop` confirms by matching its own nonce
+*there*, not anywhere in the file; `cl start` rotates only from a file that has
+one, and moves anything else to `<store>/incomplete/` with a loud message.
+
+**Forecloses:** treating presence as sufficient. The invariant is now presence
+AND completeness.
+
+**Reverses by:** a handoff format where a trailing line is not available (a
+strict schema owned by something else), which would need a sidecar file instead.
+
+**Why:** a handoff is meant to be written temp-file-then-rename, so a complete
+one appears whole. But an agent that writes straight to the target and is
+killed mid-write leaves a real, readable, TRUNCATED file — plausible prose cut
+off mid-sentence, no marker, because the marker is written last. Presence alone
+cannot tell that from a good handoff, and the replacement session is then seeded
+from a lie and does not know it. Reproduced 2026-09-25: a file ending
+`...currently ha` rotated a session. A partially-synced file from a shared store
+fails identically. The same rule fixes the reverse error, where a genuine
+handoff whose prose *mentions* a marker was classified by that mention.
+
+**Not chosen:** deleting an incomplete handoff. It is real work and it is the
+evidence of what went wrong, so it is filed, not destroyed. Leaving it in place
+was also rejected: it would be re-examined and re-rejected on every start.
+
+## 2026-09-25 — The pathname handed to a replacement is never renamed again
+
+> Supersedes the two-phase `.claims/` staging introduced earlier the same day,
+> which was broken on every rotation path.
+
+**Chose:** rotating renames the active handoff **once**, straight to its
+permanent home under `<store>/consumed/`, and hands that path to the
+replacement. `.claims/` is gone. Destination names are unique by construction
+(timestamp + pid + two random draws), not by checking for a free name first.
+Rollback moves the file back to the active path **only if nothing newer is
+there**. A synchronous launch (tmux, cmux) that is refused rolls back and keeps
+the session's row in the restart list; the exec paths preflight the working
+directory and the agent binary before the handoff is treated as spent.
+
+**Forecloses:** any staging area for an in-flight handoff, and any "commit"
+step that moves a path another process already holds.
+
+**Reverses by:** a launch protocol where the replacement acknowledges receipt,
+which would allow a real two-phase commit.
+
+**Why:** the staged design built the replacement's first message from the
+staging path and then moved the file to `consumed/` once the backend accepted.
+The prompt was already on its way to the agent, so **every rotation told the new
+session to read a path that no longer existed** — the feature silently did
+nothing. Reproduced by recording the agent's argv. Every test passed throughout,
+because they all asserted on the store (active file gone, `consumed/` one richer)
+and none on whether the path in the agent's own argv still resolved. A rename is
+also the whole concurrency answer: two starts racing for one handoff give exactly
+one rotation and one ordinary resume, with no lock to go stale.
+
+**Not chosen:** claiming ownership separately from the content path via a
+metadata record. It works, but it adds a second thing to keep consistent in
+order to preserve a staging step with no remaining purpose.
+
+**Honest boundary:** on an `exec` path the launcher becomes the agent, so it can
+never observe the agent running. Ownership granted + cwd reachable + agent
+runnable is what it can establish, and that is what the comments claim.
+
+## 2026-09-25 — Which way a session comes back is recorded on its row, not inferred from the store
+
+**Chose:** `cl stop` sets `resume_only` on the saved row when no handoff arrived
+or `--no-handoff` was given, and `cl start` obeys the row, filing any stale
+handoff aside.
+
+**Forecloses:** deriving the start mode from whichever file happens to be
+present.
+
+**Reverses by:** handoffs becoming per-cycle artifacts that cannot outlive the
+stop that requested them, which would make presence unambiguous again.
+
+**Why:** two cases broke inference. A stop whose request failed can leave an
+OLDER complete handoff in place, so the next start rotates from notes predating
+everything done since — while `cl stop` has already printed that it would
+resume. And `--no-handoff`'s attempt to clear a pending handoff can itself fail,
+silently reversing an explicit choice. A promise printed to the user should not
+depend on a filesystem move succeeding.
+
+## 2026-09-25 — A hand-written handoff is stamped with the id its session was LAUNCHED with
+
+**Chose:** `cl handoff` writes `<!-- cl:manual:<ts>@<sid> -->` using
+`CL_SESSION_ID`, set by every launch that knows the id and passed into pane
+commands explicitly. A rotation refuses a handoff whose stamped id is not the
+session being replaced. A session with no id stamps none, and unstamped markers
+are accepted for any occupant.
+
+**Also forecloses:** deriving "my own session id" from the display name. That is
+no evidence: the name is stable across rotations, so after one the newest
+session under it is the REPLACEMENT — a predecessor still finishing its handoff
+would stamp its successor's id onto its own file and make a stale handoff look
+current. Unstamped is honest; wrongly stamped is worse than nothing.
+
+**Forecloses:** a name alone identifying a handoff's author.
+
+**Reverses by:** handoffs becoming per-session-id files rather than per-name,
+which would make the stamp redundant.
+
+**Why:** a `cl handoff` that starts writing before a rotation and finishes
+after it renames the PREVIOUS occupant's notes into the freshly-emptied active
+path, and the next start seeds a replacement from them. The name is stable
+across rotations, so only the id distinguishes them.
+
+**Note:** the separator is `@`, not `:`. A first implementation read "after the
+last colon", which pulled `00Z` out of an ISO-8601 timestamp and rejected every
+unstamped marker as foreign.
+
+## 2026-09-25 — `cl stop` stops; rotation is requested, not required
+
+**Chose:** `cl stop` asks for a handoff within a stop-wide budget
+(`CL_HANDOFF_BUDGET`, default 300s total, not per session), reports failure
+prominently, and then stops the session regardless — `cl start` resumes it.
+`--require-handoff` (alias `--rotate`) opts into failing closed and exits
+non-zero if anything is left running. `--no-handoff` now also *clears* any
+pending handoff, so its promise of "resume it as-is" is actually true.
+
+**Forecloses:** `cl stop` guaranteeing a rotation without a flag.
+
+**Reverses by:** silent downgrades proving costly in practice despite the
+warning, which would make `--require-handoff` the default.
+
+**Why:** rotation is the optimisation and resume is the floor — stated in the
+design, then contradicted by a default that blocked on the optimisation.
+`cl stop` is what you run before a reboot or a version upgrade, and the session
+least able to answer a handoff request is the wedged one you most need gone.
+A global budget replaces attempts × timeout × sessions, which could hold an
+eight-session stop for over half an hour and still leave sessions running.
+
+**Not chosen:** keeping fail-closed with a bounded deadline. It keeps the
+wedge for a benefit the warning already delivers; the loud message plus a
+non-zero exit makes the downgrade visible, which was the actual concern.
+
+## 2026-09-24 — The tool supplies the mechanism; the prompt is yours
+
+**Chose:** `cl` ships a default instruction that asks for a handoff and the
+completion token, and nothing else. Anything further — tidying a task list,
+trimming notes, house rules about what may be archived — comes from
+`~/.config/claude-session/handoff-prompt.txt` (and `resume-prompt.txt` for a
+fresh session's first message), with `{{handoff}}`, `{{nonce}}`, `{{name}}` and
+`{{store}}` substituted literally and never evaluated.
+
+The first version of this feature had one person's note-keeping rules typed
+into the script: a specific file layout, a line-count target, archive-age
+rules, and a named person to escalate to. That is instantiation, not
+mechanism, and this repo is public. The same change moved the default storage
+off a hardcoded notes-app path onto `~/.local/state/claude-session/handoff`,
+so someone who installs this gets a working default instead of a warning about
+a directory they have never heard of.
+
+**Forecloses:** the tool prescribing what a good handoff contains beyond the
+token it has to check for.
+
+**Reverses by:** moving the default text back inline — which would also mean
+deciding, for everyone, what a session owes its successor.
+
+## 2026-09-23 — Configured dir first, local fallback, announced; one resolution point
+
+**Chose:** `handoff_root()` is the only place that decides between
+`CL_HANDOFF_DIR` and the local fallback — probed by an actual write, not just
+`[ -d ]` (a File Provider dataless directory `stat`s fine and fails every
+`open()`, a failure mode seen in practice with sync clients). Every handoff
+path goes through it, and a fallback is logged every time, not once.
+
+**Forecloses:** a handoff or board trim ever silently landing nowhere durable
+because the directory was mid-sync.
+
+**Reverses by:** dropping the fallback and failing the handoff instead, if a
+non-durable write is judged worse than a missed handoff.
+
+## 2026-09-23 — `cl start --fresh` is Claude-only, and old sessions are never a dead end
+
+**Chose:** `do_fresh_start`/`request_handoff` require `agent == claude`,
+matching the existing `cl stop`/`cl start` Codex exclusion (see 2026-08-28
+above). The retired session's id is both appended to
+`~/.config/claude-session/fresh-history.json` and printed as a direct
+`claude --resume <id>` command — in a file *and* on screen.
+
+**Forecloses:** a Codex `cl start --fresh` (no thread-status interface exists
+to know if the old thread is safely retireable) and a "fresh start" that loses
+the prior conversation.
+
+**Unblocking condition (Codex):** same as the existing exclusion — a Codex CLI
+interface that reports session status.
+
+## 2026-09-23 — `cl --list` name vs `SendMessage` name: documented, not fixed
+
+**Known limitation, not addressed by this change.** Some `cl`-launched
+sessions (observed for cmux-teams workspaces) register for `SendMessage`/
+`ListAgents` under an auto-generated `<dir>-<hex>` name instead of the
+`--name` title `cl` passed. That assignment happens in the cmux/Agent-Teams
+layer, which `bin/claude-session` doesn't control — `cl` only ever passes
+`--name` to `claude` — and reproducing the behavior well enough to patch
+around it blind risked masking the actual bug. See `docs/handoff.md` and
+`topics/claude-session-tool.md` (2026-09-23 entry) for the observed mapping.

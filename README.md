@@ -87,8 +87,11 @@ session state. Open a new terminal afterward so the `cl` alias stops resolving.
 - `cl new --codex "Name" [dir|-d]` — start a fresh Codex CLI session (see [Codex CLI sessions](#codex-cli-sessions))
 - `cl --list` — print discovered sessions (`--codex` / `--claude` first to filter)
 - `cl --codex "Name"` — resume a Codex session when the same name exists for both agents
-- `cl stop` — snapshot live sessions, kill them, and close their iTerm tabs (`--keep-tabs` to leave tabs open)
-- `cl start` — relaunch every session from the last `stop`
+- `cl stop` — ask each Claude session for a handoff, then snapshot live sessions, kill them, and close their iTerm tabs. A session whose handoff never lands is stopped anyway and resumes instead of rotating (`--require-handoff` to fail closed, `--keep-tabs` to leave tabs open, `--no-handoff` to skip the request and clear any pending handoff, `--dry-run` to preview)
+- `cl start` — relaunch every session from the last `stop`; any session with a **complete** waiting handoff starts **fresh** under the same name, seeded with it, instead of resuming (see [Handoff and rotation](docs/handoff.md))
+- `cl handoff` — run inside a session to write its handoff by hand (stamped with that session's id, so a late write is never adopted by its replacement)
+- `cl start --fresh "Name" [--dry-run]` — rotate one **live** session now, without stopping anything else
+- The handoff instruction is replaceable: put your own in `~/.config/claude-session/handoff-prompt.txt`
 - `cl restore` — restore `state.json` from the newest history snapshot (then `cl start`)
 
 ## Creating a new session — `cl new`
@@ -270,10 +273,22 @@ This file is yours and is never read from or written to the repository.
 reboot, or to pick up a new Claude version (a running session keeps the version
 it launched with; only a fresh launch upgrades).
 
-- **`cl stop`** writes the live sessions to `~/.config/claude-session/state.json`
-  (one record per session: name, session id, cwd, agent), then kills them. Before
-  killing a session that looks **mid-task**, it asks `Kill it anyway? [y/N]`;
-  answer no and that session is left running while the rest are killed. Re-run
+- **`cl stop`** first asks each live Claude session, in its own pane, to write
+  a handoff (`<handoff dir>/<Name>.md`) — see
+  [Handoff and rotation](docs/handoff.md) for the mechanism, how to replace
+  the instruction with your own, and the fallback path. `--no-handoff` skips that step;
+  `--dry-run` previews everything without sending, killing, or writing
+  anything. **A session whose handoff never lands is still stopped** — it comes
+  back by resuming rather than rotating, and says so loudly. Pass
+  `--require-handoff` (alias `--rotate`) to fail closed instead; that exits
+  non-zero if any session is left running. `--no-handoff` also clears any
+  pending handoff, so the session really does come back as-is. The whole stop
+  shares one handoff budget (`CL_HANDOFF_BUDGET`, default 300s total — not per
+  session). It then writes the live sessions to
+  `~/.config/claude-session/state.json` (one record per session: name, session
+  id, cwd, agent), and kills them. Before killing a session that still looks
+  **mid-task** after the handoff wait, it asks `Kill it anyway? [y/N]`; answer
+  no and that session is left running while the rest are killed. Re-run
   `cl stop` once it's idle to catch it. Needs `jq`.
   - **Closes the iTerm tab too.** Each tab `cl` opens is tagged with an iTerm
     user variable (`user.clSession`, via an OSC 1337 escape), so `stop` can find
@@ -283,9 +298,47 @@ it launched with; only a fresh launch upgrades).
     terminals can't be scripted this way) and best-effort; pass `--keep-tabs`
     to leave all tabs open.
 - **`cl start`** reads the state file and, for each session, reattaches if it's
-  already live, else creates the tmux session and resumes the pinned
-  conversation by id — as the agent it was saved under. Then attach with
-  `tmux attach` (or `tmux -CC attach` in iTerm for native tabs).
+  already live, as the agent it was saved under. Rotation is a Claude
+  mechanism, so a Codex row always resumes as itself; for a Claude session
+  **the handoff decides how it comes back**: if a
+  *complete* one is waiting, that session starts *fresh* under the same name and
+  directory, told to read the handoff and continue; otherwise it resumes the
+  pinned conversation by id, exactly as before. A handoff counts as complete
+  only when its last line is the marker `cl` asked for — a file cut off
+  mid-write has none, so it is filed under `incomplete/` and the session
+  resumes rather than continuing from a truncation. So a skipped, failed or
+  half-written handoff costs you the rotation, never the session.
+  - Rotating renames the handoff **once**, straight to its permanent home under
+    `consumed/`, and hands that path to the replacement — a path given to
+    another process is never renamed again. A refused launch puts it back
+    (unless something newer has appeared meanwhile) and keeps the session's row
+    in the restart list, so `cl start` just retries it and the command exits
+    non-zero. The rename is atomic, so two starts racing for one handoff give
+    exactly one rotation and one ordinary resume.
+  - Which way a session comes back is **recorded on its saved row**, not guessed
+    from whichever file survived: `cl stop` marks it resume-only when no handoff
+    arrived or `--no-handoff` was used, and `cl start` obeys that.
+  - A row is **consumed only once some process has confirmed the launch**. Where
+    `cl start` creates the session itself (tmux, cmux) it confirms it directly.
+    Where it opens an iTerm tab instead, the tab does the launching, so the row
+    is cleared by that child once it has been granted ownership of the name —
+    the same proof, and the same moment, that lets it claim the handoff. A row
+    whose launch was refused, or that looked live and was skipped, stays in
+    `state.json` until then, so the next `cl start` picks it up and you do not
+    have to know to run `cl restore`. The acknowledgement is keyed by agent,
+    name **and thread id** — a name is not unique over time, so matching without
+    the thread could clear the row of a *different* session that happens to share
+    the name, one nobody started. With no thread id it acknowledges nothing at
+    all. It fails closed throughout: if it cannot be written the row simply
+    stays, because a duplicate tab is cheap and a dropped session is not.
+  Then attach with `tmux attach` (or `tmux -CC attach` in iTerm for native tabs).
+- **`cl handoff`** — run *inside* a session to write its handoff by hand; the
+  way out when a pane can't be reached. Pipe the text in (`cl handoff < notes.md`)
+  or run it bare to be told where to write.
+- **`cl start --fresh "Name"`** rotates just that one *live* session now,
+  without stopping anything else (see [Rotation hint](#rotation-hint) below).
+  The old session id is never lost — see
+  [Handoff and rotation](docs/handoff.md#2-rotation-on-cl-start).
 
 ### Codex sessions: what stop/start covers, and what it doesn't
 
@@ -321,8 +374,9 @@ tab to close — but only when something suggests it is actually being served.
 Stored threads with no process produce no warning at all:
 
 ```
-⚠ leaving Review — cl has no launch record for this Codex session, so it has
-  no safe way to identify the process. Close it in its own tab.
+⚠ leaving Review — something looks like it is running this Codex thread, but cl
+  has no launch record for it and cannot identify the process safely. Close it
+  in its own tab.
 ```
 
 Such a session is also **not** written to the state file, because `cl start`
@@ -331,9 +385,17 @@ clients on one transcript.
 
 `cl start` is the reverse case and uses the looser test on purpose: any sign of
 life means skip. A false positive costs a tab you reopen by hand; a false
-negative starts a second client on a live transcript. Rows skipped that way stay
-in `state.json` rather than being consumed, so the next `cl start` picks them up
-once they really are gone — you do not have to know to run `cl restore`.
+negative starts a second client on a live transcript.
+
+### Rotation hint
+
+`cl --list` shows an approximate current context size per Claude session (last
+known `input + cache_read + cache_creation` tokens from its transcript) and
+flags a session `rotate` when that's over ~250k tokens or the transcript is
+over ~7 days old — both the point past which `cl start` (full resume) costs
+noticeably more per call than `cl start --fresh` (see
+[docs/handoff.md](docs/handoff.md#3-rotation-hint-on-cl---list)). Codex rows
+are left blank — their rollout format has no comparable usage figure.
 
 ### State history (recovery)
 

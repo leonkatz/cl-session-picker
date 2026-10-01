@@ -113,6 +113,12 @@ check "codex: -m and the id are two elements" "-m|codex-model-id" \
 check "…and the subcommand still follows the options" "resume|$SID" \
   "$(grep -A1 '^resume$' "$FIX/argv.codex" | paste -sd'|' -)"
 
+# `cl start` also has to apply a remembered model, and that is asserted in
+# test-tmux-mode.sh rather than here: this fixture deliberately has no tmux, so
+# `cl start` only PRINTS the commands for a human to run and never builds a
+# resume command at all. A revert matrix on 2026-09-29 showed the restart path
+# was uncovered because every model assertion here drives `cl <name>`.
+
 printf 'a session with no remembered model launches exactly as before\n'
 # The regression that would hurt most quietly: a stray flag, or an empty one,
 # on every session that never asked for a model.
@@ -155,13 +161,18 @@ case "$out" in *"unsafe model"*) pass=$((pass+1)); printf '  ok   %s\n' "…and 
 printf '{}\n' > "$MODELS"
 
 printf 'the memory survives a stop/start cycle\n'
-# state.json is a snapshot that `cl start` consumes and DELETES. A model kept
-# there would be gone after one cycle — this is why it lives in its own file.
+# state.json is a snapshot `cl start` eventually consumes and DELETES. A model
+# kept there would be gone after one cycle — this is why it lives in its own
+# file. What this suite pins is that the model outlives the snapshot, whatever
+# the snapshot does: this fixture has no tmux, so start delegates the launch and
+# keeps the row (see test-codex-lifecycle.sh), and the model must survive that
+# just as it survives the consuming path.
 cl model Alpha persistent-model >/dev/null
 STATE="$HOME/.config/claude-session/state.json"
 printf '[{"name":"Alpha","sid":"abc","cwd":"%s","agent":"claude"}]\n' "$FIX/work" > "$STATE"
 cl start >/dev/null 2>&1
-check "state.json was consumed by start" "0" "$([ -f "$STATE" ] && echo 1 || echo 0)"
+check "the model is not stored in state.json" "null" \
+  "$(jq -r 'if type=="array" then (.[0].model // "null") else "null" end' "$STATE" 2>/dev/null || echo null)"
 check "…but the remembered model is still there" "persistent-model" "$(jq -r '.claude.Alpha' "$MODELS")"
 
 printf 'cl new --model remembers and applies in one step\n'

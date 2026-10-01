@@ -59,11 +59,19 @@ mk_thread "$SID_THEIRS" Theirs
 
 # PATH without tmux: the bare/iTerm shape, which is what this is for.
 BASEPATH="$FIX/bin:/usr/bin:/bin"
-cl() { ( cd "$FIX" && env -i HOME="$HOME" CODEX_HOME="$CODEX_HOME" PATH="$BASEPATH" bash "$CL" "$@" ) ; }
+# `cl stop` asks every live CLAUDE row for a handoff and waits up to
+# CL_HANDOFF_BUDGET (300s by default) for one to land. This suite is about the
+# CODEX lifecycle and provides no way to deliver a handoff, so on the default
+# budget each of its stops would block for five minutes and the suite would
+# look hung rather than failing. One second is enough to prove the request was
+# made and gave up; rotation itself is covered in test-handoff.sh.
+export CL_HANDOFF_BUDGET=1
+cl() { ( cd "$FIX" && env -i HOME="$HOME" CODEX_HOME="$CODEX_HOME" PATH="$BASEPATH" \
+         CL_HANDOFF_BUDGET=1 bash "$CL" "$@" ) ; }
 # Opening real tabs happens only when the shell is iTerm-hosted; elsewhere cl
 # prints the commands instead. Both paths carry the agent, so both are checked.
 cl_iterm() { ( cd "$FIX" && env -i HOME="$HOME" CODEX_HOME="$CODEX_HOME" PATH="$BASEPATH" \
-               TERM_PROGRAM=iTerm.app bash "$CL" "$@" ) ; }
+               CL_HANDOFF_BUDGET=1 TERM_PROGRAM=iTerm.app bash "$CL" "$@" ) ; }
 
 # A real process to stand in for a running agent, and the registry record cl
 # would have written when it launched it. Recording the START TOKEN is the whole
@@ -270,7 +278,7 @@ esac
 exit 0
 TMUXEOF
 chmod +x "$FIX/tmuxbin/tmux"
-cl_tmux() { ( cd "$FIX" && env -i HOME="$HOME" CODEX_HOME="$CODEX_HOME" \
+cl_tmux() { ( cd "$FIX" && env -i HOME="$HOME" CODEX_HOME="$CODEX_HOME" CL_HANDOFF_BUDGET=1 \
               PATH="$FIX/tmuxbin:$BASEPATH" bash "$CL" "$@" ) ; }
 rm -f "$FIX/tmux.calls" "$FIX/stamped"
 out=$(cl_tmux stop --keep-tabs 2>&1)
@@ -339,16 +347,98 @@ register Live codex "$STILLUP" "$SID_MINE"
 printf '[{"name":"Live","sid":"%s","cwd":"%s","agent":"codex"},{"name":"Gone","sid":"zzz","cwd":"%s","agent":"claude"}]\n' \
   "$SID_MINE" "$FIX/work" "$FIX/work" > "$STATE"
 out=$(cl_iterm start 2>&1)
-check "the live row is kept for next time" "Live" \
+# "Gone" is kept as well, and that is the contract rather than a regression.
+# This is the iTerm/no-tmux path: the launch is DELEGATED to a new tab running
+# `cl <name>`, so this process never observes whether an agent actually
+# started — "AppleScript accepted the text" is not "a session is running".
+# Consuming the row here is the same loss this block exists to prevent, and it
+# is worse once rotation is in play, because the handoff is claimed by the tab:
+# a tab that never runs would leave the session with neither a row nor a
+# rotation, recoverable only by knowing to run cl restore.
+#
+# Retention is only half of it. The row is cleared by the CHILD, which does know
+# whether it launched — see ack_state_row and the acknowledgement lifecycle test
+# below. Retention alone would never end, because a start that skips a live
+# session keeps its row too.
+check "the live row is kept for next time" "Live Gone" \
   "$(jq -r '.[].name' "$STATE" 2>/dev/null | tr '\n' ' ' | sed 's/ $//')"
 case "$out" in *"left in"*) pass=$((pass+1)); printf '  ok   %s\n' "…and start says so" ;;
   *) fail=$((fail+1)); printf '  FAIL %s\n       got: %s\n' "…and start says so" "$out" ;; esac
 kill "$STILLUP" 2>/dev/null
-# When nothing is skipped the file is consumed exactly as before.
+# …and a start with NOTHING live keeps its rows too, on this path. That is not
+# an oversight: a row is consumed only when some process can SEE the launch
+# succeed. This one cannot — the tab does the launching — so the row waits for
+# the child's acknowledgement. The tmux path, where `tmux new-session -d`
+# answers this shell directly, consumes immediately; that half of the rule is
+# asserted in test-tmux-mode.sh.
 printf '[{"name":"Gone2","sid":"yyy","cwd":"%s","agent":"claude"}]\n' "$FIX/work" > "$STATE"
 cl_iterm start >/dev/null 2>&1
-check "a fully-handled start still clears the file" "0" \
-  "$([ -f "$STATE" ] && echo 1 || echo 0)"
+check "a delegated start keeps the row it could not confirm" "Gone2" \
+  "$(jq -r '.[].name' "$STATE" 2>/dev/null | tr '\n' ' ' | sed 's/ $//')"
+
+printf 'the delegated child acknowledges its own row, and it stays gone\n'
+# The lifecycle Codex required (2026-09-29). Retention without acknowledgement
+# never ends: a start that skips a live session keeps its row too, so state.json
+# would become a permanent desired-state list and resurrect sessions the user
+# had deliberately closed. The child is the only process that knows a launch
+# happened, so it is the one that clears the row.
+#
+# Step 1: the tab's own `cl <name>` launches the agent and acknowledges.
+rm -f "$PIDDIR"/* "$STATE"
+printf '[{"name":"Mine","sid":"%s","cwd":"%s","agent":"codex"},{"name":"Other","sid":"%s","cwd":"%s","agent":"codex"}]\n' \
+  "$SID_MINE" "$FIX/work" "$SID_THEIRS" "$FIX/work" > "$STATE"
+cl --codex Mine >/dev/null 2>&1
+check "the launched row is acknowledged and gone" "Other" \
+  "$(jq -r '.[].name' "$STATE" 2>/dev/null | tr '\n' ' ' | sed 's/ $//')"
+check "…and the untouched row is still there" "1" \
+  "$(jq '[.[] | select(.name=="Other")] | length' "$STATE" 2>/dev/null)"
+# Step 2: the session is then closed deliberately. Nothing is live, and the
+# acknowledged row must NOT come back — this is the resurrection Codex found.
+pkill -f "codex resume $SID_MINE" 2>/dev/null; rm -f "$PIDDIR"/*
+out=$(cl_iterm start 2>&1)
+case "$out" in *Mine*) fail=$((fail+1)); printf '  FAIL %s\n       got: %s\n' "a deliberately closed session is not resurrected" "$out" ;;
+  *) pass=$((pass+1)); printf '  ok   %s\n' "a deliberately closed session is not resurrected" ;; esac
+check "…and it is still absent from the restart list" "0" \
+  "$(jq '[.[] | select(.name=="Mine")] | length' "$STATE" 2>/dev/null || echo 0)"
+# Step 3: an acknowledgement that CANNOT be written leaves the row rather than
+# guessing. A stale row costs a duplicate tab; a wrongly deleted one costs a
+# session, so the failure direction is fixed.
+rm -f "$PIDDIR"/* "$STATE"
+printf '[{"name":"Mine","sid":"%s","cwd":"%s","agent":"codex"}]\n' "$SID_MINE" "$FIX/work" > "$STATE"
+ln -s "999999999:not-a-real-start-token" "$STATE.acklock" 2>/dev/null
+out=$(cl --codex Mine 2>&1)
+check "a blocked acknowledgement keeps the row" "1" \
+  "$(jq '[.[] | select(.name=="Mine")] | length' "$STATE" 2>/dev/null)"
+case "$out" in *"died holding"*|*"stays in the restart list"*) pass=$((pass+1)); printf '  ok   %s\n' "…and says the lock needs clearing" ;;
+  *) fail=$((fail+1)); printf '  FAIL %s\n       got: %s\n' "…and says the lock needs clearing" "$out" ;; esac
+rm -f "$STATE.acklock"
+pkill -f "codex resume $SID_MINE" 2>/dev/null
+# Step 4: the acknowledgement is keyed by agent AND name, like every other
+# registry question here. A name held by both agents is ordinary (the suite has
+# "Shared"), and acknowledging one agent's launch must not consume the other's
+# restart row — that would silently drop a session that was never started.
+rm -f "$PIDDIR"/* "$STATE"
+printf '[{"name":"Shared","sid":"%s","cwd":"%s","agent":"codex"},{"name":"Shared","sid":"csid","cwd":"%s","agent":"claude"}]\n' \
+  "$SID_SHARED" "$FIX/work" "$FIX/work" > "$STATE"
+cl --codex Shared >/dev/null 2>&1
+check "acknowledging codex leaves the same-named claude row" "claude" \
+  "$(jq -r '.[].agent' "$STATE" 2>/dev/null | tr '\n' ' ' | sed 's/ $//')"
+pkill -f "codex resume $SID_SHARED" 2>/dev/null
+# Step 5: the acknowledgement is keyed by THREAD as well, and that is a race
+# rather than a nicety. `cl start` writes a bare `cl --codex <name>` into a tab
+# while the saved row names one thread; a newer same-named thread can win
+# discovery before that tab runs, so the tab launches the NEW one. Deleting the
+# old row then would destroy a restart row for a session nobody started — the
+# unsafe direction this code exists to avoid. The row must survive.
+rm -f "$PIDDIR"/* "$STATE"
+printf '[{"name":"Mine","sid":"%s","cwd":"%s","agent":"codex"}]\n' \
+  01dddddd-0000-7000-8000-0000000000dd "$FIX/work" > "$STATE"
+cl --codex Mine >/dev/null 2>&1
+check "a launch of a different generation leaves the old row" "1" \
+  "$(jq '[.[] | select(.name=="Mine")] | length' "$STATE" 2>/dev/null)"
+check "…and it is still the generation that was saved" "01dddddd-0000-7000-8000-0000000000dd" \
+  "$(jq -r '.[] | select(.name=="Mine") | .sid' "$STATE" 2>/dev/null)"
+pkill -f "codex resume $SID_MINE" 2>/dev/null
 
 printf 'a start that fails keeps its row, and a filter failure keeps the file\n'
 # Two ways a restart list was lost: a row whose create FAILED was consumed as

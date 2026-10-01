@@ -84,6 +84,14 @@ check "iTerm: the agent itself is exec'd" "yes" "$(bare)"
 has   "iTerm: …on the right session id"   "$(cat "$FIX/argv.claude")" "$SID"
 has   "iTerm: the tab is still tagged for cl stop" "$out" "1337;SetUserVar=clSession="
 out=$(run_cl "iTerm.app" CL_TMUX=1); check "iTerm + CL_TMUX=1: back in tmux" "yes" "$(wrapped)"
+# The tmux server's environment is whatever it was started with, so a session's
+# identity has to travel in the COMMAND, not be inherited. `cl handoff` run
+# inside a session reads CL_SESSION_NAME to know which handoff it is writing —
+# without this, the in-session escape hatch cannot identify itself. (A revert
+# matrix found this untested on 2026-09-29.)
+has   "iTerm + CL_TMUX=1: identity travels in the tmux command" \
+  "$(cat "$FIX/argv.tmux")" 'CL_SESSION_NAME='
+has   "…and the session id with it" "$(cat "$FIX/argv.tmux")" 'CL_SESSION_ID='
 out=$(run_cl "Apple_Terminal");      check "outside iTerm: still tmux"       "yes" "$(wrapped)"
 
 printf 'launch registry — identity for a session with no id in its argv\n'
@@ -93,7 +101,7 @@ REGLIB="$FIX/reglib.sh"
 { sed -n '/^tmux_name() {/,/^}/p' "$CL"
   awk '/^PID_DIR=/{f=1} /^session_pid\(\) \{/{f=0} f' "$CL"
   sed -n '/^session_pid() {/,/^}/p' "$CL"; } > "$REGLIB"
-for fn in registered_pid acquire_launch reg_file clear_launch session_pid claim_token start_token retire_process; do
+for fn in registered_pid acquire_launch reg_file clear_launch session_pid claim_token start_token retire_process ack_state_row; do
   grep -q "^${fn}()" "$REGLIB" || setup_failed "$fn not extracted from $CL"
 done
 # shellcheck disable=SC1090
@@ -103,6 +111,47 @@ acquire_launch "Solo" claude || setup_failed "first acquire should succeed"
 check "the claim records the calling process" "$$" "$(registered_pid "Solo")"
 check "a second claim on a live session is refused" "1" \
   "$(acquire_launch "Solo" claude >/dev/null; echo $?)"
+
+printf 'ack_state_row: two invariants, driven directly\n'
+# Both are properties of the function rather than of a reachable command, so they
+# are asserted here instead of end-to-end. A revert matrix on 2026-09-29 removed
+# each with every end-to-end suite still green, which is what a guard on an
+# unreachable-today branch looks like — kept because the branch becomes reachable
+# the moment a caller forgets an argument, and the cost of being wrong is a
+# deleted session.
+STATE="$FIX/ackstate.json"
+# 1. No thread id means the generation cannot be identified, so nothing is
+#    deleted. Reachable the day any caller omits the sid, or a row is saved for a
+#    fresh thread that has none yet (acquire_launch records those as "-").
+printf '[{"name":"Solo","sid":"-","cwd":"%s","agent":"claude"}]\n' "$FIX/work" > "$STATE"
+ack_state_row "Solo" claude "" 2>/dev/null
+check "an empty sid deletes nothing" "1" "$(jq 'length' "$STATE" 2>/dev/null)"
+ack_state_row "Solo" claude "-" 2>/dev/null
+check "…and neither does a placeholder sid" "1" "$(jq 'length' "$STATE" 2>/dev/null)"
+# 2. The lock is released only by its owner. An unconditional `rm -f` would
+#    delete a lock that had been cleared and re-taken by a SUCCESSOR, letting two
+#    acknowledgements into the critical section at once. Simulated by a jq that
+#    replaces the lock mid-critical-section, which is the only moment the bug is
+#    observable.
+printf '[{"name":"Solo","sid":"%s","cwd":"%s","agent":"claude"}]\n' "$SID" "$FIX/work" > "$STATE"
+mkdir -p "$FIX/jqhook"
+REALJQ=$(command -v jq)
+cat > "$FIX/jqhook/jq" <<JQHOOK
+#!/bin/sh
+if [ ! -f "$FIX/jq-hooked" ]; then
+  : > "$FIX/jq-hooked"
+  rm -f "$STATE.acklock"
+  ln -s 'successor:took-it' "$STATE.acklock" 2>/dev/null
+fi
+exec "$REALJQ" "\$@"
+JQHOOK
+chmod +x "$FIX/jqhook/jq"
+rm -f "$FIX/jq-hooked" "$STATE.acklock"
+( PATH="$FIX/jqhook:$PATH"; ack_state_row "Solo" claude "$SID" 2>/dev/null )
+check "a successor's lock survives the previous owner's release" "successor:took-it" \
+  "$(readlink "$STATE.acklock" 2>/dev/null)"
+rm -f "$STATE.acklock" "$FIX/jq-hooked" "$STATE"
+unset STATE
 
 # Names that COLLIDE under tmux_name's sanitiser must not share a record.
 # Under tmux `new-session -A` made them one session so two owners could not
@@ -208,6 +257,66 @@ has   "the live one is reported live" "$out" "Solo already live"
 tabs=$(cat "$FIX/osascript.log" 2>/dev/null)
 hasnt "…and gets no tab (that would be a 2nd agent on one transcript)" "$tabs" 'cl \"Solo\"'
 has   "…while the other session does get its tab" "$tabs" 'cl \"Solo Two\"'
+# The run above delegates each launch to a tab and so cannot confirm any of
+# them; its rows stay. With CL_TMUX=1 the launch is `tmux new-session -d` in
+# THIS shell, which answers directly — so a confirmed launch consumes its row,
+# and the snapshot is cleared once nothing is left to account for. Both halves
+# of that rule matter: consuming an unconfirmed row loses the session, and
+# keeping a confirmed one makes the restart list grow without bound.
+cat > "$HOME/.config/claude-session/state.json" <<JSON
+[{"name":"Confirmed","sid":"$SID2","cwd":"$FIX/work","agent":"claude"}]
+JSON
+rm -f "$FIX/argv.tmux"
+# A remembered model has to reach the RESTART path too — `cl start` builds its
+# own resume command instead of going through `cl <name>`. test-session-model.sh
+# cannot cover this (no tmux there, so start only prints commands), and a revert
+# matrix on 2026-09-29 found the line unguarded.
+printf '{"claude": {"Confirmed": "restart-path-model"}}\n' \
+  > "$HOME/.config/claude-session/models.json"
+env -i HOME="$HOME" PATH="$PATHF" TERM_PROGRAM=iTerm.app CL_TMUX=1 bash "$CL" start >/dev/null 2>&1
+check "a launch this shell confirmed consumes its row" "0" \
+  "$([ -f "$HOME/.config/claude-session/state.json" ] && echo 1 || echo 0)"
+has   "…and start applies the remembered model" "$(cat "$FIX/argv.tmux")" '--model restart-path-model'
+rm -f "$HOME/.config/claude-session/models.json"
+tcmd=$(cat "$FIX/argv.tmux" 2>/dev/null)
+# Two things the pre-create must do besides creating, both of which a revert
+# matrix found untested (2026-09-29):
+#
+# The session it just made has to be STAMPED as cl's. `cl stop` kills a Codex
+# session only on that proof, so an unstamped session cl created itself is one
+# cl can never stop again — it would report "carries no cl ownership stamp" and
+# leave it running forever.
+has   "…and stamps the session it created as cl's" "$tcmd" '@cl_agent'
+has   "…including which thread it holds" "$tcmd" '@cl_sid'
+# And the command must carry the session's identity in its environment. `cl
+# handoff` run INSIDE a session is the documented way out when its pane cannot
+# be reached, and it identifies itself from CL_SESSION_NAME — without this a
+# session restored by `cl start` cannot write its own handoff.
+has   "…and passes the session identity to the agent" "$tcmd" 'CL_SESSION_NAME='
+
+printf 'a child that gains tmux clears the row its parent had to keep\n'
+# The mode transition Codex would not let me scope out (2026-09-29). `cl start`
+# without tmux cannot see whether a tab launched anything, so it DELEGATES and
+# keeps the row. If that new interactive tab then sources a shell config setting
+# CL_TMUX=1, the child takes the tmux branch and `new-session -d` hands it the
+# very proof the parent lacked. Nothing used to consume the row on that path, so
+# the permanent-desired-state bug survived for exactly this combination.
+#
+# Two runs, deliberately: the first is the parent's delegated start (row must
+# remain), the second is the child that tab would run (row must go).
+rm -f "$FIX/argv.tmux"
+cat > "$HOME/.config/claude-session/state.json" <<JSON
+[{"name":"Solo Two","sid":"$SID2","cwd":"$FIX/work","agent":"claude"}]
+JSON
+env -i HOME="$HOME" PATH="$PATHF" TERM_PROGRAM=iTerm.app bash "$CL" start >/dev/null 2>&1
+check "the delegated parent keeps the row" "1" \
+  "$(jq '[.[] | select(.name=="Solo Two")] | length' "$HOME/.config/claude-session/state.json" 2>/dev/null)"
+env -i HOME="$HOME" PATH="$PATHF" TERM_PROGRAM=iTerm.app CL_TMUX=1 bash "$CL" "Solo Two" >/dev/null 2>&1
+check "…and the tmux child acknowledges it" "0" \
+  "$([ -f "$HOME/.config/claude-session/state.json" ] && echo 1 || echo 0)"
+# The child must have actually created a session, not merely attached — otherwise
+# the assertion above would pass for the wrong reason.
+has   "…on the strength of a real create" "$(cat "$FIX/argv.tmux")" 'new-session -d'
 
 printf 'cl stop kills the intended process and closes its tab\n'
 # Incidentally a regression guard for the parent-process check: this file is
@@ -215,7 +324,12 @@ printf 'cl stop kills the intended process and closes its tab\n'
 # "tmux". While that check matched the whole command line it skipped the kill.
 kill -0 "$LIVE" 2>/dev/null || setup_failed "fixture agent died before the stop case"
 : > "$FIX/osascript.log"
-out=$(env -i HOME="$HOME" PATH="$PATHF" TERM_PROGRAM=iTerm.app bash "$CL" stop </dev/null 2>&1)
+# --no-handoff, because this case is about the KILL and the tab close, not
+# about handoffs: a plain `cl stop` now leaves a session running when no
+# handoff arrives, so without this the fixture would survive on purpose and
+# the assertion below would be testing the wrong contract. That a satisfied
+# handoff is followed by the kill is asserted in test-handoff.sh.
+out=$(env -i HOME="$HOME" PATH="$PATHF" TERM_PROGRAM=iTerm.app bash "$CL" stop --no-handoff </dev/null 2>&1)
 sleep 0.5
 check "the intended fixture process is gone" "dead" "$(kill -0 "$LIVE" 2>/dev/null && echo alive || echo dead)"
 has   "cl stop reported killing it" "$out" "killed Solo"
