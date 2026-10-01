@@ -4,6 +4,75 @@ Form-factor choices that could have gone another way. Each entry records what
 was chosen, what it forecloses, and what would reverse it — so a later change
 is a deliberate reversal, not an accident.
 
+## 2026-10-01 — rotation can be switched off, and the tool records which way it ran
+
+**Chose:** a global default plus optional per-session overrides
+(`rotate.json`), resolved as **flag > `CL_ROTATE` > stored > on**, and one
+appended line per `cl stop` in `rotation-log.tsv` carrying **every stopped
+session's context size**.
+
+Why a toggle at all: rotation is a trade, not a free win. It spends one handoff
+request per session per stop — a real call — to make every later call carry a
+short seeded context instead of a long transcript. Which side wins depends on how
+someone actually works, which is an empirical question, so the tool has to be
+able to run both ways and say which way it ran.
+
+**Off means the request is skipped, not discarded.** Asking for a handoff and
+then ignoring it would make an "off" week pay rotation's cost while measuring its
+absence.
+
+**The log records context sizes, not just a rotate/resume count.** A count plus a
+bill cannot distinguish rotation from a busier week. Context size is the actual
+mechanism — the per-call multiplier rotation reduces — so it is what makes a
+spend difference attributable. `context_size` already existed for the `cl --list`
+hint; this reuses it rather than inventing a second measure.
+
+**And it records EVERY session's size, not a per-stop summary.** The first version
+stored one median per stop and then averaged those, under a heading that said
+median. An average of medians is neither the median of the sessions nor the median
+stop, and it weights a one-session stop exactly like a ten-session one. The test
+could not tell, because every stop in its fixture week had the same median.
+Keeping the distribution is the only way the number printed can be the number
+named. (Codex review, 2026-10-01.)
+
+**Clean means the stored policy decided every stop, and nothing else.** A
+per-session override, a stop flag and a `CL_ROTATE` all contaminate a week, even
+when every session rotated the same way, because the decision was not uniform. The
+rule is expressed as "anything but the stored policy" rather than as a list of
+contaminating sources: the list form had already lost `flag`, which let a week of
+flag-driven stops be reported as a clean sample while the raw log said otherwise.
+An exported `CL_ROTATE` held for a whole week would genuinely be a clean arm, but
+nothing can distinguish that from a value typed once, and guessing optimistically
+is how a contaminated week gets believed.
+
+**A week is marked unclean whenever the DECISION was not uniform**, not merely
+when the outcome differed. With the default on and one session explicitly set to
+on, every effective mode is on — but the week still contains a deliberate
+override, and reporting it as a clean A/B sample would be a lie of omission. So
+source is tracked per session, independently of mode.
+
+**It reports the mechanism and refuses to imply it knows cost.** This tool cannot
+see money. Printing anything shaped like a saving would be a number nobody could
+check.
+
+**Weeks are grouped by the Monday they start on, computed exactly** (civil date →
+day number → back off to Monday). The first version derived a week number from
+the day of the year, which split a Mon–Fri run of stops across two buckets and
+mixed the two arms of the very comparison the report exists to make readable.
+A week containing per-session overrides, or a stop whose sessions disagreed, is
+marked so it is not read as a clean sample.
+
+**Forecloses:** policy now lives in three layers plus a flag, so "will this
+session rotate?" has no single answer without naming the layer — which is why
+`rotate status` reports the layer and the log records it. A simpler design (one
+env var) could not express "off everywhere except this session", and could not
+distinguish a deliberate experiment from a one-off override in the log.
+
+**Would reverse it:** finding that rotation is unambiguously cheaper across
+several ABAB weeks. Then the toggle becomes dead weight and the log can go with
+it — though `cl stop --no-handoff` should stay, since stopping a session as-is is
+useful independently of any measurement.
+
 ## 2026-09-29 — a restart row is cleared by the process that launched it
 
 **Chose:** where `cl start` creates the session itself (tmux, cmux) it consumes

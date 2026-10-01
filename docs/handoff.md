@@ -332,6 +332,53 @@ If a custom prompt asks for work *in addition* to the handoff, that work must
 happen **before** the handoff is written. The handoff landing is the only
 completion signal `cl` has, so anything after it can be interrupted by the kill.
 
+## Whether rotation happens at all
+
+Rotation is a trade. Each `cl stop` spends one handoff request per session — a
+real model call — and in exchange every later call in the replacement carries a
+short seeded context instead of a whole transcript. Which side wins is a question
+about how someone works, not one this design can settle, so the policy is
+switchable and each stop records which way it ran.
+
+```sh
+cl rotate                 # policy, plus whether a handoff is already waiting
+cl rotate off             # sessions are stopped and resumed as-is
+cl rotate off "Review"    # one session; cl rotate clear "Review" undoes it
+cl rotate stats           # the per-stop log, by week
+```
+
+Resolved per session, highest first: a flag on the stop (`--no-handoff`,
+`--require-handoff`), then `CL_ROTATE=0|1`, then the stored setting in
+`rotate.json`, then on. Off skips the **request**, not merely its use: asking and
+discarding would pay rotation's cost while measuring its absence.
+
+`rotation-log.tsv` gets one line per stop — mode, which layer decided, sessions,
+handoffs obtained, and **every session's context size at stop time**. That last
+field is the point. A rotate/resume count next to a bill cannot separate rotation
+from a busier week, whereas context size is the per-call multiplier rotation
+actually removes. Each size is kept rather than only a per-stop summary, so a
+week's figure can be a true median across sessions: an average of per-stop
+medians is a different number, and weights a one-session stop like a ten-session
+one.
+
+`cl rotate stats` groups by the Monday each week starts on. A week is clean only
+when the **stored policy** decided every stop in it; a per-session override, a
+stop flag, or a `CL_ROTATE` all mark it, even when every session still rotated the
+same way, because the decision was no longer uniform. The rule is written as
+"anything but the stored policy contaminates" rather than as a list of
+contaminating sources — a list is a thing to forget to extend, and `flag` was
+once missing from one. It reports the mechanism and nothing about money, because
+the tool cannot see a bill.
+
+The log's columns gained `ctx_all` after it first shipped. A file written by the
+earlier version has its header migrated forward on the next stop; older rows
+simply have no tenth field, which reads as an empty distribution and is exactly
+what makes a week print as approximate.
+
+Codex threads are `n/a` rather than `off`: a handoff is a Claude session
+summarising itself, so there is no mechanism there to enable. `cl stop` never asks
+them for one whatever the policy says.
+
 ## What lives in the store
 
 | path | holds |
