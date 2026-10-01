@@ -33,6 +33,8 @@ mkdir -p "$HOME/.claude/projects/p1" "$HOME/.claude/projects/p2" "$FIX/work" "$F
 ROT="$HOME/.config/claude-session/rotate.json"
 LOG="$HOME/.config/claude-session/rotation-log.tsv"
 STATE="$HOME/.config/claude-session/state.json"
+# The exact nine-column header this log shipped with before ctx_all existed.
+LEGACY_HEADER=$(printf 'timestamp\tmode\tsource\tsessions\thandoffs\tresume_only\tkept\tctx_total\tctx_median')
 
 # Two discoverable Claude sessions, with transcript usage so context_size has a
 # figure to report (the log's whole point is recording it).
@@ -248,7 +250,7 @@ printf 'a log from the previous version is migrated, not corrupted\n'
 # ctx_all was added after this log first shipped. Appending a ten-column row under
 # a nine-column header leaves a file the built-in parser happens to read but whose
 # header lies to a human or any other tool.
-printf 'timestamp\tmode\tsource\tsessions\thandoffs\tresume_only\tkept\tctx_total\tctx_median\n' > "$LOG"
+printf '%s\n' "$LEGACY_HEADER" > "$LOG"
 printf '2026-09-21T09:00:00Z\ton\tdefault\t4\t4\t0\t0\t400000\t100000\n' >> "$LOG"
 cl rotate on >/dev/null
 cl stop --keep-tabs >/dev/null 2>&1
@@ -268,11 +270,70 @@ check "the legacy week is still reported, marked approximate" "~100k" \
 # Migration is idempotent: a second stop must not add another header.
 cl stop --keep-tabs >/dev/null 2>&1
 check "a second stop does not re-migrate" "1" "$(grep -c '^timestamp' "$LOG")"
-# A file that is not ours is left completely alone.
-printf 'some other tool wrote this\nand this\n' > "$LOG"
-cl stop --keep-tabs >/dev/null 2>&1
-check "a foreign file keeps its first line" "some other tool wrote this" "$(head -1 "$LOG")"
+# A file that is not ours is left completely alone. Migration matches the EXACT
+# headers this tool has written; it used to match any first line beginning
+# "timestamp", which silently replaced a foreign header with this schema — data
+# loss, and a direct contradiction of the rule the function states. The old test
+# only used a first line that did not start with "timestamp" at all, so it proved
+# nothing about the dangerous branch.
+for foreign in \
+  'some other tool wrote this' \
+  'timestamp_ms	event	value' \
+  'timestamp	something	else' \
+  'timestamp_ms	ctx_all_of_them	x' \
+  'timestamp	mode	source	sessions	handoffs	resume_only	kept	ctx_total' ; do
+  printf '%s\nrow one\nrow two\n' "$foreign" > "$LOG"
+  before=$(cat "$LOG")
+  cl stop --keep-tabs >/dev/null 2>&1
+  check "foreign header kept byte-for-byte: ${foreign%%	*}…" "$foreign" "$(head -1 "$LOG")"
+  # …and its existing rows are untouched too, not just its first line.
+  check "…with its rows intact" "row one row two" \
+    "$(sed -n '2,3p' "$LOG" | tr '\n' ' ' | sed 's/ $//')"
+done
 rm -f "$LOG"
+
+printf 'a migration that cannot complete says so, and still stops\n'
+# Silence here would leave exactly the mixed schema the migration exists to
+# prevent, with nothing said about it. Two of the three failure points are
+# reachable cleanly; all three share one warning.
+#
+# (a) the lock cannot be taken — a lock left by a process that is gone is reported
+#     rather than broken, which is this project's rule everywhere else too.
+printf '%s\n' "$LEGACY_HEADER" > "$LOG"
+printf '2026-09-21T09:00:00Z\ton\tdefault\t4\t4\t0\t0\t400000\t100000\n' >> "$LOG"
+ln -s '999999999:not-a-real-start-token' "$LOG.lock" 2>/dev/null
+out=$(cl stop --keep-tabs 2>&1); rc=$?
+rm -f "$LOG.lock"
+check "a blocked lock still lets the stop succeed" "0" "$rc"
+has "…and names the field the header does not" "$out" "ctx_all"
+has "…and says how to fix it" "$out" "replacing the first line"
+check "…the legacy header is untouched" "$LEGACY_HEADER" "$(head -1 "$LOG")"
+check "…and the row was still recorded" "2" "$(grep -c '^20' "$LOG" | tr -d ' ')"
+rm -f "$LOG"
+
+# (b) the temp file is created but the replacement is refused — the arrangement
+#     that isolates the `mv` itself.
+if command -v chflags >/dev/null 2>&1; then
+  printf '%s\n' "$LEGACY_HEADER" > "$LOG"
+  printf '2026-09-21T09:00:00Z\ton\tdefault\t4\t4\t0\t0\t400000\t100000\n' >> "$LOG"
+  chflags uchg "$LOG" 2>/dev/null
+  out=$(cl stop --keep-tabs 2>&1); rc=$?
+  chflags nouchg "$LOG" 2>/dev/null
+  check "a refused replacement still lets the stop succeed" "0" "$rc"
+  has "…and is reported rather than silent" "$out" "could not update the column header"
+  check "…leaving the original header intact" "$LEGACY_HEADER" "$(head -1 "$LOG")"
+  check "…and no temp file left behind" "0" \
+    "$(ls "$HOME/.config/claude-session"/*.mig.* 2>/dev/null | grep -c . | tr -d ' ')"
+else
+  # Reported, not skipped silently: a quiet skip is indistinguishable from a pass.
+  printf '  SKIP no chflags here — the refused-replacement path is unexercised on this platform\n'
+fi
+rm -f "$LOG"
+# The third point — the temp file cannot be created at all — shares the same
+# warning and is not given its own case: isolating it needs the log's directory
+# unwritable, which also stops save_state writing state.json and makes `cl stop`
+# fail earlier for an unrelated and correct reason. Testing it that way would
+# assert the wrong thing.
 
 printf 'an unwritable log never blocks a stop\n'
 # A measurement must not be able to stop you shutting down. This is the one
