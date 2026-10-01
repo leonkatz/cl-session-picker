@@ -1,0 +1,254 @@
+#!/usr/bin/env bash
+# test-rotate-toggle.sh — the rotation policy, its precedence, and the per-stop log.
+#
+# What this suite is actually protecting:
+#
+#   * PRECEDENCE. Four layers decide whether a session is asked for a handoff
+#     (stop flag, CL_ROTATE, stored setting, default-on). Getting the order wrong
+#     is silent: you would believe an experiment ran one way while it ran the
+#     other, and the measurement would be worthless rather than obviously broken.
+#
+#   * THE LOG MUST NOT BLOCK A STOP. This is a measurement feature. If it could
+#     refuse a shutdown it would be worse than not existing, so an unwritable log
+#     is asserted to leave the stop working.
+#
+#   * WEEK BOUNDARIES. The report groups by the Monday a week starts on. A first
+#     version derived a week number from the day of the year, which split a Mon-Fri
+#     run of stops across two buckets — mixing the two arms of the very A/B the
+#     report exists to make readable.
+set -u
+
+CL="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/bin/claude-session"
+[ -x "$CL" ] || { printf 'FIXTURE SETUP FAILED: %s not executable\n' "$CL" >&2; exit 2; }
+FIX="$(mktemp -d "${TMPDIR:-/tmp}/cl-rotate.XXXXXX")"; trap 'rm -rf "$FIX"' EXIT
+pass=0; fail=0
+check() { if [ "$2" = "$3" ]; then pass=$((pass+1)); printf '  ok   %s\n' "$1"; else fail=$((fail+1)); printf '  FAIL %s\n       expected [%s] got [%s]\n' "$1" "$2" "$3"; fi; }
+has()  { case "$2" in *"$3"*) pass=$((pass+1)); printf '  ok   %s\n' "$1" ;; *) fail=$((fail+1)); printf '  FAIL %s\n       wanted [%s] in: %s\n' "$1" "$3" "$2" ;; esac; }
+hasnt(){ case "$2" in *"$3"*) fail=$((fail+1)); printf '  FAIL %s\n       did NOT want [%s] in: %s\n' "$1" "$3" "$2" ;; *) pass=$((pass+1)); printf '  ok   %s\n' "$1" ;; esac; }
+setup_failed() { printf 'FIXTURE SETUP FAILED: %s\n' "$1" >&2; exit 2; }
+command -v jq >/dev/null 2>&1 || setup_failed "jq is required by the code under test"
+
+export HOME="$FIX/home"
+mkdir -p "$HOME/.claude/projects/p1" "$HOME/.claude/projects/p2" "$FIX/work" "$FIX/bin" || setup_failed mkdir
+ROT="$HOME/.config/claude-session/rotate.json"
+LOG="$HOME/.config/claude-session/rotation-log.tsv"
+STATE="$HOME/.config/claude-session/state.json"
+
+# Two discoverable Claude sessions, with transcript usage so context_size has a
+# figure to report (the log's whole point is recording it).
+SID_A=01aaaaaa-0000-7000-8000-0000000000aa
+SID_B=01bbbbbb-0000-7000-8000-0000000000bb
+mk_claude() { # sid name last_input_tokens
+  printf '{"cwd":"%s"}\n{"customTitle":"%s"}\n' "$FIX/work" "$2" > "$HOME/.claude/projects/p1/$1.jsonl"
+  printf '{"message":{"usage":{"input_tokens":%s,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}\n' "$3" \
+    >> "$HOME/.claude/projects/p1/$1.jsonl"
+}
+mk_claude "$SID_A" Alpha 120000
+mk_claude "$SID_B" Beta   40000
+# One discoverable Codex thread, so the n/a cell and the never-asked rule have a
+# row to be true of.
+export CODEX_HOME="$HOME/.codex"
+SID_G=01cccccc-0000-7000-8000-0000000000cc
+mkdir -p "$CODEX_HOME/sessions/2026/01/01" || setup_failed mkdir-codex
+printf '{"id":"%s","thread_name":"Gamma","updated_at":"2026-01-01T00:00:00Z"}\n' "$SID_G" > "$CODEX_HOME/session_index.jsonl"
+printf '{"type":"session_meta","payload":{"id":"%s","cwd":"%s"}}\n' "$SID_G" "$FIX/work" \
+  > "$CODEX_HOME/sessions/2026/01/01/rollout-2026-01-01T00-00-00-$SID_G.jsonl"
+
+# A fake claude that records argv, so nothing in this suite can launch a real agent.
+printf '#!/bin/sh\nfor a in "$@"; do printf "%%s\\n" "$a"; done > "%s"\nexit 0\n' "$FIX/argv.claude" > "$FIX/bin/claude"
+chmod +x "$FIX/bin/claude" || setup_failed chmod
+# No tmux and no osascript: cl then prints commands rather than opening tabs, which
+# keeps every case in this suite to the decision under test.
+BASEPATH="$FIX/bin:/usr/bin:/bin"
+# CL_HANDOFF_BUDGET=1 throughout: these cases are about WHETHER a handoff is asked
+# for, never about waiting for one. On the 300s default each stop would block for
+# five minutes and the suite would look hung instead of failing.
+cl() { ( cd "$FIX" && env -i HOME="$HOME" CODEX_HOME="$CODEX_HOME" PATH="$BASEPATH" CL_HANDOFF_BUDGET=1 \
+         ${CL_ROTATE+CL_ROTATE="$CL_ROTATE"} ${CL_SESSION_NAME+CL_SESSION_NAME="$CL_SESSION_NAME"} \
+         bash "$CL" "$@" ) ; }
+
+printf 'the default, and changing it\n'
+check "rotation is on with no store at all" "on" "$(cl rotate status | awk '/^default/{print $3}')"
+check "…and no store file was created by asking" "0" "$([ -e "$ROT" ] && echo 1 || echo 0)"
+cl rotate off >/dev/null
+check "rotate off sets the default" "off" "$(cl rotate status | awk '/^default/{print $3}')"
+cl rotate on >/dev/null
+check "rotate on sets it back" "on" "$(cl rotate status | awk '/^default/{print $3}')"
+out=$(cl rotate off)
+has "…and says what off means" "$out" "will not ask for handoffs"
+
+printf 'a per-session override beats the default, both ways\n'
+cl rotate on Alpha >/dev/null
+check "override on, default off" "on" "$(cl rotate status | awk '/Alpha/{print $3}')"
+check "…and Beta still follows the default" "off" "$(cl --list 2>/dev/null | awk '$2=="Beta"{print $6}')"
+cl rotate on >/dev/null; cl rotate off Alpha >/dev/null
+check "override off, default on" "off" "$(cl --list 2>/dev/null | awk '$2=="Alpha"{print $6}')"
+check "…Beta follows the default again" "on" "$(cl --list 2>/dev/null | awk '$2=="Beta"{print $6}')"
+out=$(cl rotate status)
+has "status warns overrides spoil a measurement week" "$out" "ambiguous"
+cl rotate clear Alpha >/dev/null
+check "clear removes the override" "on" "$(cl --list 2>/dev/null | awk '$2=="Alpha"{print $6}')"
+out=$(cl rotate status)
+has "…and status says there are none" "$out" "overrides: none"
+
+printf 'a hand-edited store is reported, not obeyed\n'
+# The file is user-editable, so a nonsense value must not silently become policy.
+printf '{"default":"maybe","sessions":{"claude":{"Alpha":"sometimes"}}}\n' > "$ROT"
+out=$(cl rotate status 2>&1)
+check "an unreadable default falls back to on" "on" "$(cl rotate status 2>/dev/null | awk '/^default/{print $3}')"
+has "…and says so" "$out" "ignoring unreadable default"
+# A bad per-session value is reported by `rotate status`, not by a listing: `cl`
+# renders one row per session into a chooser and must not emit stray text there.
+out=$(cl rotate status 2>&1)
+has "…and a per-session value is reported by status" "$out" "ignoring unreadable setting"
+check "…with that session falling back to the default" "on" "$(cl --list 2>/dev/null | awk '$2=="Alpha"{print $6}')"
+rm -f "$ROT"
+
+printf 'codex is n/a — a thread that cannot write a handoff is not "off"\n'
+# Reporting "off" would imply it could be switched on. It cannot: a handoff is a
+# Claude session summarising itself.
+check "rotate on <name> refuses --codex" "1" "$(cl rotate on --codex Alpha >/dev/null 2>&1; echo $?)"
+out=$(cl rotate on --codex Alpha 2>&1)
+has "…and says why" "$out" "Claude mechanism"
+# A discoverable Codex thread, so the LISTING can be checked too. Without one in
+# the fixture the n/a cell was unreachable: a revert matrix removed the guard
+# that produces it and nothing failed, because no row ever exercised it.
+out=$(cl --list 2>/dev/null)
+check "a codex row shows n/a in HANDOFF, not a setting" "—" "$(printf '%s' "$out" | awk '$2=="Gamma"{print $6}')"
+check "…and the default does not change that" "—" \
+  "$(cl rotate off >/dev/null; cl --list 2>/dev/null | awk '$2=="Gamma"{print $6}')"
+cl rotate on >/dev/null
+# …and it is never asked for a handoff at a stop, whatever the policy says.
+out=$(cl stop --dry-run 2>&1)
+hasnt "a codex thread is never asked for a handoff" "$out" 'ask "Gamma"'
+has   "…while a claude one still is" "$out" 'ask "Alpha"'
+
+printf 'precedence: flag, then CL_ROTATE, then the stored setting\n'
+# Asserted through `cl stop --dry-run`, which reports the decision per session
+# without killing anything or waiting on a handoff.
+cl rotate off >/dev/null
+out=$(cl stop --dry-run 2>&1)
+has "stored off is honoured" "$out" "rotation off"
+out=$(CL_ROTATE=1 cl stop --dry-run 2>&1)
+has "CL_ROTATE=1 overrides stored off" "$out" "rotation on"
+out=$(cl stop --dry-run --require-handoff 2>&1)
+has "a flag overrides stored off" "$out" "rotation on"
+cl rotate on >/dev/null
+out=$(CL_ROTATE=0 cl stop --dry-run 2>&1)
+has "CL_ROTATE=0 overrides stored on" "$out" "rotation off"
+out=$(cl stop --dry-run --no-handoff 2>&1)
+has "--no-handoff overrides stored on" "$out" "rotation off"
+out=$(CL_ROTATE=1 cl stop --dry-run --no-handoff 2>&1)
+has "a flag also outranks CL_ROTATE" "$out" "rotation off"
+out=$(CL_ROTATE=banana cl stop --dry-run 2>&1)
+has "an unparseable CL_ROTATE is reported" "$out" "ignoring CL_ROTATE"
+has "…and the stored value is used instead" "$out" "rotation on"
+
+printf 'rotation off means the handoff is never REQUESTED\n'
+# Half the measurement: the request is itself a model call per session, so an
+# "off" week has to skip it, not ask and discard.
+cl rotate off >/dev/null
+out=$(cl stop --dry-run 2>&1)
+hasnt "no handoff is requested when off" "$out" "asked"
+cl rotate on >/dev/null
+out=$(cl stop --dry-run 2>&1)
+has "…and one is when on" "$out" 'would ask "Alpha" to write handoff' 
+
+printf 'the log records a stop, including an off one\n'
+rm -f "$LOG"
+cl rotate off >/dev/null
+cl stop --keep-tabs >/dev/null 2>&1
+check "a log file is created" "1" "$([ -f "$LOG" ] && echo 1 || echo 0)"
+check "…with exactly one header" "1" "$(grep -c '^timestamp' "$LOG")"
+check "…and one row for the stop" "1" "$(( $(wc -l < "$LOG") - 1 ))"
+check "…recording mode off" "off" "$(awk -F'\t' 'NR==2{print $2}' "$LOG")"
+check "…naming the layer that decided" "default" "$(awk -F'\t' 'NR==2{print $3}' "$LOG")"
+check "…counting both sessions" "2" "$(awk -F'\t' 'NR==2{print $4}' "$LOG")"
+check "…with no handoffs obtained" "0" "$(awk -F'\t' 'NR==2{print $5}' "$LOG")"
+# The context figures are the link between rotation and spend; a log without them
+# answers nothing.
+# Lower median on an even count, which is a choice rather than a law: with two
+# sessions of 120k and 40k either is defensible, so the code picks one and the
+# comment says which, instead of being silently arbitrary.
+check "…and the median context of the two sessions" "40000" "$(awk -F'\t' 'NR==2{print $9}' "$LOG")"
+check "…and their total" "160000" "$(awk -F'\t' 'NR==2{print $8}' "$LOG")"
+cl stop --keep-tabs >/dev/null 2>&1
+check "a second stop appends rather than replacing" "2" "$(( $(wc -l < "$LOG") - 1 ))"
+check "…still one header" "1" "$(grep -c '^timestamp' "$LOG")"
+
+printf 'a mixed stop is recorded as mixed, not as one arm of the experiment\n'
+rm -f "$LOG"; cl rotate on >/dev/null; cl rotate off Alpha >/dev/null
+cl stop --keep-tabs >/dev/null 2>&1
+check "mode is mixed when sessions disagreed" "mixed" "$(awk -F'\t' 'NR==2{print $2}' "$LOG")"
+check "…and the source says so too" "mixed" "$(awk -F'\t' 'NR==2{print $3}' "$LOG")"
+cl rotate clear Alpha >/dev/null
+
+printf 'an unwritable log never blocks a stop\n'
+# A measurement must not be able to stop you shutting down. This is the one
+# failure in the feature whose direction is not negotiable.
+rm -f "$LOG"
+mkdir -p "$HOME/.config/claude-session" 2>/dev/null
+printf 'not a log\n' > "$LOG"; chmod 000 "$LOG" 2>/dev/null
+out=$(cl stop --keep-tabs 2>&1); rc=$?
+check "the stop still succeeds" "0" "$rc"
+has "…and says the stop is missing from the log" "$out" "not in the rotation log"
+has "…while still reporting the stop itself" "$out" "state saved"
+chmod 644 "$LOG" 2>/dev/null; rm -f "$LOG"
+
+printf 'stats group by the Monday a week starts on\n'
+# The regression that matters: a Mon-Fri run must be ONE row. Day-of-year
+# arithmetic split it in two, mixing the arms of the comparison.
+printf 'timestamp\tmode\tsource\tsessions\thandoffs\tresume_only\tkept\tctx_total\tctx_median\n' > "$LOG"
+for d in 2026-09-28 2026-09-29 2026-09-30 2026-10-01 2026-10-02; do
+  printf '%sT09:00:00Z\ton\tdefault\t6\t6\t0\t0\t372000\t62000\n' "$d" >> "$LOG"
+done
+for d in 2026-10-05 2026-10-09; do
+  printf '%sT09:00:00Z\toff\tdefault\t6\t0\t6\t0\t1086000\t181000\n' "$d" >> "$LOG"
+done
+printf '2026-10-12T09:00:00Z\tmixed\tsession\t6\t3\t3\t0\t720000\t120000\n' >> "$LOG"
+out=$(cl rotate stats)
+check "the Mon-Fri run is one week, not two" "1" "$(printf '%s' "$out" | grep -c '^2026-09-28')"
+check "…with all five cycles in it" "5" "$(printf '%s' "$out" | awk '/^2026-09-28/{print $3}')"
+check "…and all thirty sessions" "30" "$(printf '%s' "$out" | awk '/^2026-09-28/{print $4}')"
+check "Mon and Fri of the next week group together" "2" "$(printf '%s' "$out" | awk '/^2026-10-05/{print $3}')"
+check "the rotating week reports its median context" "62k" "$(printf '%s' "$out" | awk '/^2026-09-28/{print $5}')"
+check "…and the non-rotating week its larger one" "181k" "$(printf '%s' "$out" | awk '/^2026-10-05/{print $5}')"
+check "a week with overrides is flagged" "yes" "$(printf '%s' "$out" | awk '/^2026-10-12/{print $6}')"
+check "…and a clean week is not" "-" "$(printf '%s' "$out" | awk '/^2026-09-28/{print $6}')"
+has "stats refuses to pretend it knows cost" "$out" "context each session had grown to"
+# A log containing junk must not take the report down with it.
+printf 'garbage line with no tabs\n' >> "$LOG"
+out=$(cl rotate stats 2>&1)
+check "a malformed line is skipped, not fatal" "5" "$(printf '%s' "$out" | awk '/^2026-09-28/{print $3}')"
+
+printf 'the listing shows policy and pending state separately\n'
+rm -f "$LOG"; cl rotate on >/dev/null
+out=$(cl --list 2>/dev/null)
+has "there is a HANDOFF column" "$out" "HANDOFF"
+# …and a HINT column beside it. These were one unlabelled column, which read as
+# if the context-size advice were the setting.
+has "…and a separate HINT column" "$out" "HINT"
+check "a session with rotation on shows on" "on" "$(printf '%s' "$out" | awk '$2=="Alpha"{print $6}')"
+# A complete handoff waiting is STATE, not policy, and shows as a marker beside it.
+HR="$HOME/.local/state/claude-session/handoff"
+mkdir -p "$HR" 2>/dev/null
+printf '# notes\n<!-- cl:manual:2026-10-01T09:00:00Z@%s -->\n' "$SID_A" > "$HR/Alpha.md"
+out=$(cl --list 2>/dev/null)
+check "a pending handoff is marked on the row" "on↻" "$(printf '%s' "$out" | awk '$2=="Alpha"{print $6}')"
+check "…and a session without one is not" "on" "$(printf '%s' "$out" | awk '$2=="Beta"{print $6}')"
+cl rotate off Alpha >/dev/null
+out=$(cl --list 2>/dev/null)
+# off + pending is a real, visible inconsistency: someone wrote a handoff by hand
+# for a session that will not be asked for one. The next stop clears it.
+check "off with a handoff waiting shows both" "off↻" "$(printf '%s' "$out" | awk '$2=="Alpha"{print $6}')"
+rm -f "$HR/Alpha.md"; cl rotate clear Alpha >/dev/null
+
+printf 'asked from inside a session, status answers about THAT session\n'
+out=$(CL_SESSION_NAME=Alpha cl rotate status)
+has "it leads with this session" "$out" 'this session ("Alpha")'
+has "…and still reports the default" "$out" "default: rotation"
+out=$(cl rotate status)
+hasnt "outside a session it does not invent one" "$out" "this session"
+
+printf '\n%s passed, %s failed\n' "$pass" "$fail"
+[ "$fail" -eq 0 ] || exit 1

@@ -387,6 +387,51 @@ clients on one transcript.
 life means skip. A false positive costs a tab you reopen by hand; a false
 negative starts a second client on a live transcript.
 
+### Turning rotation off, and measuring whether it pays
+
+Rotation is a **trade**, not a free win: every `cl stop` spends one handoff
+request per session (a real call), and in exchange every later call carries a
+short seeded context instead of a long transcript. Which side wins depends on how
+you actually work, so `cl` can run both ways and record which way it ran.
+
+```sh
+cl rotate                 # what is the policy, and what is pending?
+cl rotate off             # stop asking for handoffs (sessions resume as-is)
+cl rotate on              # back to rotating
+cl rotate off "Review"    # just that session; cl rotate clear "Review" undoes it
+cl rotate stats           # what the log says, by week
+```
+
+Precedence, highest first: a flag on the command (`--no-handoff` /
+`--require-handoff`), then `CL_ROTATE=0|1` for a one-off, then the stored
+setting, then on. Turning rotation off skips the handoff **request**, not just
+its use — otherwise you would pay rotation's cost while measuring its absence.
+
+Every `cl stop` appends one line to
+`~/.config/claude-session/rotation-log.tsv`: how the stop ran, which layer
+decided, how many sessions, how many handoffs landed, and the **context sizes at
+stop time** — the per-call cost rotation removes. `cl rotate stats` groups it by
+the Monday each week starts on:
+
+```
+WEEK FROM      MODE      CYCLES  SESSIONS  CTX MEDIAN  OVERRIDES
+2026-09-28     on             5        30         62k          -
+2026-10-05     off            5        30        181k          -
+```
+
+This reports the **mechanism, not money** — `cl` cannot see a bill. It tells you
+how much context you were carrying each way, and how much work was in each week,
+so a difference in spend can be attributed instead of guessed at. Alternate over
+several weeks rather than one each: a single week's volume varies enough to swamp
+the effect. A week where per-session overrides were active is flagged
+`OVERRIDES=yes`, because it is not a clean sample.
+
+The `HANDOFF` column in `cl` and `cl --list` shows each session's setting, with
+`↻` when a complete handoff is already waiting — so `off↻` means someone wrote
+one by hand for a session that will not be asked for one, and the next stop will
+clear it. Codex rows show `—`: rotation needs a session that can summarise
+itself, so there is nothing there to switch on.
+
 ### Rotation hint
 
 `cl --list` shows an approximate current context size per Claude session (last

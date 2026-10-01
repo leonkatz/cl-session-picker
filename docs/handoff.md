@@ -332,6 +332,38 @@ If a custom prompt asks for work *in addition* to the handoff, that work must
 happen **before** the handoff is written. The handoff landing is the only
 completion signal `cl` has, so anything after it can be interrupted by the kill.
 
+## Whether rotation happens at all
+
+Rotation is a trade. Each `cl stop` spends one handoff request per session — a
+real model call — and in exchange every later call in the replacement carries a
+short seeded context instead of a whole transcript. Which side wins is a question
+about how someone works, not one this design can settle, so the policy is
+switchable and each stop records which way it ran.
+
+```sh
+cl rotate                 # policy, plus whether a handoff is already waiting
+cl rotate off             # sessions are stopped and resumed as-is
+cl rotate off "Review"    # one session; cl rotate clear "Review" undoes it
+cl rotate stats           # the per-stop log, by week
+```
+
+Resolved per session, highest first: a flag on the stop (`--no-handoff`,
+`--require-handoff`), then `CL_ROTATE=0|1`, then the stored setting in
+`rotate.json`, then on. Off skips the **request**, not merely its use: asking and
+discarding would pay rotation's cost while measuring its absence.
+
+`rotation-log.tsv` gets one line per stop — mode, which layer decided, sessions,
+handoffs obtained, and the **context sizes at stop time**. That last field is the
+point. A rotate/resume count next to a bill cannot separate rotation from a busier
+week, whereas context size is the per-call multiplier rotation actually removes.
+`cl rotate stats` groups by the Monday each week starts on and marks any week
+where per-session overrides were in play, since those are not clean samples. It
+reports the mechanism and nothing about money, because the tool cannot see a bill.
+
+Codex threads are `n/a` rather than `off`: a handoff is a Claude session
+summarising itself, so there is no mechanism there to enable. `cl stop` never asks
+them for one whatever the policy says.
+
 ## What lives in the store
 
 | path | holds |

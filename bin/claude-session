@@ -56,6 +56,26 @@
 #                             #   it — the way out when a pane can't be reached.
 #                             #   Pipe the text in, or run it bare to be told
 #                             #   where to write. --path prints just the path.
+#   claude-session rotate     # whether `cl stop` asks for handoffs at all.
+#                             #   `rotate` / `rotate status` reports it (run
+#                             #   INSIDE a session and it leads with that one);
+#                             #   `rotate off` / `rotate on` set the default;
+#                             #   `rotate off "Name"` overrides one session and
+#                             #   `rotate clear "Name"` un-overrides it.
+#                             #   Precedence: a stop flag, then CL_ROTATE, then
+#                             #   the stored setting, then on.
+#                             #   `rotate stats` summarises the per-stop log
+#                             #   (~/.config/claude-session/rotation-log.tsv) by
+#                             #   week: how many stops ran each way, how much
+#                             #   work was in them, and the median context being
+#                             #   carried — so a change in spend can be
+#                             #   attributed rather than guessed at. Turning
+#                             #   rotation off skips the handoff REQUEST too,
+#                             #   which is itself a call per session, so both
+#                             #   sides of the trade are measured.
+#                             #   The HANDOFF column in `cl` / `cl --list` shows
+#                             #   each session's setting, with ↻ when a complete
+#                             #   handoff is already waiting.
 #   claude-session start      # relaunch every session from the last stop, each as
 #                             #   the agent it was saved under. Rotation is a CLAUDE
 #                             #   mechanism: a Codex row always resumes as itself.
@@ -126,6 +146,23 @@ STATE_HISTORY_DIR="$HOME/.config/claude-session/history"
 # transcript id.
 MODELS="$HOME/.config/claude-session/models.json"
 STATE_HISTORY_KEEP=10
+
+# Whether `cl stop` asks for handoffs: a global default plus optional per-session
+# overrides. Separate from MODELS because it answers a different question (what
+# should happen to this session) and is written on a different cadence.
+#
+#   { "default": "on", "sessions": { "claude": { "Review": "off" } } }
+#
+# It exists to be TOGGLED for measurement: rotation trades a cost (one handoff
+# request per session, per stop) against a saving (every later call carries a
+# seeded context instead of a long transcript). Which wins is an empirical
+# question about how someone actually works, so the tool has to be able to run
+# both ways and record which way it ran.
+ROTATE="$HOME/.config/claude-session/rotate.json"
+# One appended line per `cl stop`. The point is to make a spend difference
+# explainable rather than coincidental, so it records the CONTEXT SIZES at stop
+# time — the per-call multiplier rotation actually reduces — not just a count.
+ROTATION_LOG="$HOME/.config/claude-session/rotation-log.tsv"
 
 # --- handoff / fresh-start config --------------------------------------------
 # Where handoffs are written. Local state by default, because that is the only
@@ -987,13 +1024,21 @@ model_flag() {
 # Same ownership rule as the launch registry: the lock names its holder, and is
 # reclaimed only on PROOF the holder is gone (its start token no longer
 # matches), never on age.
-models_lock() {
-  local lock="$MODELS.lock" holder hpid me i=0
+# store_lock <file> / store_unlock <file>: the read-modify-write lock for a
+# small JSON store under ~/.config/claude-session.
+#
+# Generalised from models_lock when the rotation store needed the same thing. It
+# is deliberately ONE implementation rather than two: the reasoning below about
+# never unlinking a stale lock is subtle, was got wrong once already, and a
+# second copy is a second chance to get it wrong. models_lock/models_unlock
+# remain as named wrappers so their call sites still read as being about models.
+store_lock() {
+  local lock="$1.lock" holder hpid me i=0
   # Fail closed on our own identity FIRST: a lock created from an empty token
   # publishes a weak "PID:" holder that the next writer reads as stale.
   me=$(claim_token)
   case "$me" in
-    *:) echo "claude-session: cannot read this process's start time — refusing to update $MODELS unowned" >&2
+    *:) echo "claude-session: cannot read this process's start time — refusing to update $1 unowned" >&2
         return 1 ;;
   esac
   while [ "$i" -lt 100 ]; do
@@ -1026,14 +1071,296 @@ models_lock() {
     sleep 0.05
     i=$((i+1))
   done
-  echo "claude-session: another process is updating $MODELS — try again" >&2
+  echo "claude-session: another process is updating $1 — try again" >&2
   return 1
 }
 # Releasing is safe where reclaiming is not: this unlinks only while the link
 # still names US, so it cannot delete a successor's lock.
-models_unlock() {
-  local lock="$MODELS.lock"
+store_unlock() {
+  local lock="$1.lock"
   [ "$(readlink "$lock" 2>/dev/null)" = "$(claim_token)" ] && rm -f "$lock"
+  return 0
+}
+
+models_lock()   { store_lock   "$MODELS"; }
+models_unlock() { store_unlock "$MODELS"; }
+rotate_lock()   { store_lock   "$ROTATE"; }
+rotate_unlock() { store_unlock "$ROTATE"; }
+
+# --- rotation policy ---------------------------------------------------------
+#
+# "Will `cl stop` ask this session for a handoff?" Three layers, and they answer
+# different questions, so they are kept apart rather than collapsed:
+#
+#   POLICY   what should happen        rotate.json / CL_ROTATE / a stop flag
+#   STATE    what is waiting now       a complete unconsumed handoff on disk
+#   ADVICE   what probably should      the context-size hint in `cl --list`
+#
+# Conflating policy with state is how a toggle becomes untrustworthy: a session
+# can have rotation ON and nothing pending, or OFF with a handoff someone wrote
+# by hand, and both are worth seeing.
+
+# A stored value is only ever "on" or "off". Anything else in the file is a hand
+# edit, and is reported rather than guessed at — the same rule model_for follows.
+_rotate_valid() { case "$1" in on|off) return 0 ;; *) return 1 ;; esac; }
+
+rotate_default() {
+  local v
+  [ -r "$ROTATE" ] || { printf 'on'; return 0; }
+  command -v jq >/dev/null 2>&1 || { printf 'on'; return 0; }
+  v=$(jq -r '.default // empty' "$ROTATE" 2>/dev/null)
+  if [ -n "$v" ] && ! _rotate_valid "$v"; then
+    printf 'claude-session: ignoring unreadable default "%s" in %s — treating rotation as on\n' "$v" "$ROTATE" >&2
+    printf 'on'; return 0
+  fi
+  printf '%s' "${v:-on}"
+}
+
+# rotate_for <name> [agent] -> on | off | n/a
+#
+# n/a for Codex, and that is a fact about the mechanism rather than a setting:
+# rotation needs a handoff, a handoff is a Claude session summarising itself, and
+# a Codex thread has no equivalent. Reporting "off" would imply it could be
+# turned on.
+rotate_for() {
+  local name="$1" agent="${2:-claude}" v
+  [ "$agent" = "claude" ] || { printf 'n/a'; return 0; }
+  if [ -r "$ROTATE" ] && command -v jq >/dev/null 2>&1; then
+    v=$(jq -r --arg a "$agent" --arg n "$name" '.sessions[$a][$n] // empty' "$ROTATE" 2>/dev/null)
+    if [ -n "$v" ]; then
+      if _rotate_valid "$v"; then printf '%s' "$v"; return 0; fi
+      printf 'claude-session: ignoring unreadable setting "%s" for "%s" in %s\n' "$v" "$name" "$ROTATE" >&2
+    fi
+  fi
+  rotate_default
+}
+
+# Which layer decided, for `cl rotate status`. A week of measurements is
+# ambiguous without it — "off" could be the experiment or a one-off override.
+rotate_source() {
+  local name="$1" agent="${2:-claude}" v
+  [ "$agent" = "claude" ] || { printf 'mechanism'; return 0; }
+  if [ -r "$ROTATE" ] && command -v jq >/dev/null 2>&1; then
+    v=$(jq -r --arg a "$agent" --arg n "$name" '.sessions[$a][$n] // empty' "$ROTATE" 2>/dev/null)
+    _rotate_valid "$v" && { printf 'session'; return 0; }
+  fi
+  printf 'default'
+}
+
+# rotate_effective <name> <agent> -> on | off
+# Adds the environment layer, for the stop path. A stop FLAG outranks all of
+# this and is applied by do_stop itself, where the flag is in scope.
+rotate_effective() {
+  local name="$1" agent="${2:-claude}"
+  [ "$agent" = "claude" ] || { printf 'off'; return 0; }
+  case "${CL_ROTATE:-}" in
+    0|off|no)   printf 'off'; return 0 ;;
+    1|on|yes)   printf 'on';  return 0 ;;
+    '')         : ;;
+    *) printf 'claude-session: ignoring CL_ROTATE="%s" (expected 0/1, on/off) \n' "$CL_ROTATE" >&2 ;;
+  esac
+  rotate_for "$name" "$agent"
+}
+
+# rotate_write <on|off|clear> [name] [agent]: update the store under its lock.
+rotate_write() {
+  local what="$1" name="${2:-}" agent="${3:-claude}" tmp rc=0
+  command -v jq >/dev/null 2>&1 || { echo "claude-session: jq is required to change rotation settings" >&2; return 1; }
+  mkdir -p "$(dirname "$ROTATE")" 2>/dev/null || { echo "claude-session: cannot create $(dirname "$ROTATE")" >&2; return 1; }
+  rotate_lock || return 1
+  [ -s "$ROTATE" ] || printf '{"default":"on","sessions":{}}\n' > "$ROTATE" 2>/dev/null
+  tmp="$ROTATE.tmp.$$"
+  if [ -z "$name" ]; then
+    jq --arg v "$what" '.default = $v | .sessions //= {}' "$ROTATE" > "$tmp" 2>/dev/null || rc=1
+  elif [ "$what" = "clear" ]; then
+    jq --arg a "$agent" --arg n "$name" 'if .sessions[$a] then .sessions[$a] |= del(.[$n]) else . end' "$ROTATE" > "$tmp" 2>/dev/null || rc=1
+  else
+    jq --arg a "$agent" --arg n "$name" --arg v "$what" '.sessions //= {} | .sessions[$a] //= {} | .sessions[$a][$n] = $v' "$ROTATE" > "$tmp" 2>/dev/null || rc=1
+  fi
+  if [ "$rc" -eq 0 ] && [ -s "$tmp" ]; then
+    mv "$tmp" "$ROTATE" 2>/dev/null || rc=1
+  else
+    rc=1
+  fi
+  rm -f "$tmp" 2>/dev/null
+  rotate_unlock
+  [ "$rc" -eq 0 ] || echo "claude-session: could not update $ROTATE — nothing was changed" >&2
+  return "$rc"
+}
+
+# rotation_log_append <mode> <source> <sessions> <handoffs> <resume_only> <kept> <ctx...>
+#
+# ALWAYS returns 0. This is a measurement, and a measurement must never be able
+# to stop you shutting your machine down — if the log cannot be written, say so
+# once and carry on. (The inverse of the handoff rules, where failing closed
+# protects a session; here failing closed would protect nothing and cost a stop.)
+rotation_log_append() {
+  local mode="$1" source="$2" sessions="$3" handoffs="$4" ronly="$5" kept="$6"
+  shift 6
+  local total=0 n=0 med=0 c sorted
+  for c in "$@"; do
+    case "$c" in ''|*[!0-9]*) continue ;; esac
+    total=$((total+c)); n=$((n+1))
+  done
+  if [ "$n" -gt 0 ]; then
+    # Median, not mean: one enormous session should not make a whole week look
+    # expensive. On an EVEN count this takes the lower of the two middles — with
+    # two sessions either is defensible, so the choice is stated here rather than
+    # left as an accident of the arithmetic.
+    sorted=$(printf '%s\n' "$@" | grep -E '^[0-9]+$' | sort -n | awk -v n="$n" 'NR==int((n+1)/2){print; exit}')
+    med="${sorted:-0}"
+  fi
+  mkdir -p "$(dirname "$ROTATION_LOG")" 2>/dev/null || { _rotation_log_warn; return 0; }
+  if [ ! -e "$ROTATION_LOG" ]; then
+    printf 'timestamp\tmode\tsource\tsessions\thandoffs\tresume_only\tkept\tctx_total\tctx_median\n' \
+      >> "$ROTATION_LOG" 2>/dev/null || { _rotation_log_warn; return 0; }
+  fi
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$mode" "$source" "$sessions" "$handoffs" "$ronly" "$kept" "$total" "$med" \
+    >> "$ROTATION_LOG" 2>/dev/null || _rotation_log_warn
+  return 0
+}
+_rotation_log_warn() {
+  printf 'claude-session: could not append to %s — this stop is not in the rotation log\n' "$ROTATION_LOG" >&2
+}
+
+# do_rotate: read and change the policy, and summarise what the log says.
+do_rotate() {
+  local sub="${1:-status}" target agent="claude" v src
+  case "$sub" in
+    on|off)
+      shift
+      if [ -n "${1:-}" ]; then
+        case "$1" in
+          --codex) echo "claude-session: rotation is a Claude mechanism — a Codex thread cannot write a handoff" >&2; return 1 ;;
+          --claude) shift ;;
+        esac
+      fi
+      target="${1:-}"
+      if [ -z "$target" ]; then
+        rotate_write "$sub" || return 1
+        printf 'rotation is now %s by default%s\n' "$sub" \
+          "$( [ "$sub" = off ] && printf ' — `cl stop` will not ask for handoffs' )"
+      else
+        rotate_write "$sub" "$target" "$agent" || return 1
+        printf 'rotation is now %s for "%s" (overriding the default, which is %s)\n' "$sub" "$target" "$(rotate_default)"
+      fi
+      return 0 ;;
+    clear)
+      shift; target="${1:-}"
+      [ -n "$target" ] || { echo "claude-session: rotate clear needs a session name" >&2; return 1; }
+      rotate_write clear "$target" "$agent" || return 1
+      printf '"%s" follows the default again (%s)\n' "$target" "$(rotate_default)"
+      return 0 ;;
+    stats) shift; rotate_stats "$@"; return $? ;;
+    status) : ;;
+    *) echo "claude-session: rotate: unknown argument '$sub' (on|off|clear|status|stats)" >&2; return 1 ;;
+  esac
+
+  # status. Inside a session, lead with THAT session: being able to ask "will I
+  # be rotated?" from where you are is the point of CL_SESSION_NAME existing.
+  if [ -n "${CL_SESSION_NAME:-}" ]; then
+    v=$(rotate_for "$CL_SESSION_NAME"); src=$(rotate_source "$CL_SESSION_NAME")
+    printf 'this session ("%s"): rotation %s (%s)\n' "$CL_SESSION_NAME" "$v" "$src"
+    if handoff_root >/dev/null 2>&1 && handoff_is_complete "$(handoff_path "$_CL_HANDOFF_ROOT" "$CL_SESSION_NAME")"; then
+      printf '  a complete handoff is waiting — `cl start` would start this one fresh from it\n'
+    fi
+    printf '\n'
+  fi
+  printf 'default: rotation %s\n' "$(rotate_default)"
+  if [ -r "$ROTATE" ] && command -v jq >/dev/null 2>&1; then
+    local line oa on ov shown=0
+    # Validated HERE rather than in the listing. A hand-edited value has to be
+    # reported somewhere, but a picker row is the wrong place: `cl` renders one
+    # line per session and must not emit stray text into the chooser. status is
+    # the diagnostic command, so it is the one that checks.
+    while IFS=$'\t' read -r oa on ov; do
+      [ -n "$on" ] || continue
+      [ "$shown" = "0" ] && { printf 'per-session overrides:\n'; shown=1; }
+      if _rotate_valid "$ov"; then
+        printf '  %s [%s]: %s\n' "$on" "$oa" "$ov"
+      else
+        printf '  %s [%s]: ignoring unreadable setting "%s" — follows the default (%s)\n' \
+          "$on" "$oa" "$ov" "$(rotate_default)"
+      fi
+    done < <(jq -r '.sessions // {} | to_entries[] | .key as $a | .value | to_entries[] | "\($a)\t\(.key)\t\(.value)"' "$ROTATE" 2>/dev/null)
+    if [ "$shown" = "1" ]; then
+      printf '\nNote: overrides make a measurement week ambiguous — `cl rotate stats` marks those weeks.\n'
+    else
+      printf 'per-session overrides: none\n'
+    fi
+  fi
+  [ -e "$ROTATION_LOG" ] && printf '\n%s stop(s) logged in %s — `cl rotate stats` summarises them\n' \
+    "$(( $(wc -l < "$ROTATION_LOG" 2>/dev/null || echo 1) - 1 ))" "$ROTATION_LOG"
+  return 0
+}
+
+# rotate_stats: aggregate the log by ISO week.
+#
+# Deliberately NOT a cost report: this tool cannot see money. It reports the
+# mechanism — how many stops ran each way, how much work was in them, and the
+# median context being carried — so a difference in a bill can be attributed
+# instead of guessed at.
+rotate_stats() {
+  [ -r "$ROTATION_LOG" ] || { printf 'no rotation log yet (%s) — run a `cl stop` first\n' "$ROTATION_LOG"; return 0; }
+  command -v awk >/dev/null 2>&1 || { echo "claude-session: awk is required for stats" >&2; return 1; }
+  printf '%-14s %-8s %7s %9s %11s %10s\n' 'WEEK FROM' MODE CYCLES SESSIONS 'CTX MEDIAN' OVERRIDES
+  # Weeks are grouped by the MONDAY they start on, computed exactly.
+  #
+  # The first version derived a week number from the day of the year, which put a
+  # Mon-Fri run of stops into two different buckets whenever it straddled a
+  # 7-day boundary that was not a Monday. For an A/B whose whole premise is
+  # "compare this week against that week", a smeared boundary silently mixes the
+  # two arms — the exact confound this report exists to rule out. So: civil date
+  # -> day number -> back off to Monday, with no dependence on a date(1) whose
+  # flags differ between BSD and GNU.
+  awk -F'\t' '
+    function days_from_civil(y, m, d,   era, yoe, doy, doe, yy) {
+      yy = y - (m <= 2 ? 1 : 0)
+      era = int((yy >= 0 ? yy : yy - 399) / 400)
+      yoe = yy - era * 400
+      doy = int((153 * (m + (m > 2 ? -3 : 9)) + 2) / 5) + d - 1
+      doe = yoe * 365 + int(yoe/4) - int(yoe/100) + doy
+      return era * 146097 + doe - 719468
+    }
+    function civil_from_days(z,   era, doe, yoe, y, doy, mp, d, m) {
+      z += 719468
+      era = int((z >= 0 ? z : z - 146096) / 146097)
+      doe = z - era * 146097
+      yoe = int((doe - int(doe/1460) + int(doe/36524) - int(doe/146096)) / 365)
+      y = yoe + era * 400
+      doy = doe - (365 * yoe + int(yoe/4) - int(yoe/100))
+      mp = int((5 * doy + 2) / 153)
+      d = doy - int((153 * mp + 2) / 5) + 1
+      m = mp + (mp < 10 ? 3 : -9)
+      y += (m <= 2)
+      return sprintf("%04d-%02d-%02d", y, m, d)
+    }
+    NR==1 && $1=="timestamp" { next }
+    $1 ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]/ {
+      mode=$2; src=$3; sess=$4+0; med=$9+0
+      split(substr($1,1,10), p, "-")
+      dn = days_from_civil(p[1]+0, p[2]+0, p[3]+0)
+      # 1970-01-01 was a Thursday, so (dn+3)%7 is 0 on a Monday.
+      key = civil_from_days(dn - ((dn % 7) + 3) % 7)
+      cycles[key]++; sessions[key]+=sess
+      if (med>0) { medsum[key]+=med; medn[key]++ }
+      if (src=="session" || src=="mixed") ovr[key]="yes"
+      if (modes[key]=="") modes[key]=mode
+      else if (modes[key]!=mode) modes[key]="mixed"
+    }
+    END {
+      n=0; for (k in cycles) keys[n++]=k
+      for (i=0;i<n;i++) for (j=i+1;j<n;j++) if (keys[i]>keys[j]) { t=keys[i];keys[i]=keys[j];keys[j]=t }
+      for (i=0;i<n;i++) { k=keys[i]
+        avg = (medn[k]>0) ? int(medsum[k]/medn[k]) : 0
+        printf "%-14s %-8s %7d %9d %11s %10s\n", k, modes[k], cycles[k], sessions[k],
+          (avg>0 ? sprintf("%dk", int(avg/1000)) : "-"), (ovr[k]=="yes" ? "yes" : "-")
+      }
+    }' "$ROTATION_LOG"
+  printf '\nCTX MEDIAN is the context each session had grown to at stop time — the per-call\n'
+  printf 'cost rotation removes. OVERRIDES=yes means per-session settings were in play that\n'
+  printf 'week, so it is not a clean A/B sample.\n'
   return 0
 }
 
@@ -2805,6 +3132,11 @@ do_stop() {
   # silently leaves three sessions running is no better than one that silently
   # kills them unhandoffed.
   local name t hrc kept=0 nohandoff=0 kept_names="" resume_only="" budget_left="$CL_HANDOFF_BUDGET"
+  # Rotation accounting for the log. `sess_rotate` is decided PER SESSION, since
+  # the stored policy can carry per-session overrides, so the mode recorded for
+  # the whole stop is "mixed" when they disagreed — a week containing a mixed
+  # stop is not a clean A/B sample and `cl rotate stats` says so.
+  local sess_rotate log_mode="" log_src="" n_sessions=0 n_handoffs=0 n_ronly=0 ctxs=""
   # Resolved once for the whole stop so --no-handoff can clear a stale handoff
   # without every session re-resolving the store in a subshell.
   _CL_STOP_ROOT=""
@@ -2818,27 +3150,51 @@ do_stop() {
     # to a REAL tmux kill-session / process kill while printing "[dry-run]".
     # (Found in Codex review, 2026-09-23, via a fake-tmux fixture that
     # recorded the real kill-session call.)
+    # Resolve the policy for THIS session. A flag on the command outranks
+    # everything, because it is the most explicit thing the operator can say;
+    # below that, CL_ROTATE for a one-off, then the stored setting.
+    if [ "$agent" != "claude" ]; then
+      sess_rotate="n/a"
+    elif [ "$no_handoff" = "1" ]; then
+      sess_rotate="off"; log_src="${log_src:-flag}"
+    elif [ "$require_handoff" = "1" ]; then
+      sess_rotate="on";  log_src="${log_src:-flag}"
+    else
+      sess_rotate=$(rotate_effective "$name" "$agent")
+      if [ -n "${CL_ROTATE:-}" ]; then log_src="${log_src:-env}"
+      else log_src="${log_src:-$(rotate_source "$name" "$agent")}"; fi
+    fi
+    if [ "$sess_rotate" != "n/a" ]; then
+      n_sessions=$((n_sessions+1))
+      if [ -z "$log_mode" ]; then log_mode="$sess_rotate"
+      elif [ "$log_mode" != "$sess_rotate" ]; then log_mode="mixed"; log_src="mixed"; fi
+      # Read BEFORE the session is killed: afterwards the transcript stops
+      # growing, but this is the figure that matters — what this session had
+      # grown to, i.e. what each further call would have carried on a resume.
+      ctxs="$ctxs $(context_size "$sid" "$agent")"
+    fi
     if [ -n "$dry_run" ]; then
-      [ "$agent" = "claude" ] && [ "$no_handoff" = "0" ] && request_handoff "$name" "$sid" "$cwd" "$t" "$dry_run"
-      printf '[dry-run] would evaluate and, if not left running, kill "%s"\n' "$name" >&2
+      [ "$sess_rotate" = "on" ] && request_handoff "$name" "$sid" "$cwd" "$t" "$dry_run"
+      printf '[dry-run] would evaluate and, if not left running, kill "%s" (rotation %s)\n' "$name" "$sess_rotate" >&2
       continue
     fi
     # Rotation is a Claude mechanism: a Codex row is stopped and resumed as
     # itself, so it skips the whole handoff block rather than being asked for
     # something it has no way to produce.
-    if [ "$agent" != "claude" ]; then
+    if [ "$sess_rotate" = "n/a" ]; then
       :
-    elif [ "$no_handoff" = "1" ]; then
+    elif [ "$sess_rotate" = "off" ]; then
       # A skip has to be DURABLE, not inferred from absence. An earlier
       # handoff may still be sitting there from a previous cycle, and leaving
       # it would make the next `cl start` rotate — the exact opposite of what
       # "stop it as-is" promises. Clear it so the promise is true.
       if [ -n "$_CL_STOP_ROOT" ] && [ -f "$(handoff_path "$_CL_STOP_ROOT" "$name")" ]; then
-        consume_handoff "$_CL_STOP_ROOT" "$name" "--no-handoff: rotation skipped for this cycle" >/dev/null
+        consume_handoff "$_CL_STOP_ROOT" "$name" "rotation is off for this session" >/dev/null
       fi
       # Recorded on the row as well, so a clear that failed cannot quietly turn
       # an explicit skip back into a rotation.
       resume_only="${resume_only}${name}"$'\n'
+      n_ronly=$((n_ronly+1))
     else
       # The handoff is an OPTIMISATION and the plain resume is the floor, so a
       # failed handoff is loud, not fatal: `cl stop` still stops. Refusing
@@ -2866,7 +3222,9 @@ do_stop() {
         # otherwise be rotated from on the next start, contradicting the line
         # just printed.
         resume_only="${resume_only}${name}"$'\n'
-        nohandoff=$((nohandoff+1))
+        nohandoff=$((nohandoff+1)); n_ronly=$((n_ronly+1))
+      else
+        n_handoffs=$((n_handoffs+1))
       fi
     fi
     # retire_session covers both branches (tmux-hosted and cmux/bare process)
@@ -2880,6 +3238,17 @@ do_stop() {
 
   [ -n "$dry_run" ] && return 0
   mark_resume_only "$resume_only"
+  # Logged whatever happened, including a stop that rotated nothing: a week of
+  # "off" cycles is half the measurement, and a gap in the log would read as a
+  # week with no work rather than a week without rotation.
+  # The `|| :` is deliberate belt-and-braces, not noise. rotation_log_append
+  # already always returns 0, but this line sits inside the function whose exit
+  # status IS `cl stop`'s, so if it ever became the last statement a non-zero
+  # return would tell a shutdown script the stop had failed. Two independent
+  # guards, because the cost of this one being wrong is a machine that will not
+  # shut down cleanly over a log file.
+  { [ "$n_sessions" -gt 0 ] && rotation_log_append \
+      "${log_mode:-off}" "${log_src:-default}" "$n_sessions" "$n_handoffs" "$n_ronly" "$kept" $ctxs; } || :
   printf '\nstate saved. Run cl start to bring these back.\n' >&2
   if [ "$nohandoff" -gt 0 ]; then
     printf '\n%s session(s) stopped WITHOUT a handoff — `cl start` will resume those as they were\n' "$nohandoff" >&2
@@ -3551,14 +3920,42 @@ live_dot() {
 # agent_tag <agent>: short marker shown beside non-default agents.
 agent_tag() { [ "$1" = "claude" ] && printf '%-6s' '' || printf '%-6s' "$1"; }
 
+# rotate_cell <name> <agent> [root]: the rotation column for a listing.
+#
+# POLICY and STATE in one narrow column, because they answer different questions
+# and seeing only one of them is misleading:
+#
+#   on      will be asked for a handoff at the next `cl stop`
+#   on↻     …and a complete handoff is already waiting (next start rotates)
+#   off     will not be asked
+#   off↻    will not be asked, but a handoff IS waiting — someone wrote one by
+#           hand, and the next stop will clear it. Worth seeing rather than
+#           silently reconciling.
+#   —       Codex: no handoff mechanism at all, so nothing to enable
+#
+# The root is passed in because resolving the handoff store per row would re-run
+# its directory checks once per session.
+rotate_cell() {
+  local name="$1" agent="${2:-claude}" root="${3:-}" v="" pending=""
+  [ "$agent" = "claude" ] || { printf '—'; return 0; }
+  v=$(rotate_for "$name" "$agent" 2>/dev/null)
+  [ -n "$root" ] && handoff_is_complete "$(handoff_path "$root" "$name")" 2>/dev/null && pending='↻'
+  printf '%s%s' "$v" "$pending"
+}
+
 # fzf rows: "<display>\tNAME\tSID\tCWD\tAGENT"  (display shown; rest carried for the action)
 rows() {
   printf '＋ new claude here  ·  %s\tNEW\t\t%s\tclaude\n' "$PWD" "$PWD"
   if command -v codex >/dev/null 2>&1; then
     printf '＋ new codex here   ·  %s\tNEW\t\t%s\tcodex\n' "$PWD" "$PWD"
   fi
+  # Resolved once for the whole listing, and quietly: the picker is not the place
+  # to complain about a handoff store, and a missing one just means nothing is
+  # pending.
+  local _root=""
+  handoff_root >/dev/null 2>&1 && _root="$_CL_HANDOFF_ROOT"
   discover | while IFS=$'\t' read -r name sid cwd epoch agent; do
-    printf '%s %-22s %s %-8s %s\t%s\t%s\t%s\t%s\n' "$(live_dot "$name" "$sid" "$agent")" "$name" "$(agent_tag "$agent")" "$(reltime "$epoch")" "$cwd" "$name" "$sid" "$cwd" "$agent"
+    printf '%s %-22s %s %-8s %-5s %s\t%s\t%s\t%s\t%s\n' "$(live_dot "$name" "$sid" "$agent")" "$name" "$(agent_tag "$agent")" "$(reltime "$epoch")" "$(rotate_cell "$name" "$agent" "$_root")" "$cwd" "$name" "$sid" "$cwd" "$agent"
   done
 }
 
@@ -3581,15 +3978,20 @@ case "${1:-}" in
     if [ "${1:-}" = "--fresh" ]; then shift; do_fresh_start "$@"; else do_start; fi
     exit $? ;;
   handoff) shift; do_handoff "$@"; exit 0 ;;
+  rotate)  shift; do_rotate "$@"; exit $? ;;
   restore) do_restore "${2:-}"; exit 0 ;;
   --discover)  # raw TSV (name sid cwd epoch agent) — for scripts and tests
     discover; exit 0 ;;
   --list)
-    printf '%-2s %-22s %-6s %-8s %-6s %-6s %s\n' '' NAME AGENT 'ACTIVE' CTX '' DIR
+    # HANDOFF is the POLICY (plus ↻ when one is already waiting); HINT is ADVICE
+    # from the context size. They were one unlabelled column before, which read as
+    # if the advice were the setting — two different questions, two headings.
+    printf '%-2s %-22s %-6s %-8s %-6s %-6s %-6s %s\n' '' NAME AGENT 'ACTIVE' CTX HANDOFF HINT DIR
+    _lroot=""; handoff_root >/dev/null 2>&1 && _lroot="$_CL_HANDOFF_ROOT"
     discover | while IFS=$'\t' read -r name sid cwd epoch agent; do
       [ -z "$AGENT_FILTER" ] || [ "$agent" = "$AGENT_FILTER" ] || continue
       ctx=$(context_size "$sid" "$agent")
-      printf '%-2s %-22s %s %-8s %-6s %-6s %s\n' "$(live_dot "$name" "$sid" "$agent")" "$name" "$(agent_tag "$agent")" "$(reltime "$epoch")" "$(fmt_ctx "$ctx")" "$(rotate_hint "$ctx" "$epoch" "$agent")" "$cwd"
+      printf '%-2s %-22s %s %-8s %-6s %-6s %-6s %s\n' "$(live_dot "$name" "$sid" "$agent")" "$name" "$(agent_tag "$agent")" "$(reltime "$epoch")" "$(fmt_ctx "$ctx")" "$(rotate_cell "$name" "$agent" "$_lroot")" "$(rotate_hint "$ctx" "$epoch" "$agent")" "$cwd"
     done
     exit 0 ;;
   -h|--help) awk 'NR>1 && !/^#/{exit} NR>1{print}' "$0"; exit 0 ;;
