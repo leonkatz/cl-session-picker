@@ -32,6 +32,8 @@ CL="$HERE/../bin/claude-session"
 FIX="$(mktemp -d "${TMPDIR:-/tmp}/cl-model.XXXXXX")"; trap 'rm -rf "$FIX"' EXIT
 pass=0; fail=0
 check() { if [ "$2" = "$3" ]; then pass=$((pass+1)); printf '  ok   %s\n' "$1"; else fail=$((fail+1)); printf '  FAIL %s\n       expected [%s] got [%s]\n' "$1" "$2" "$3"; fi; }
+cl_model_stored() { jq -r --arg n "$1" '.claude[$n] // empty' "$MODELS" 2>/dev/null; }
+
 setup_failed() { printf 'FIXTURE SETUP FAILED: %s\n' "$1" >&2; exit 2; }
 command -v jq >/dev/null 2>&1 || setup_failed "jq is required by the code under test"
 
@@ -105,6 +107,31 @@ check "…with the id immediately after" "no-such-model" \
 check "…alongside the flags it always had" "1" \
   "$(grep -c '^--dangerously-skip-permissions$' "$FIX/argv.claude")"
 
+# AND THE SAME BOUNDARY WITH BRACKETS IN IT. The accepted-value loop further
+# down proves `opus[1m]` is STORED; it never drives it through model_flag to
+# argv. So neither a missing escape (brackets glob inside the command string)
+# nor an over-escape (a literal backslash arriving in the argv element) would
+# have failed anything — the existing cases here all use bracket-free values.
+# Asserting the store instead of the boundary is the same mistake one level off
+# that has now cost several rounds. (Codex review of fd65ad7, 2026-10-08.)
+# A DECOY THE GLOB WOULD MATCH. `opus[1m]` is a character class matching `opus1`
+# or `opusm`, so with no such file present bash leaves an UNQUOTED occurrence
+# untouched — and the first version of this case passed with `printf %q` removed
+# from model_flag entirely. It proved nothing about escaping. Planting a file the
+# pattern matches is what makes a missing escape observable: unquoted, the
+# command string expands to `opus1` and the argv element is wrong.
+: > "$FIX/work/opus1"
+rm -f "$FIX/argv.claude"
+cl model Alpha 'opus[1m]' >/dev/null
+cl Alpha >/dev/null 2>&1
+check "claude: a bracketed id survives as ONE argv element" "1" \
+  "$(grep -c '^--model$' "$FIX/argv.claude")"
+# EXACTLY this, byte for byte: not opus\[1m\], not opus1m, not opus.
+check "…and arrives unescaped and unglobbed" "opus[1m]" \
+  "$(grep -A1 '^--model$' "$FIX/argv.claude" | tail -1)"
+check "…and did not split into extra elements" "1" \
+  "$(grep -cF 'opus[1m]' "$FIX/argv.claude")"
+
 rm -f "$FIX/argv.codex"
 cl model T codex-model-id >/dev/null
 cl --codex T >/dev/null 2>&1
@@ -112,6 +139,15 @@ check "codex: -m and the id are two elements" "-m|codex-model-id" \
   "$(grep -A1 '^-m$' "$FIX/argv.codex" | paste -sd'|' -)"
 check "…and the subcommand still follows the options" "resume|$SID" \
   "$(grep -A1 '^resume$' "$FIX/argv.codex" | paste -sd'|' -)"
+
+# model_flag has a SEPARATE branch for codex (`-m` vs `--model`), so the
+# bracketed case has to cross that one too.
+: > "$FIX/work/sonnet1"
+rm -f "$FIX/argv.codex"
+cl model T 'sonnet[1m]' >/dev/null
+cl --codex T >/dev/null 2>&1
+check "codex: a bracketed id arrives exactly as given" "-m|sonnet[1m]" \
+  "$(grep -A1 '^-m$' "$FIX/argv.codex" | paste -sd'|' -)"
 
 # `cl start` also has to apply a remembered model, and that is asserted in
 # test-tmux-mode.sh rather than here: this fixture deliberately has no tmux, so
@@ -146,6 +182,40 @@ rm -f "$FIX/argv.codex"
 CLARGS='--model explicit-long' cl --codex T >/dev/null 2>&1
 check "the long form is recognised too" "0" "$(grep -c '^-m$' "$FIX/argv.codex")"
 cl model T - >/dev/null
+
+printf 'the model specs the agent really accepts are not refused\n'
+# `opus[1m]` is the 1M-context variant, and a real spec the agent accepts —
+# confirmed on a Bedrock-backed machine, 2026-10-08. valid_model rejected `[`
+# and `]`, so that variant could not be set per session AT ALL. The bug was
+# invisible because every OTHER form worked.
+#
+# Full Bedrock inference-profile ARNs must keep working too: on that machine
+# they are what the agent resolves aliases to, and they are already accepted.
+for _ok in 'opus' 'opus[1m]' 'claude-opus-5' 'sonnet[1m]' \
+           'arn:aws:bedrock:us-east-1:123456789012:inference-profile/global.anthropic.claude-opus-5-5'; do
+  rm -f "$FIX/argv.claude"
+  out=$(cl model Alpha "$_ok" 2>&1)
+  check "accepted: $_ok" "$_ok" "$(cl_model_stored Alpha)"
+done
+cl model Alpha - >/dev/null 2>&1
+
+printf '…while everything that could reach a shell still is refused\n'
+# The charset is permissive now, so the negative cases carry the weight. Each
+# of these would be live shell syntax inside the command string the launchers
+# build, if it ever got through.
+for _bad in 'opus$(touch '"$FIX"'/pwn-sub)' 'opus;touch '"$FIX"'/pwn-semi' \
+            'opus`touch '"$FIX"'/pwn-tick`' 'opus|tee' 'opus&bg' 'opus>out' \
+            'opus out' "opus'q" 'opus"q' 'opus*glob' 'opus?glob'; do
+  out=$(cl model Alpha "$_bad" 2>&1); rc=$?
+  if [ "$rc" -ne 0 ]; then pass=$((pass+1)); printf '  ok   refused: %s\n' "$(printf '%s' "$_bad" | head -c 30)"
+  else fail=$((fail+1)); printf '  FAIL refused: %s\n       it was accepted\n' "$_bad"; fi
+done
+check "and none of them ran anything" "0" "$(ls "$FIX" 2>/dev/null | grep -c '^pwn-')"
+# A guard against the loop above passing vacuously: the helper must really be
+# able to store a GOOD value at this point.
+cl model Alpha opus >/dev/null 2>&1
+check "the store still works after the refusals" "opus" "$(cl_model_stored Alpha)"
+cl model Alpha - >/dev/null 2>&1
 
 printf 'a hand-edited store cannot smuggle a value onto a command line\n'
 # models.json is a plain file in the user's config dir. Validating only on the
