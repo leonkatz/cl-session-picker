@@ -984,7 +984,22 @@ codex_args() { printf '%s' "${CL_CODEX_ARGS:-}"; }
 valid_model() {
   case "$1" in
     '') return 1 ;;
-    *[!A-Za-z0-9._:/-]*) return 1 ;;
+    # `[` and `]` are allowed because `opus[1m]` is a real model spec the agent
+    # accepts — the 1M-context variant — and refusing it meant that variant
+    # could not be set per session at all. Confirmed working on a Bedrock-backed
+    # machine, 2026-10-08.
+    #
+    # Safe because every consumer goes through model_flag, which applies
+    # `printf '%q'`, and the result always lands in a shell command STRING that
+    # tmux/cmux/sh then evaluates — there is no path that takes the escaped form
+    # as a literal argv element. Widening this without that single choke point
+    # would be a glob-injection.
+    #
+    # The ORDER in the bracket expression is load-bearing: `]` must come first
+    # after the `!` to be literal, and `-` must come last. Verified against
+    # shell metacharacters, spaces, quotes and globs rather than assumed — this
+    # file has lost to `case` patterns before.
+    *[!]A-Za-z0-9._:/[-]*) return 1 ;;
     *) return 0 ;;
   esac
 }
@@ -1552,7 +1567,7 @@ set_model() {
   command -v jq >/dev/null 2>&1 || { echo "claude-session: model needs jq (brew install jq)" >&2; return 1; }
   [ -n "$name" ] || { echo "claude-session: model needs a session name" >&2; return 1; }
   [ "$model" = "-" ] || valid_model "$model" \
-    || { echo "claude-session: refusing model \"$model\" — allowed: letters, digits, . _ - : /" >&2; return 1; }
+    || { echo "claude-session: refusing model \"$model\" — allowed: letters, digits, . _ - : / [ ]" >&2; return 1; }
   mkdir -p "$(dirname "$MODELS")" || { echo "claude-session: cannot create state dir" >&2; return 1; }
   models_lock || return 1
   [ -r "$MODELS" ] || printf '{}\n' > "$MODELS"
