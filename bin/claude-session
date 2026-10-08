@@ -977,10 +977,19 @@ codex_args() { printf '%s' "${CL_CODEX_ARGS:-}"; }
 # argument, cmux --command, and the exec paths), so it is validated on the way
 # IN and quoted on the way out. The charset allows what real model identifiers
 # use — letters, digits, dot, underscore, hyphen, colon, slash, so both a plain
-# id and a fully qualified cloud resource name pass — and excludes everything a
-# shell would act on. Refusing at set time means the stored file can never hold
-# something dangerous, and the quoting at use time is the second line rather
-# than the only one.
+# id and a fully qualified cloud resource name pass — plus SQUARE BRACKETS, for
+# the `opus[1m]` 1M-context variants the agent accepts.
+#
+# Brackets are the one admitted character class a shell WOULD act on (globbing),
+# so they rely on the escaping at use time rather than on the charset. That is
+# only sound because every consumer goes through model_flag, which applies
+# `printf '%q'`, and every result lands in a command string that is evaluated —
+# never passed as a literal argv element. Everything else a shell acts on is
+# still refused outright.
+#
+# Refusing at set time means the stored file can never hold something dangerous;
+# the quoting at use time is what makes brackets safe specifically. Two
+# different guarantees, and the charset comment used to claim only the first.
 valid_model() {
   case "$1" in
     '') return 1 ;;
@@ -2567,7 +2576,7 @@ do_new() {
   # and no tmux). Persisting first left a preference behind for a session that
   # was never created — a half-done transaction presented as one step.
   if [ -n "$model" ]; then
-    valid_model "$model" || { echo "claude-session: refusing model \"$model\" — allowed: letters, digits, . _ - : /" >&2; exit 1; }
+    valid_model "$model" || { echo "claude-session: refusing model \"$model\" — allowed: letters, digits, . _ - : / [ ]" >&2; exit 1; }
   fi
   case "$arg" in
     -d|--default)

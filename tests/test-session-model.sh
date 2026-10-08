@@ -107,6 +107,31 @@ check "…with the id immediately after" "no-such-model" \
 check "…alongside the flags it always had" "1" \
   "$(grep -c '^--dangerously-skip-permissions$' "$FIX/argv.claude")"
 
+# AND THE SAME BOUNDARY WITH BRACKETS IN IT. The accepted-value loop further
+# down proves `opus[1m]` is STORED; it never drives it through model_flag to
+# argv. So neither a missing escape (brackets glob inside the command string)
+# nor an over-escape (a literal backslash arriving in the argv element) would
+# have failed anything — the existing cases here all use bracket-free values.
+# Asserting the store instead of the boundary is the same mistake one level off
+# that has now cost several rounds. (Codex review of fd65ad7, 2026-10-08.)
+# A DECOY THE GLOB WOULD MATCH. `opus[1m]` is a character class matching `opus1`
+# or `opusm`, so with no such file present bash leaves an UNQUOTED occurrence
+# untouched — and the first version of this case passed with `printf %q` removed
+# from model_flag entirely. It proved nothing about escaping. Planting a file the
+# pattern matches is what makes a missing escape observable: unquoted, the
+# command string expands to `opus1` and the argv element is wrong.
+: > "$FIX/work/opus1"
+rm -f "$FIX/argv.claude"
+cl model Alpha 'opus[1m]' >/dev/null
+cl Alpha >/dev/null 2>&1
+check "claude: a bracketed id survives as ONE argv element" "1" \
+  "$(grep -c '^--model$' "$FIX/argv.claude")"
+# EXACTLY this, byte for byte: not opus\[1m\], not opus1m, not opus.
+check "…and arrives unescaped and unglobbed" "opus[1m]" \
+  "$(grep -A1 '^--model$' "$FIX/argv.claude" | tail -1)"
+check "…and did not split into extra elements" "1" \
+  "$(grep -cF 'opus[1m]' "$FIX/argv.claude")"
+
 rm -f "$FIX/argv.codex"
 cl model T codex-model-id >/dev/null
 cl --codex T >/dev/null 2>&1
@@ -114,6 +139,15 @@ check "codex: -m and the id are two elements" "-m|codex-model-id" \
   "$(grep -A1 '^-m$' "$FIX/argv.codex" | paste -sd'|' -)"
 check "…and the subcommand still follows the options" "resume|$SID" \
   "$(grep -A1 '^resume$' "$FIX/argv.codex" | paste -sd'|' -)"
+
+# model_flag has a SEPARATE branch for codex (`-m` vs `--model`), so the
+# bracketed case has to cross that one too.
+: > "$FIX/work/sonnet1"
+rm -f "$FIX/argv.codex"
+cl model T 'sonnet[1m]' >/dev/null
+cl --codex T >/dev/null 2>&1
+check "codex: a bracketed id arrives exactly as given" "-m|sonnet[1m]" \
+  "$(grep -A1 '^-m$' "$FIX/argv.codex" | paste -sd'|' -)"
 
 # `cl start` also has to apply a remembered model, and that is asserted in
 # test-tmux-mode.sh rather than here: this fixture deliberately has no tmux, so
