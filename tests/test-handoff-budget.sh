@@ -218,5 +218,80 @@ not_contains "…and does not say 'asked' at all" "$out" "will be asked"
 # pass by describing an empty stop.
 contains "the no-handoff run really did process the sessions" "$out" "Probe"
 
+echo "the fair share is allocated per ELIGIBLE session, whatever the order"
+# ── WHY THIS NEEDS REAL tmux SESSIONS ───────────────────────────────────────
+#
+# The allocated window is only observable in the "waiting up to Ns" line, and
+# that line is only printed after the ask has actually been sent. Unreachable
+# fixtures return "no reachable pane" before any window exists, so the earlier
+# cases in this suite cannot see the divisor at all — which is exactly how the
+# ordering bug survived them.
+#
+# ── THE BUG ────────────────────────────────────────────────────────────────
+#
+# The prepass counts only sessions that WILL be asked. The decrement used to sit
+# at the bottom of the loop and fire for every claude session, rotation-off ones
+# included. For discovery order off,on,on the divisor began at 2, the `off` row
+# took it to 1, and the first eligible session got the WHOLE remaining budget
+# instead of half — starving the one after it. Ordering-dependent unfairness,
+# which is the thing the cap exists to remove. (Codex review, 2026-10-08.)
+TMUX_TMPDIR="$FIX/tmux-tmp"; mkdir -p "$TMUX_TMPDIR"
+rtmux() { TMUX_TMPDIR="$TMUX_TMPDIR" tmux "$@"; }
+trap 'rtmux kill-server >/dev/null 2>&1; rm -rf "$FIX"' EXIT
+command -v tmux >/dev/null 2>&1 || setup_failed "tmux is needed to observe an allocated window"
+
+# Discovery is ordered by the fixture file's mtime, newest first, so the order
+# is set explicitly rather than left to the filesystem.
+mk() { # <name> <mtime YYYYMMDDhhmm>
+  printf '{"cwd":"%s"}\n{"customTitle":"%s"}\n' "$FIX" "$1" > "$HOME/.claude/projects/p1/sid-$1.jsonl"
+  touch -t "$2" "$HOME/.claude/projects/p1/sid-$1.jsonl"
+  # A live pane, so the ask is sent and the window is announced. `sleep` ignores
+  # the typed text; only the dispatch and the window matter here.
+  rtmux new-session -d -s "$1" -c "$FIX" "sleep 120" 2>/dev/null
+}
+window_for() { # <name> — the "waiting up to Ns" the run allocated it
+  sed -n "s/.*asked \"$1\".*waiting up to \([0-9]*\)s.*/\1/p" "$FIX/alloc.out" | head -1
+}
+
+rm -f "$HOME/.claude/projects/p1/"*.jsonl
+mk OffFirst 202610081200   # newest -> discovered first
+mk OnSecond 202610081100
+mk OnThird  202610081000
+# OffFirst is excluded by the prepass; it must not move the divisor either.
+env -i HOME="$HOME" PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
+  bash "$CL" rotate off OffFirst >/dev/null 2>&1
+env -i HOME="$HOME" PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
+  CL_HANDOFF_DIR="$FIX/hdir-alloc" CL_HANDOFF_BUDGET=6 CL_HANDOFF_MIN_SHARE=1 \
+  CL_HANDOFF_TIMEOUT=60 CL_HANDOFF_ATTEMPTS=1 \
+  bash "$CL" stop --keep-tabs > "$FIX/alloc.out" 2>&1
+contains "the off row is skipped, not asked" "$(cat "$FIX/alloc.out")" "OffFirst"
+check "the off row never gets a window at all" "" "$(window_for OffFirst)"
+# 6s budget, TWO eligible sessions -> 3s each. The bug gave the first 6s.
+check "the first eligible gets half, not everything" "3" "$(window_for OnSecond)"
+check "…leaving a real share for the second" "3" "$(window_for OnThird)"
+rtmux kill-server >/dev/null 2>&1
+
+echo "…including when a strict failure skips the rest of a session's turn"
+# --require-handoff `continue`s before the old decrement, so an already-attempted
+# session stayed in the divisor for everyone after it.
+TMUX_TMPDIR="$FIX/tmux-tmp2"; mkdir -p "$TMUX_TMPDIR"
+rm -f "$HOME/.claude/projects/p1/"*.jsonl
+mk StrictA 202610081200
+mk StrictB 202610081100
+mk StrictC 202610081000
+env -i HOME="$HOME" PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
+  bash "$CL" rotate on >/dev/null 2>&1
+env -i HOME="$HOME" PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
+  CL_HANDOFF_DIR="$FIX/hdir-strict" CL_HANDOFF_BUDGET=12 CL_HANDOFF_MIN_SHARE=1 \
+  CL_HANDOFF_TIMEOUT=60 CL_HANDOFF_ATTEMPTS=1 \
+  bash "$CL" stop --require-handoff --keep-tabs > "$FIX/alloc.out" 2>&1
+check "the first of three gets a third of the budget" "4" "$(window_for StrictA)"
+# 12 - 4 = 8 left, TWO eligible remain -> 4. With the missed decrement the
+# divisor stayed at 3 and this read 2.
+check "…and the next still gets a third, not a quarter" "4" "$(window_for StrictB)"
+contains "the strict mode really did leave the first one running" "$(cat "$FIX/alloc.out")" "leaving \"StrictA\" running"
+rtmux kill-server >/dev/null 2>&1
+rm -f "$HOME/.claude/projects/p1/"*.jsonl
+
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ] || exit 1

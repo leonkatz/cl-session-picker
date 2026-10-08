@@ -3508,6 +3508,25 @@ do_stop() {
         request_handoff "$name" "$sid" "$cwd" "$t" ""; hrc=$?
         budget_left="$_CL_BUDGET_LEFT"
       fi
+      # THIS SESSION'S SLOT IS NOW SPENT — exactly once, here, for a
+      # rotation-on session whose turn was reached, and before any `continue`
+      # below.
+      #
+      # It was at the bottom of the loop and fired for EVERY claude session,
+      # including rotation-off ones the prepass had deliberately excluded. With
+      # discovery order off,on,on the divisor began at 2, the `off` row took it
+      # to 1, and the first eligible session was handed the WHOLE remaining
+      # budget instead of half — starving the one after it, which is the
+      # ordering-dependent unfairness this was supposed to end. The comment
+      # there claimed the skipped row "used a slot in the divisor above"; that
+      # was simply false once the prepass stopped counting it.
+      #
+      # And the strict path `continue`s a few lines down, so a session that had
+      # already been attempted stayed in the divisor for everyone after it.
+      # (Codex review, 2026-10-08.)
+      if [ "$_ask_left" -gt 0 ]; then
+        _ask_left=$(( _ask_left - 1 ))
+      fi
       if [ "$hrc" -ne 0 ]; then
         if [ "$require_handoff" = "1" ]; then
           printf '✋ leaving "%s" running — --require-handoff was given and no handoff arrived.\n' "$name" >&2
@@ -3532,13 +3551,6 @@ do_stop() {
     # moves on; its return value changes nothing here (a lost race, a decline,
     # a slow shutdown, or a session that was not cl's to kill are all just
     # "didn't get killed this time, re-run stop").
-    # DECREMENTED FOR EVERY claude SESSION, asked or skipped. A session that
-    # was skipped (rotation off) or never reached still used a slot in the
-    # divisor above, so the ones after it are entitled to its share — a fixed
-    # budget/total divisor would under-serve the tail for no reason.
-    if [ "$agent" = "claude" ] && [ "$_ask_left" -gt 0 ]; then
-      _ask_left=$(( _ask_left - 1 ))
-    fi
     retire_session "$name" "$sid" "$t" "$close_tabs" "$agent"
   done <<< "$_rows"
 
