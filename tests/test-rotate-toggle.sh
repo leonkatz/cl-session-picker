@@ -68,6 +68,18 @@ BASEPATH="$FIX/bin:/usr/bin:/bin"
 cl() { ( cd "$FIX" && env -i HOME="$HOME" CODEX_HOME="$CODEX_HOME" PATH="$BASEPATH" CL_HANDOFF_BUDGET=1 \
          ${CL_ROTATE+CL_ROTATE="$CL_ROTATE"} ${CL_SESSION_NAME+CL_SESSION_NAME="$CL_SESSION_NAME"} \
          bash "$CL" "$@" ) ; }
+# cl_nosession — the same, with CL_SESSION_NAME deliberately NOT forwarded.
+#
+# `cl` forwards it when the SUITE's own environment has it, which is how
+# `CL_SESSION_NAME=Alpha cl rotate status` works. The cost is that the "outside
+# a session" case inherits the real name whenever the suite is run from inside a
+# cl-managed session — so it failed with
+# `this session ("<the real session name>"): rotation on` for anyone running
+# normal way, and passed only in a bare shell. Verified pre-existing on
+# untouched main, 2026-10-09.
+cl_nosession() { ( cd "$FIX" && env -i HOME="$HOME" CODEX_HOME="$CODEX_HOME" PATH="$BASEPATH" \
+         CL_HANDOFF_BUDGET=1 ${CL_ROTATE+CL_ROTATE="$CL_ROTATE"} \
+         bash "$CL" "$@" ) ; }
 
 printf 'the default, and changing it\n'
 check "rotation is on with no store at all" "on" "$(cl rotate status | awk '/^default/{print $3}')"
@@ -451,7 +463,7 @@ printf 'asked from inside a session, status answers about THAT session\n'
 out=$(CL_SESSION_NAME=Alpha cl rotate status)
 has "it leads with this session" "$out" 'this session ("Alpha")'
 has "…and still reports the default" "$out" "default: rotation"
-out=$(cl rotate status)
+out=$(cl_nosession rotate status)
 hasnt "outside a session it does not invent one" "$out" "this session"
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"

@@ -3027,11 +3027,40 @@ send_text_tmux() {
 
 # send_text_iterm <tag> <text>: type literal text into the iTerm session
 # tagged user.clSession == <tag> (the same tag launch_session/launch_named set
-# via tag_iterm_session), via AppleScript `write text` — which types-and-Enters
-# in one call, same as write_text does for any interactive shell. Best-effort:
-# a session that was never tagged (started before this feature, or `cl new`'s
-# detached-create path) cannot be reached this way and is reported as such by
-# the caller, not here.
+# via tag_iterm_session). Best-effort: a session that was never tagged (started
+# before this feature, or `cl new`'s detached-create path) cannot be reached
+# this way and is reported as such by the caller, not here.
+#
+# ── TEXT AND RETURN ARE TWO CALLS, AND THE RETURN IS A LITERAL CR ───────────
+#
+# This was one `write text "..."`, described here as "types-and-Enters in one
+# call". It does terminate the line — with LF (0x0a) — and that only submits a
+# SHORT one. Measured against a live Claude TUI in iTerm, 2026-10-09:
+#
+#   59 chars  + the LF write text appends  -> SUBMITS
+#   343 chars + the same                   -> does NOT submit; the text sits in
+#                                             the input box
+#   a second, bare LF onto that stuck text -> still does not submit
+#   a literal CR (ASCII 13)                -> submits immediately
+#
+# The handoff prompt is 430-566 characters, so it NEVER submitted through this
+# path. That is the entirety of the reported fault — "the handoff request posted
+# in the hub session but never submitted" — and a real `cl stop` across eleven
+# iTerm-hosted sessions produced ZERO handoffs: every one asked, every one timed
+# out, because no ask was ever submitted.
+#
+# A long line wraps, which appears to leave the input in a state where LF
+# inserts instead of submitting; CR submits in both states, so CR is used
+# unconditionally. The delay separates the two writes for the same reason
+# send_text_cmux keeps its Enter as its own `send-key` call.
+#
+# WHY IT WAS NOT CAUGHT EARLIER, since the lesson is the point: a tmux probe on
+# 2026-10-08 sent 427 characters followed immediately by Enter and submitted
+# correctly, and I concluded from it that the submit path was sound. It was —
+# for tmux, which sends a real Enter key. The iTerm path went untested because
+# testing it means typing into live sessions, and the untested path was the
+# broken one. Two days of work on retry and budget behaviour sat downstream of
+# an ask that could never arrive.
 send_text_iterm() {
   local tag="$1" text="$2" etag etext found
   etag="${tag//\\/\\\\}"; etag="${etag//\"/\\\"}"
@@ -3049,7 +3078,9 @@ tell application "iTerm"
     end repeat
   end repeat
   if hit is missing value then return "no"
-  tell hit to write text "${etext}"
+  tell hit to write text "${etext}" newline NO
+  delay 0.15
+  tell hit to write text (ASCII character 13) newline NO
   return "yes"
 end tell
 OSA
