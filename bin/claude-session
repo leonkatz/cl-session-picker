@@ -3010,17 +3010,17 @@ send_text_tmux() {
 # before this feature, or `cl new`'s detached-create path) cannot be reached
 # this way and is reported as such by the caller, not here.
 #
-# ── TEXT AND RETURN ARE TWO CALLS, AND THE RETURN IS A LITERAL CR ───────────
+# ── TEXT AND RETURN ARE TWO CALLS, AND THE RETURN COMES AFTER A PAUSE ───────
 #
 # This was one `write text "..."`, described here as "types-and-Enters in one
-# call". It does terminate the line — with LF (0x0a) — and that only submits a
-# SHORT one. Measured against a live Claude TUI in iTerm, 2026-10-09:
+# call", and it only ever submitted a SHORT line. Measured against a live
+# Claude TUI in iTerm, 2026-10-09:
 #
-#   59 chars  + the LF write text appends  -> SUBMITS
-#   343 chars + the same                   -> does NOT submit; the text sits in
-#                                             the input box
-#   a second, bare LF onto that stuck text -> still does not submit
-#   a literal CR (ASCII 13)                -> submits immediately
+#   59 chars  + the terminator write text appends -> SUBMITS
+#   343 chars + the same                          -> does NOT submit; the text
+#                                                    sits in the input box
+#   a second, bare LF onto that stuck text        -> still does not submit
+#   a literal CR (ASCII 13) as its own write      -> submits immediately
 #
 # The handoff prompt is 430-566 characters, so it NEVER submitted through this
 # path. That is the entirety of the reported fault — "the handoff request posted
@@ -3028,10 +3028,33 @@ send_text_tmux() {
 # iTerm-hosted sessions produced ZERO handoffs: every one asked, every one timed
 # out, because no ask was ever submitted.
 #
-# A long line wraps, which appears to leave the input in a state where LF
-# inserts instead of submitting; CR submits in both states, so CR is used
-# unconditionally. The delay separates the two writes for the same reason
-# send_text_cmux keeps its Enter as its own `send-key` call.
+# ── WHAT THE FIX IS NOT ─────────────────────────────────────────────────────
+#
+# This block used to claim `write text` terminates the line with LF (0x0a) and
+# that the fix was switching to CR. That is WRONG, and it matters, because
+# somebody reading it would conclude the byte was the whole story and could
+# collapse these two writes back into one while keeping a CR — reintroducing
+# the fault. Measured at the pty with ICRNL cleared, 2026-10-13
+# (tools/iterm-broadcast-probe.sh is what measured it):
+#
+#   write text "X" newline YES                      -> X 0x0d
+#   write text "X" newline NO, then ASCII 13        -> X 0x0d
+#
+# BYTE-IDENTICAL. `newline YES` appends CR, not LF, so the one-call form was
+# already sending CR and failed on a long line anyway. There are no
+# bracketed-paste markers in either form either, even when the receiver enables
+# paste mode — so that explanation is out too.
+#
+# The difference that remains is TIMING: the two-step puts 0.15s between the
+# text and the terminator, so the CR arrives as its own input event after the
+# TUI has digested a long wrapped line. WHY a same-burst CR is dropped there is
+# not established — it is a TUI-side behaviour this code cannot see — but the
+# separation is what empirically fixes it, and the 10-09 table also shows LF
+# never submits even on its own, so the terminator stays a literal CR.
+#
+# Both halves are therefore load-bearing: CR because LF does not submit, and
+# the pause because a long line needs the CR to arrive separately. The delay is
+# the same reason send_text_cmux keeps its Enter as its own `send-key` call.
 #
 # WHY IT WAS NOT CAUGHT EARLIER, since the lesson is the point: a tmux probe on
 # 2026-10-08 sent 427 characters followed immediately by Enter and submitted
