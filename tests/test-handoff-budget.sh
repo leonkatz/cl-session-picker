@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Handoff budget fairness + busy-awareness tests — run: tests/test-handoff-budget.sh
+# Parallel-handoff + budget tests — run: tests/test-handoff-budget.sh
 #
-# ── WHAT WENT WRONG ─────────────────────────────────────────────────────────
+# ── WHAT WENT WRONG, TWICE ──────────────────────────────────────────────────
 #
 # A real `cl stop` over nineteen sessions produced two handoffs and nineteen
 # losses. The log:
@@ -15,24 +15,30 @@
 #   ⏳ asked "<next>" ... — waiting up to 54s          <- 246s already gone
 #   ... then eighteen × "the 300s handoff budget for this stop is spent"
 #
-# Two independent defects, neither of which is a submit bug — a 427-character
-# single-line prompt followed immediately by Enter was measured submitting
-# correctly into an idle session:
+# The first round of fixes addressed the two visible defects — a BUSY claude
+# queues typed input so a retry only stacks copies (handoff_target_busy), and
+# attempts × timeout could eat 90% of the whole budget (a per-session cap). Both
+# were real. Neither touched the shape underneath:
 #
-# 1. A BUSY claude QUEUES typed input and runs it when it finishes. Measured:
-#    injecting into a working session shows "Press up to edit queued messages"
-#    and executes nothing until the current task ends. cl saw no handoff file,
-#    concluded the ask was lost, and typed it AGAIN — three copies stacked in
-#    one input box. A retry answers "the ask did not land", which is not the
-#    same question as "the agent has not finished".
+#   the wait was SERIAL, so a stop cost `sessions × share` in wall clock
+#   while each session's share was `budget / sessions`.
 #
-# 2. ARITHMETIC: CL_HANDOFF_ATTEMPTS(3) × CL_HANDOFF_TIMEOUT(90) = 270s against
-#    a CL_HANDOFF_BUDGET of 300s for the WHOLE stop. One session's worst case
-#    was 90% of everyone's budget. That is not a cap.
+# Both numbers move the wrong way as sessions accumulate, so the fair-share
+# machinery was rationing a resource that did not need rationing. On the second
+# nineteen-session stop (2026-10-12) twelve sessions were again stopped with no
+# handoff, because 300/19 = 15s floored to 45s exhausts the budget after six.
 #
-# So the properties under test are: a working session is waited for and NOT
-# re-asked, no session can spend more than its share, and an operator is told
-# BEFORE the stop that the budget will not cover the sessions they have.
+# So the asks now go out TOGETHER and one window covers all of them. The
+# properties under test are therefore:
+#
+#   * every eligible session is asked BEFORE any of them is waited for;
+#   * the wait is one shared window, not one per session;
+#   * each session gets the WHOLE window — no division, no floor, no ordering
+#     dependence (so the suite's old fair-share cases are gone, not ported:
+#     there is no divisor left to be unfair);
+#   * the budget still bounds the whole phase;
+#   * a session that is merely still WORKING is not re-asked;
+#   * nothing is killed until the wait is over.
 set -u
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 CL="$HERE/../bin/claude-session"
@@ -45,9 +51,9 @@ contains() { case "$2" in *"$3"*) ok "$1" ;; *) bad "$1" "wanted [$3] in: $2" ;;
 not_contains() { case "$2" in *"$3"*) bad "$1" "did NOT want [$3] in: $2" ;; *) ok "$1" ;; esac; }
 setup_failed() { printf 'FIXTURE SETUP FAILED: %s\n' "$1" >&2; exit 2; }
 
-# The REAL functions, verbatim — same extractor the sibling suite uses, because
-# a reimplementation here would only prove the reimplementation works. The
-# shape-tracking awk matters: a one-liner definition breaks a naive sed range.
+# The REAL functions, verbatim — a reimplementation here would only prove the
+# reimplementation works. The shape-tracking awk matters: a one-liner definition
+# breaks a naive sed range.
 extract_fns() {
   local f="$1"; shift
   local n
@@ -64,29 +70,15 @@ extract_fns() {
 }
 
 LIB="$FIX/lib.sh"
-extract_fns "$CL" handoff_session_cap handoff_target_busy handoff_nonce request_handoff > "$LIB"
-for fn in handoff_session_cap handoff_target_busy handoff_nonce request_handoff; do
+extract_fns "$CL" handoff_target_busy handoff_nonce handoff_send_once request_handoff > "$LIB"
+for fn in handoff_target_busy handoff_nonce handoff_send_once request_handoff; do
   grep -q "^${fn}()" "$LIB" || setup_failed "could not extract ${fn} from the shipped script"
 done
-# A guard on the extract, not on the product: if request_handoff ever stops
-# consulting the busy check or the cap, these tests must fail loudly rather
-# than keep passing against a function that no longer has the behaviour.
+# Guards on the extract, not on the product: if these functions ever stop
+# consulting the busy check or routing sends through the one dispatcher, these
+# tests must fail loudly rather than keep passing against something else.
 grep -q 'handoff_target_busy' "$LIB" || setup_failed "extracted request_handoff never consults the busy check"
-grep -q '_CL_SESSION_CAP'     "$LIB" || setup_failed "extracted request_handoff never consults the session cap"
-
-echo "handoff_session_cap divides the budget, with a floor that can still succeed"
-cap() { ( CL_HANDOFF_MIN_SHARE="${3:-45}"; . "$LIB"; handoff_session_cap "$1" "$2" ); }
-check "one session gets the lot"                        "300" "$(cap 300 1)"
-check "two split it"                                    "150" "$(cap 300 2)"
-# THE WORK MAC'S CASE: 300/19 = 15s, which is below the ~35s a real handoff
-# takes. A 15s ask is not a short ask, it is a guaranteed failure that still
-# spends the budget — so the floor wins over fairness here on purpose.
-check "nineteen would get 15s, so the floor applies" "45"  "$(cap 300 19)"
-check "…and the floor is configurable"               "20"  "$(cap 300 19 20)"
-# Clamped the other way too: the floor must never promise more than is left.
-check "the floor never exceeds what is left"         "30"  "$(cap 30 1)"
-check "a divisor of zero is treated as one, not a division error" "300" "$(cap 300 0)"
-check "exactly at the floor is not rounded up"       "45"  "$(cap 90 2)"
+grep -q 'handoff_send_once'   "$LIB" || setup_failed "extracted request_handoff does not send via handoff_send_once"
 
 echo "handoff_target_busy asks about the PROCESS, not the terminal"
 tb() { # <tmux-has-session-rc> <session_busy-rc> <pid> <claude_busy-rc>
@@ -105,10 +97,33 @@ check "…and an idle one is not"                        "idle" "$(tb 0 1 '' 1)"
 check "no tmux but a recorded pid mid-task is busy"    "busy" "$(tb 1 1 4242 0)"
 check "…and no pid at all is not busy, not an error"   "idle" "$(tb 1 1 '' 0)"
 
-# ── the behavioural core ────────────────────────────────────────────────────
-# request_handoff driven with stubs, because a real busy claude cannot be
-# fixtured. SENDS ARE COUNTED IN A FILE: the function runs in a subshell, so a
-# counter variable would be lost — the same out-param-through-a-subshell trap
+echo "handoff_send_once picks ONE route and does not spray the prompt around"
+sd() { # <tmux-has-session-rc> <tmux-send-rc> <iterm-rc> <cmux-sfc>
+  (
+    . "$LIB"
+    HOME="$FIX/sendhome"
+    eval "tmux() { case \"\$1\" in has-session) return $1 ;; esac; return 1; }"
+    eval "send_text_tmux() { echo tmux >> '$FIX/route.log'; return $2 ; }"
+    eval "send_text_iterm() { echo iterm >> '$FIX/route.log'; return $3 ; }"
+    eval "send_text_cmux() { echo cmux >> '$FIX/route.log'; return 0 ; }"
+    handoff_send_once "N" "sid" "tname" "PROMPT" && echo sent || echo unreachable
+  )
+}
+: > "$FIX/route.log"; check "a live tmux pane takes the tmux route" "sent" "$(sd 0 0 1 '')"
+check "…and only that route"  "tmux" "$(sort -u "$FIX/route.log" | tr -d '\n')"
+# THE DELIBERATE NON-FALLTHROUGH. A live tmux session that refuses send-keys is
+# a broken pane, not an iTerm tab — typing a handoff request into some other
+# window is worse than reporting it unreachable.
+: > "$FIX/route.log"; check "a tmux pane that refuses the send is unreachable" "unreachable" "$(sd 0 1 0 '')"
+not_contains "…and the prompt is NOT then typed into iTerm" "$(cat "$FIX/route.log")" "iterm"
+: > "$FIX/route.log"; check "no tmux session falls through to iTerm" "sent" "$(sd 1 1 0 '')"
+: > "$FIX/route.log"; check "…and with neither, it reports unreachable" "unreachable" "$(sd 1 1 1 '')"
+
+# ── request_handoff: still the SINGLE-session path (`cl start --fresh`) ──────
+# `cl stop` no longer uses it; it remains the right shape for one session, where
+# serial IS the whole job. Driven with stubs, because a real busy claude cannot
+# be fixtured. SENDS ARE COUNTED IN A FILE: the function runs in a subshell, so
+# a counter variable would be lost — the same out-param-through-a-subshell trap
 # this project has hit before.
 SENDS="$FIX/sends.log"
 run_rh() { # <busy-rc> <attempts> <timeout> <session-cap>
@@ -125,8 +140,7 @@ run_rh() { # <busy-rc> <attempts> <timeout> <session-cap>
     # what is being measured.
     handoff_marker() { printf ''; }
     build_handoff_prompt() { printf 'ASK nonce=%s' "$3"; }
-    tmux() { case "$1" in has-session) return 0 ;; esac; return 1; }
-    send_text_tmux() { printf '%s\n' "$2" >> "$SENDS"; return 0; }
+    handoff_send_once() { printf '%s\n' "$4" >> "$SENDS"; return 0; }
     request_handoff "Target" "sid-1" "$FIX" "tname" ""
   ) > "$FIX/rh.out" 2>&1
   echo $?
@@ -134,7 +148,7 @@ run_rh() { # <busy-rc> <attempts> <timeout> <session-cap>
 sends()  { grep -c . "$SENDS" 2>/dev/null || echo 0; }
 nonces() { sed -n 's/.*nonce=//p' "$SENDS" | sort -u | grep -c . || echo 0; }
 
-echo "a session that is still WORKING is waited for, not asked again"
+echo "one session that is still WORKING is waited for, not asked again"
 rc=$(run_rh 0 3 1 -1)
 # THE REGRESSION. Three attempts used to mean three typed copies stacked in one
 # input box; the first ask was never lost, only queued.
@@ -153,145 +167,304 @@ check "three attempts mean three asks" "3" "$(sends)"
 check "…each with a fresh nonce, so a late answer to #1 cannot confirm #3" "3" "$(nonces)"
 check "…and the send path really ran (not a vacuous pass)" "1" "$([ "$(sends)" -gt 0 ] && echo 1 || echo 0)"
 
-echo "no session can spend more than its share of the stop"
+echo "…and a caller that imposes a cap still has it honoured"
+# Nothing sets these any more, but they are request_handoff's contract with any
+# future caller that needs a ceiling, and -1 was itself a bug once.
 start=$(date +%s)
 rc=$(run_rh 1 3 2 1)   # cap 1s, but 3 attempts × 2s = 6s if uncapped
 elapsed=$(( $(date +%s) - start ))
 check "it stops at the cap instead of taking every attempt" "1" "$([ "$elapsed" -lt 5 ] && echo 1 || echo 0)"
 contains "…and says whose share ran out" "$(cat "$FIX/rh.out")" "used its 1s share"
 check "…returning 'no handoff' so the caller resumes as-is" "2" "$rc"
-# Uncapped must still behave as before, or the cap has quietly become mandatory.
 start=$(date +%s)
 run_rh 1 2 2 -1 >/dev/null
 check "an uncapped caller still uses its full attempts" "1" \
   "$([ $(( $(date +%s) - start )) -ge 3 ] && echo 1 || echo 0)"
 
-echo "the operator is warned BEFORE the stop, not after the losses"
-# End-to-end through the real `cl stop --dry-run`, against a discover fixture —
-# the warning is worth nothing if it only exists in a unit test, and --dry-run
-# is exactly where it should be readable while it is still free to act on.
+# ── the behavioural core: a real `cl stop` over several live sessions ────────
 export HOME="$FIX/home"
 BASEPATH="/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin"
 mkdir -p "$HOME/.claude/projects/p1" "$HOME/.config/claude-session" || setup_failed "fixture HOME"
-make_sessions() { # <n>
-  rm -f "$HOME/.claude/projects/p1/"*.jsonl
-  local i
-  for i in $(seq 1 "$1"); do
-    printf '{"cwd":"%s"}\n{"customTitle":"Probe%s"}\n' "$FIX" "$i" \
-      > "$HOME/.claude/projects/p1/sid-probe$i.jsonl"
-  done
-}
-stop_dry() { env -i HOME="$HOME" PATH="$BASEPATH" CL_HANDOFF_DIR="$FIX/hdir" \
-  CL_HANDOFF_BUDGET="${1:-300}" bash "$CL" stop --dry-run 2>&1; }
-
-make_sessions 19
-out="$(stop_dry 300)"
-# A guard first: if the fixture produced no sessions, every assertion below
-# would pass by describing nothing.
-contains "the fixture really produced sessions to stop" "$out" "Probe"
-contains "nineteen sessions on a 300s budget is called out"  "$out" "19 sessions share a 300s handoff budget"
-contains "…naming the share each would get"                  "$out" "15s each"
-contains "…and how many can actually be asked"               "$out" "About 6 will be asked"
-contains "…with the exact command that would cover them all" "$out" "CL_HANDOFF_BUDGET=855"
-
-echo "…and stays quiet when the budget is adequate"
-# A warning that fires always is a warning nobody reads.
-make_sessions 2
-out="$(stop_dry 300)"
-not_contains "two sessions on 300s draws no warning" "$out" "handoff budget —"
-make_sessions 1
-out="$(stop_dry 300)"
-not_contains "a single session never divides the budget at all" "$out" "sessions share"
-
-echo "…and never warns about a budget nobody is going to spend"
-# THE REGRESSION THIS SUITE CAUSED. The first version counted every claude
-# session, so a machine with rotation off, or `--no-handoff`, warned that a
-# budget was too small for sessions it was never going to ask — and
-# test-rotate-toggle.sh caught it, because "off" must not even say the word
-# "asked". The count and the loop now share one resolver.
-make_sessions 19
-out="$(env -i HOME="$HOME" PATH="$BASEPATH" CL_HANDOFF_DIR="$FIX/hdir" \
-  CL_HANDOFF_BUDGET=300 bash "$CL" stop --dry-run --no-handoff 2>&1)"
-not_contains "--no-handoff asks nobody, so it warns about nothing" "$out" "sessions share"
-not_contains "…and does not say 'asked' at all" "$out" "will be asked"
-# Guard: the run has to have actually walked the sessions, or both of those
-# pass by describing an empty stop.
-contains "the no-handoff run really did process the sessions" "$out" "Probe"
-
-echo "the fair share is allocated per ELIGIBLE session, whatever the order"
-# ── WHY THIS NEEDS REAL tmux SESSIONS ───────────────────────────────────────
-#
-# The allocated window is only observable in the "waiting up to Ns" line, and
-# that line is only printed after the ask has actually been sent. Unreachable
-# fixtures return "no reachable pane" before any window exists, so the earlier
-# cases in this suite cannot see the divisor at all — which is exactly how the
-# ordering bug survived them.
-#
-# ── THE BUG ────────────────────────────────────────────────────────────────
-#
-# The prepass counts only sessions that WILL be asked. The decrement used to sit
-# at the bottom of the loop and fire for every claude session, rotation-off ones
-# included. For discovery order off,on,on the divisor began at 2, the `off` row
-# took it to 1, and the first eligible session got the WHOLE remaining budget
-# instead of half — starving the one after it. Ordering-dependent unfairness,
-# which is the thing the cap exists to remove. (Codex review, 2026-10-08.)
+command -v tmux >/dev/null 2>&1 || setup_failed "tmux is needed to observe a real broadcast"
 TMUX_TMPDIR="$FIX/tmux-tmp"; mkdir -p "$TMUX_TMPDIR"
 rtmux() { TMUX_TMPDIR="$TMUX_TMPDIR" tmux "$@"; }
 trap 'rtmux kill-server >/dev/null 2>&1; rm -rf "$FIX"' EXIT
-command -v tmux >/dev/null 2>&1 || setup_failed "tmux is needed to observe an allocated window"
 
-# Discovery is ordered by the fixture file's mtime, newest first, so the order
-# is set explicitly rather than left to the filesystem.
-mk() { # <name> <mtime YYYYMMDDhhmm>
-  printf '{"cwd":"%s"}\n{"customTitle":"%s"}\n' "$FIX" "$1" > "$HOME/.claude/projects/p1/sid-$1.jsonl"
+# ── A SIMULATED AGENT ───────────────────────────────────────────────────────
+#
+# The suite could not previously watch a handoff LAND: the completion token is a
+# fresh nonce generated inside the run, so no fixture can predict it, and every
+# earlier test therefore drove a session that answered nothing. That is exactly
+# how a serial wait looked identical to a parallel one.
+#
+# This reads the prompt off its own stdin — the way the real agent receives it —
+# pulls the path and the nonce OUT of that text, and writes the file the way the
+# prompt demands: temp file, terminal marker, atomic rename. Nothing is passed
+# to it out of band, so it also proves the prompt carries everything an agent
+# needs.
+AGENT="$FIX/agent.py"
+cat > "$AGENT" <<'PYEOF'
+import os, re, sys, termios, time
+fd = sys.stdin.fileno()
+old = termios.tcgetattr(fd)
+data = b""
+try:
+    new = termios.tcgetattr(fd)
+    new[3] = new[3] & ~termios.ECHO & ~termios.ICANON
+    termios.tcsetattr(fd, termios.TCSADRAIN, new)
+    while True:
+        c = sys.stdin.buffer.read(1)
+        if not c or c in (b"\r", b"\n"):
+            break
+        data += c
+finally:
+    termios.tcsetattr(fd, termios.TCSADRAIN, old)
+text = data.decode("utf-8", "replace")
+with open(os.environ["AGENT_RECV"], "w") as fh:
+    fh.write(text)
+path = re.search(r'handoff to "([^"]+)"', text)
+nonce = re.search(r'(clho:[0-9]+:[0-9]+:[0-9]+:[0-9]+)', text)
+# Deliberately AFTER the read: a handoff is work, and a window that only passes
+# against an instant answer is not testing a window.
+time.sleep(float(os.environ.get("AGENT_DELAY", "1")))
+mode = os.environ.get("AGENT_ANSWER", "1")
+if path and mode != "0":
+    hp = path.group(1)
+    os.makedirs(os.path.dirname(hp), exist_ok=True)
+    if mode == "1" and nonce:
+        body = "simulated handoff\n\n<!-- cl:%s -->\n" % nonce.group(1)
+    elif mode == "partial":
+        # Cut off mid-write: real content, no terminal marker. The whole reason
+        # the marker is the signal rather than the file's existence.
+        body = "simulated handoff that was cut off mid-sent"
+    elif mode == "quoted" and nonce:
+        # The nastiest shape, and the reason the check is on the LAST line
+        # rather than on the token being present: an agent that explains what
+        # it is about to do, quotes the token, and is then cut off. The file
+        # contains this very request's nonce and is still incomplete.
+        body = ("I will finish by writing <!-- cl:%s --> as the last line.\n"
+                "Current state: halfway through describing the wo"
+                % nonce.group(1))
+    else:
+        # A leftover from an earlier rotation: complete, but answering a
+        # question nobody asked this time.
+        body = "stale handoff\n\n<!-- cl:clho:1:1:1:1 -->\n"
+    tmp = hp + ".tmp"
+    with open(tmp, "w") as fh:
+        fh.write(body)
+    os.rename(tmp, hp)
+time.sleep(120)
+PYEOF
+
+mk_agent() { # <name> <mtime> <delay> <answer 0|1>
+  printf '{"cwd":"%s"}\n{"customTitle":"%s"}\n' "$FIX" "$1" \
+    > "$HOME/.claude/projects/p1/sid-$1.jsonl"
   touch -t "$2" "$HOME/.claude/projects/p1/sid-$1.jsonl"
-  # A live pane, so the ask is sent and the window is announced. `sleep` ignores
-  # the typed text; only the dispatch and the window matter here.
-  rtmux new-session -d -s "$1" -c "$FIX" "sleep 120" 2>/dev/null
+  rtmux new-session -d -s "$1" -c "$FIX" \
+    "AGENT_RECV='$FIX/recv-$1.txt' AGENT_DELAY='$3' AGENT_ANSWER='$4' python3 '$AGENT'" 2>/dev/null
 }
-window_for() { # <name> — the "waiting up to Ns" the run allocated it
-  sed -n "s/.*asked \"$1\".*waiting up to \([0-9]*\)s.*/\1/p" "$FIX/alloc.out" | head -1
-}
+reset_sessions() { rm -f "$HOME/.claude/projects/p1/"*.jsonl "$FIX"/recv-*.txt; }
 
-rm -f "$HOME/.claude/projects/p1/"*.jsonl
-mk OffFirst 202610081200   # newest -> discovered first
-mk OnSecond 202610081100
-mk OnThird  202610081000
-# OffFirst is excluded by the prepass; it must not move the divisor either.
+echo "every eligible session is asked BEFORE any of them is waited for"
+# THE SHAPE ITSELF. Serially, session 2 was not asked until session 1 had been
+# waited out — which is why twelve of nineteen were never asked at all. Order in
+# the transcript is the observable: all three asks, then the wait.
+reset_sessions
+mk_agent AgentA 202610121200 1 1
+mk_agent AgentB 202610121100 1 1
+mk_agent AgentC 202610121000 1 1
+start=$(date +%s)
 env -i HOME="$HOME" PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
-  bash "$CL" rotate off OffFirst >/dev/null 2>&1
-env -i HOME="$HOME" PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
-  CL_HANDOFF_DIR="$FIX/hdir-alloc" CL_HANDOFF_BUDGET=6 CL_HANDOFF_MIN_SHARE=1 \
-  CL_HANDOFF_TIMEOUT=60 CL_HANDOFF_ATTEMPTS=1 \
-  bash "$CL" stop --keep-tabs > "$FIX/alloc.out" 2>&1
-contains "the off row is skipped, not asked" "$(cat "$FIX/alloc.out")" "OffFirst"
-check "the off row never gets a window at all" "" "$(window_for OffFirst)"
-# 6s budget, TWO eligible sessions -> 3s each. The bug gave the first 6s.
-check "the first eligible gets half, not everything" "3" "$(window_for OnSecond)"
-check "…leaving a real share for the second" "3" "$(window_for OnThird)"
+  CL_HANDOFF_DIR="$FIX/store-par" CL_HANDOFF_TIMEOUT=25 CL_HANDOFF_ATTEMPTS=1 \
+  bash "$CL" stop --keep-tabs > "$FIX/par.out" 2>&1
+par_elapsed=$(( $(date +%s) - start ))
+par="$(cat "$FIX/par.out")"
+# A premise guard first: without three real asks every ordering claim below
+# would pass by describing an empty run.
+check "all three were asked" "3" "$(grep -c '→ asked' "$FIX/par.out")"
+last_ask=$(grep -n '→ asked'       "$FIX/par.out" | tail -1 | cut -d: -f1)
+first_wait=$(grep -n 'waiting up to' "$FIX/par.out" | head -1 | cut -d: -f1)
+check "…and the LAST ask precedes the FIRST wait" "1" \
+  "$([ -n "$last_ask" ] && [ -n "$first_wait" ] && [ "$last_ask" -lt "$first_wait" ] && echo 1 || echo 0)"
+
+echo "…they then write concurrently, and the window is shared"
+check "all three handoffs landed"  "3" "$(grep -c 'handoff written for' "$FIX/par.out")"
+contains "…counted off as they arrive"  "$par" "(3 of 3"
+contains "…and totalled at the end"     "$par" "3 of 3 handoff(s) landed."
+# THE WHOLE POINT, IN SECONDS. Three agents each sleeping 1s land together in
+# about a second; serially this was three separate waits. The early exit makes
+# it faster still — the loop stops the moment nothing is pending.
+check "three sessions cost about ONE window, not three" "1" \
+  "$([ "$par_elapsed" -lt 20 ] && echo 1 || echo 0)"
+# And the files are real, not just announced.
+check "the handoff files exist on disk" "3" \
+  "$(ls -1 "$FIX/store-par"/Agent*.md 2>/dev/null | wc -l | tr -d ' ')"
+contains "…with a terminal marker, written by the agent" \
+  "$(tail -1 "$FIX/store-par/AgentA.md" 2>/dev/null)" "<!-- cl:clho:"
+# The prompt alone had to carry the path and the token, since nothing was passed
+# to the agent out of band.
+contains "the prompt that reached the pane named the file" \
+  "$(cat "$FIX/recv-AgentA.txt" 2>/dev/null)" "handoff to"
 rtmux kill-server >/dev/null 2>&1
 
-echo "…including when a strict failure skips the rest of a session's turn"
-# --require-handoff `continue`s before the old decrement, so an already-attempted
-# session stayed in the divisor for everyone after it.
-TMUX_TMPDIR="$FIX/tmux-tmp2"; mkdir -p "$TMUX_TMPDIR"
-rm -f "$HOME/.claude/projects/p1/"*.jsonl
-mk StrictA 202610081200
-mk StrictB 202610081100
-mk StrictC 202610081000
+echo "every session gets the WHOLE window — the budget is no longer divided"
+# The old arithmetic: budget/sessions, floored. Nineteen sessions got 45s each
+# and the seventh onward got nothing. There is no divisor now, so the announced
+# window is the full timeout however many sessions there are.
+reset_sessions
+mk_agent NoAnsA 202610121200 1 0
+mk_agent NoAnsB 202610121100 1 0
+mk_agent NoAnsC 202610121000 1 0
+start=$(date +%s)
 env -i HOME="$HOME" PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
-  bash "$CL" rotate on >/dev/null 2>&1
-env -i HOME="$HOME" PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
-  CL_HANDOFF_DIR="$FIX/hdir-strict" CL_HANDOFF_BUDGET=12 CL_HANDOFF_MIN_SHARE=1 \
-  CL_HANDOFF_TIMEOUT=60 CL_HANDOFF_ATTEMPTS=1 \
-  bash "$CL" stop --require-handoff --keep-tabs > "$FIX/alloc.out" 2>&1
-check "the first of three gets a third of the budget" "4" "$(window_for StrictA)"
-# 12 - 4 = 8 left, TWO eligible remain -> 4. With the missed decrement the
-# divisor stayed at 3 and this read 2.
-check "…and the next still gets a third, not a quarter" "4" "$(window_for StrictB)"
-contains "the strict mode really did leave the first one running" "$(cat "$FIX/alloc.out")" "leaving \"StrictA\" running"
+  CL_HANDOFF_DIR="$FIX/store-none" CL_HANDOFF_TIMEOUT=4 CL_HANDOFF_ATTEMPTS=1 \
+  bash "$CL" stop --keep-tabs > "$FIX/none.out" 2>&1
+none_elapsed=$(( $(date +%s) - start ))
+none="$(cat "$FIX/none.out")"
+check "three sessions were asked"  "3" "$(grep -c '→ asked' "$FIX/none.out")"
+contains "the announced window is the full timeout, not a third of it" "$none" "waiting up to 4s for 3 handoff(s)"
+check "…and there is exactly ONE wait for all of them" "1" "$(grep -c 'waiting up to' "$FIX/none.out")"
+# Serial would be 3 × 4s = 12s. Shared is ~4s.
+check "…so the silence costs one window, not three"  "1" \
+  "$([ "$none_elapsed" -lt 10 ] && echo 1 || echo 0)"
+check "…and the run really did wait (not a vacuous fast pass)" "1" \
+  "$([ "$none_elapsed" -ge 3 ] && echo 1 || echo 0)"
+contains "each silent session is reported"     "$none" 'no handoff from "NoAnsA"'
+contains "…and stopped anyway, resuming as-is" "$none" "stopping it anyway"
+contains "…and the total says none landed"     "$none" "0 of 3 handoff(s) landed."
 rtmux kill-server >/dev/null 2>&1
-rm -f "$HOME/.claude/projects/p1/"*.jsonl
+
+echo "a file is not a handoff — only THIS request's terminal marker is"
+# ── FOUND BY THE REVERT MATRIX ──────────────────────────────────────────────
+#
+# Replacing the whole completion check with `[ -e "$path" ]` passed all 53
+# assertions. The nonce comparison is the central correctness guard of the
+# feature — it is what distinguishes a finished handoff from one cut off
+# mid-write, and a fresh one from a leftover of an earlier rotation — and
+# nothing in the stop path exercised it, because every fixture either answered
+# properly or not at all.
+#
+# Both failure shapes are real and both were observed in review: a handoff
+# truncated after the agent happened to mention the token, and a stale file
+# still sitting in the store from a previous cycle.
+reset_sessions
+mk_agent PartialA 202610121200 1 partial
+mk_agent StaleB   202610121100 1 stale
+# A THIRD session that answers nothing at all, with a complete-but-old handoff
+# already sitting in the store. It is the only one of the three whose file cl
+# stop could be blamed for changing — StaleB's own agent rewrites its file, so
+# asserting "left alone" there would measure the fixture, not the product.
+mk_agent QuotedD    202610120900 1 quoted
+mk_agent UntouchedC 202610121000 1 0
+mkdir -p "$FIX/store-bad"
+printf 'from last week\n\n<!-- cl:clho:2:2:2:2 -->\n' > "$FIX/store-bad/UntouchedC.md"
+pre_stale="$(cat "$FIX/store-bad/UntouchedC.md")"
+env -i HOME="$HOME" PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
+  CL_HANDOFF_DIR="$FIX/store-bad" CL_HANDOFF_TIMEOUT=6 CL_HANDOFF_ATTEMPTS=1 \
+  bash "$CL" stop --keep-tabs > "$FIX/bad.out" 2>&1
+badout="$(cat "$FIX/bad.out")"
+check "all four were asked" "4" "$(grep -c '→ asked' "$FIX/bad.out")"
+# The premise: both files DO exist, so `-e` alone would have counted them.
+check "…and both wrote a file" "2" \
+  "$(ls -1 "$FIX/store-bad/PartialA.md" "$FIX/store-bad/StaleB.md" 2>/dev/null | wc -l | tr -d ' ')"
+contains "a file with no terminal marker is NOT a handoff" "$badout" 'no handoff from "PartialA"'
+contains "…nor is one carrying an earlier rotation's marker" "$badout" 'no handoff from "StaleB"'
+# THE TRUNCATION CASE. This file contains THIS request's nonce — a check for
+# "is the token in the file?" accepts it — but the marker is not the last line,
+# because the agent was cut off while still writing. That is precisely what the
+# prompt's "write it last" instruction makes detectable.
+contains "…nor one that quotes this run's token mid-prose and stops" "$badout" 'no handoff from "QuotedD"'
+check "the quoted-token file really does contain the live nonce" "1" \
+  "$(grep -c 'I will finish by writing' "$FIX/store-bad/QuotedD.md" 2>/dev/null | head -1)"
+check "…so nothing landed"  "1" "$(printf '%s' "$badout" | grep -c '0 of 4 handoff(s) landed.')"
+not_contains "…and neither is announced as written" "$badout" "handoff written for"
+# The last known-good answer is left where it is: the agent's temp-then-rename
+# replaces it only on success, so a failed ask must not destroy it.
+check "a pre-existing handoff is left alone, not consumed" "$pre_stale" \
+  "$(cat "$FIX/store-bad/UntouchedC.md" 2>/dev/null)"
+rtmux kill-server >/dev/null 2>&1
+
+echo "the budget still bounds the whole phase"
+# It is wall clock for all rounds now rather than a pool to divide, so a budget
+# under the window clamps the window.
+reset_sessions
+mk_agent BudgetA 202610121200 1 0
+mk_agent BudgetB 202610121100 1 0
+start=$(date +%s)
+env -i HOME="$HOME" PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
+  CL_HANDOFF_DIR="$FIX/store-bud" CL_HANDOFF_TIMEOUT=60 CL_HANDOFF_ATTEMPTS=3 \
+  CL_HANDOFF_BUDGET=3 bash "$CL" stop --keep-tabs > "$FIX/bud.out" 2>&1
+bud_elapsed=$(( $(date +%s) - start ))
+contains "a 3s budget clamps a 60s window" "$(cat "$FIX/bud.out")" "waiting up to 3s"
+check "…and the stop really is that quick" "1" \
+  "$([ "$bud_elapsed" -lt 25 ] && echo 1 || echo 0)"
+contains "…then says the budget is spent" "$(cat "$FIX/bud.out")" "budget for this stop is spent"
+rtmux kill-server >/dev/null 2>&1
+
+echo "a retired setting is reported, not silently ignored"
+reset_sessions
+mk_agent ShareA 202610121200 1 0
+out=$(env -i HOME="$HOME" PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
+  CL_HANDOFF_DIR="$FIX/store-share" CL_HANDOFF_TIMEOUT=2 CL_HANDOFF_ATTEMPTS=1 \
+  CL_HANDOFF_MIN_SHARE=45 bash "$CL" stop --keep-tabs 2>&1)
+contains "CL_HANDOFF_MIN_SHARE says it no longer applies" "$out" "CL_HANDOFF_MIN_SHARE=45 no longer applies"
+contains "…and says what happens instead"                 "$out" "every session gets the whole"
+rtmux kill-server >/dev/null 2>&1
+
+echo "…and nothing is said about asking when nobody will be asked"
+# THE REGRESSION THIS SUITE CAUSED ONCE. An earlier version counted every claude
+# session, so `--no-handoff` and a rotation-off machine announced a budget
+# nobody was going to spend — test-rotate-toggle.sh caught it, because "off"
+# must not even say the word "asked".
+reset_sessions
+mk_agent QuietA 202610121200 1 0
+mk_agent QuietB 202610121100 1 0
+out=$(env -i HOME="$HOME" PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
+  CL_HANDOFF_DIR="$FIX/store-quiet" bash "$CL" stop --no-handoff --keep-tabs 2>&1)
+not_contains "--no-handoff asks nobody, so it announces nothing" "$out" "asking"
+not_contains "…and waits for nothing"                            "$out" "waiting up to"
+# Guard: the run has to have actually walked the sessions, or both of those pass
+# by describing an empty stop.
+contains "the no-handoff run really did process the sessions" "$out" "QuietA"
+rtmux kill-server >/dev/null 2>&1
+
+echo "a dry run previews every ask and waits for none of them"
+reset_sessions
+mk_agent DryA 202610121200 1 0
+mk_agent DryB 202610121100 1 0
+start=$(date +%s)
+out=$(env -i HOME="$HOME" PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
+  CL_HANDOFF_DIR="$FIX/store-dry" CL_HANDOFF_TIMEOUT=60 bash "$CL" stop --dry-run 2>&1)
+dry_elapsed=$(( $(date +%s) - start ))
+check "both sessions are previewed" "2" "$(printf '%s\n' "$out" | grep -c 'would ask')"
+not_contains "…and nothing is waited for" "$out" "waiting up to"
+check "…so a dry run is immediate"  "1" "$([ "$dry_elapsed" -lt 15 ] && echo 1 || echo 0)"
+# A dry run must leave no trace — the store is resolved by the read-only
+# previewer, which must not create it.
+check "…and no handoff store is created" "0" "$([ -d "$FIX/store-dry" ] && echo 1 || echo 0)"
+check "…and both sessions are still alive" "2" \
+  "$(rtmux list-sessions 2>/dev/null | grep -c '^Dry')"
+rtmux kill-server >/dev/null 2>&1
+
+echo "nothing is killed until the wait is over"
+# THE CTRL-C PROPERTY. Serially, by the time session 19 was asked, sessions 1-18
+# were already dead — so interrupting a slow stop lost every handoff still in
+# flight. Now the first kill cannot happen before the last ask.
+reset_sessions
+mk_agent OrderA 202610121200 1 1
+mk_agent OrderB 202610121100 1 1
+env -i HOME="$HOME" PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
+  CL_HANDOFF_DIR="$FIX/store-ord" CL_HANDOFF_TIMEOUT=25 CL_HANDOFF_ATTEMPTS=1 \
+  bash "$CL" stop --keep-tabs > "$FIX/ord.out" 2>&1
+# `retire_session` prints nothing reliable, so the handoff totals line is the
+# marker for "the wait is over": every ask must precede it.
+last_ask=$(grep -n '→ asked'            "$FIX/ord.out" | tail -1 | cut -d: -f1)
+done_line=$(grep -n 'handoff(s) landed' "$FIX/ord.out" | head -1 | cut -d: -f1)
+check "the last ask precedes the end of the wait" "1" \
+  "$([ -n "$last_ask" ] && [ -n "$done_line" ] && [ "$last_ask" -lt "$done_line" ] && echo 1 || echo 0)"
+check "…and both sessions are gone afterwards" "0" \
+  "$(rtmux list-sessions 2>/dev/null | grep -c '^Order')"
+rtmux kill-server >/dev/null 2>&1
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ] || exit 1

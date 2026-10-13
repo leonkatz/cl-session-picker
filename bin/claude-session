@@ -181,30 +181,28 @@ CL_HANDOFF_FALLBACK_BASE="${CL_HANDOFF_FALLBACK_BASE:-$HOME/.local/state/claude-
 CL_HANDOFF_PROMPT_FILE="${CL_HANDOFF_PROMPT_FILE:-$HOME/.config/claude-session/handoff-prompt.txt}"
 # The first message a fresh session receives (cl start --fresh). Same reasoning.
 CL_RESUME_PROMPT_FILE="${CL_RESUME_PROMPT_FILE:-$HOME/.config/claude-session/resume-prompt.txt}"
-# How long `cl stop` waits for a requested handoff to land before falling back
-# to a plain stop. Generous by default: writing a good handoff is real work.
-CL_HANDOFF_TIMEOUT="${CL_HANDOFF_TIMEOUT:-90}"
-# How many times to ASK before giving up. A session that is mid-task may not
-# read the first request; re-sending gives it another chance. Because `cl stop`
-# now fails CLOSED (a session whose handoff never lands is left running rather
-# than killed unhandoffed), the cost of exhausting these is a session still
-# alive, not a lost handoff — so the default is deliberately small: the whole
-# sequence can take ATTEMPTS × TIMEOUT before a stop moves on.
+# How long `cl stop` waits for requested handoffs to land before falling back to
+# a plain stop. SHARED: the asks go out together and this window covers all of
+# them at once, so it is wall clock for the whole round rather than per session.
+# That is why it can afford to be generous — 180s is three minutes for every
+# session simultaneously, where the serial version gave each of nineteen 45s and
+# never reached thirteen of them. A real handoff on an idle session measured
+# ~35s end to end (2026-10-07); the rest of the window is for a session that has
+# to finish what it is doing first, since a queued ask only comes due then.
+CL_HANDOFF_TIMEOUT="${CL_HANDOFF_TIMEOUT:-180}"
+# How many ROUNDS of asking before giving up. A round asks every session that
+# has not answered yet and is not visibly busy, then waits one shared window, so
+# the worst case is ROUNDS × TIMEOUT for the whole stop rather than per session.
+# A session that is mid-task may not read the first request; re-sending gives it
+# another chance, but one that is merely still WORKING is never re-asked — see
+# handoff_target_busy.
 CL_HANDOFF_ATTEMPTS="${CL_HANDOFF_ATTEMPTS:-3}"
-# A GLOBAL budget for the whole stop, not a per-session one. attempts × timeout
-# × sessions is how a handoff feature turns an eight-session `cl stop` into a
-# 36-minute one; once this is spent, remaining sessions are stopped without
-# being asked and told so. Deliberately generous for one session, bounded for
-# a working set.
+# WALL CLOCK for the whole handoff phase — the ceiling on how long `cl stop` may
+# sit there, across every round. It is no longer a pool divided between
+# sessions: since the asks are concurrent, the number that matters is how long
+# the operator waits, not how thin each slice is. Once it is spent, sessions
+# that have not answered are stopped as-is and told so.
 CL_HANDOFF_BUDGET="${CL_HANDOFF_BUDGET:-300}"
-
-# CL_HANDOFF_MIN_SHARE: the smallest window worth giving one session. A share
-# below this is not a short ask, it is a guaranteed failure that still spends
-# the budget — measured 2026-10-07, a real handoff on an idle session takes
-# ~35s end to end, so 45s is the floor with headroom. It exists because the
-# budget is divided by the number of sessions: 19 sessions over 300s is 15s
-# each, and that asks nineteen questions nobody can answer.
-CL_HANDOFF_MIN_SHARE="${CL_HANDOFF_MIN_SHARE:-45}"
 # Record of session names started fresh, with the OLD session id, so a fresh
 # start is never a dead end — the prior conversation stays resumable even
 # though its name now points at the new session.
@@ -2701,25 +2699,6 @@ handoff_target_busy() {
   claude_busy "$pid"
 }
 
-# handoff_session_cap <budget_left> <sessions_still_to_ask>: one session's TOTAL
-# share of what is left, across all of its attempts.
-#
-# Without this the per-session worst case is CL_HANDOFF_ATTEMPTS x
-# CL_HANDOFF_TIMEOUT = 270s against a 300s budget for the whole stop — 90% of
-# it, for one session. That is not a cap, it is a coin toss about who goes
-# first.
-handoff_session_cap() {
-  local left="$1" n="${2:-1}" cap
-  [ "$n" -ge 1 ] 2>/dev/null || n=1
-  cap=$(( left / n ))
-  # The floor wins over fairness ON PURPOSE: a share too small to succeed in
-  # helps nobody, so it is better that the sessions which do get asked have a
-  # real chance and the rest are told up front they will not be asked.
-  [ "$cap" -lt "$CL_HANDOFF_MIN_SHARE" ] && cap="$CL_HANDOFF_MIN_SHARE"
-  [ "$cap" -gt "$left" ] && cap="$left"
-  printf '%s' "$cap"
-}
-
 # close_cmux_surface <sid> [display_name]: best-effort close of the cmux surface
 # hosting this session, looked up in cmux's own session store. Called after the
 # claude is dead, so the surface holds nothing but a bare shell.
@@ -3104,6 +3083,37 @@ send_text_cmux() {
     && cmux send-key --surface "$1" -- enter >/dev/null 2>&1
 }
 
+# handoff_send_once <name> <sid> <tmux_name> <prompt>: type the ask into the
+# session, by whichever route reaches it. 0 if it went somewhere, 1 if there was
+# no route at all.
+#
+# ONE place decides reachability, because two callers need the same answer about
+# the same session: request_handoff (one session, waits for it) and `cl stop`'s
+# broadcast (every session, waits for them together). When this lived inside
+# request_handoff the broadcast could only have it by duplicating it, and a
+# duplicated send path is one that drifts — the tmux target form alone took two
+# review rounds to get right.
+#
+# The tmux branch deliberately does NOT fall through to iTerm when the send
+# fails: a live tmux session that refuses send-keys is a broken pane, not an
+# iTerm tab, and typing a handoff request into some other window is worse than
+# reporting it unreachable.
+handoff_send_once() {
+  local name="$1" sid="$2" t="$3" prompt="$4" store sfc
+  if [ -n "$t" ] && tmux has-session -t "=${t}" 2>/dev/null; then
+    send_text_tmux "$t" "$prompt" && return 0
+  elif send_text_iterm "$t" "$prompt"; then
+    return 0
+  else
+    store="$HOME/.cmuxterm/claude-hook-sessions.json"
+    if command -v jq >/dev/null 2>&1 && [ -r "$store" ]; then
+      sfc=$(jq -r --arg sid "$sid" '.sessions[$sid].surfaceId // empty' "$store" 2>/dev/null)
+      [ -n "$sfc" ] && send_text_cmux "$sfc" "$prompt" && return 0
+    fi
+  fi
+  return 1
+}
+
 # request_handoff <name> <sid> <cwd> <tmux_name> [--dry-run]: try to get the
 # live session to write its own handoff before it dies. Returns:
 #   0  a handoff is on disk for this session and is THIS run's — either its
@@ -3132,16 +3142,19 @@ send_text_cmux() {
 # request always contains it, and nothing else ever could.
 handoff_nonce() { printf 'clho:%s:%s:%s:%s' "$$" "$(date +%s 2>/dev/null || echo 0)" "$RANDOM" "$RANDOM"; }
 
-# _CL_BUDGET_LEFT: seconds of waiting left for the WHOLE stop. do_stop sets it
-# before each call and reads it back after; a lone caller that never sets it
-# gets -1, meaning unbounded.
+# _CL_BUDGET_LEFT / _CL_SESSION_CAP: the bounds request_handoff waits within.
+# Both default to -1, meaning unbounded, and NOTHING sets them any more: `cl
+# stop` stopped dividing a budget between sessions when the asks became
+# concurrent, and its only other caller is `cl start --fresh`, which handles one
+# session and should give it the full attempts. They stay because they are
+# request_handoff's contract with any future caller that does need a ceiling —
+# and because -1 was itself a bug once: the subtraction used to run
+# unconditionally and return on `<= 0`, so an uncapped caller quit after ONE
+# attempt and CL_HANDOFF_ATTEMPTS did nothing.
 _CL_BUDGET_LEFT="${_CL_BUDGET_LEFT:--1}"
-# _CL_SESSION_CAP: seconds THIS session may spend, across all its attempts. -1
-# means uncapped (a lone caller that never set it). do_stop sets it per session
-# from handoff_session_cap so one session cannot eat the whole stop's budget.
 _CL_SESSION_CAP="${_CL_SESSION_CAP:--1}"
 request_handoff() {
-  local name="$1" sid="$2" cwd="$3" t="$4" dry="${5:-}" prompt root hp nonce waited sfc store sent=0 vrc
+  local name="$1" sid="$2" cwd="$3" t="$4" dry="${5:-}" prompt root hp nonce waited sent=0 vrc
 
   # Dry run: preview ONLY, via the read-only *_preview resolver — checked
   # before touching anything real. handoff_path (below) needs a resolved
@@ -3209,17 +3222,7 @@ request_handoff() {
       prompt=$(build_handoff_prompt "$root" "$name" "$nonce")
       sent=0
 
-      if [ -n "$t" ] && tmux has-session -t "=${t}" 2>/dev/null; then
-        send_text_tmux "$t" "$prompt" && sent=1
-      elif send_text_iterm "$t" "$prompt"; then
-        sent=1
-      else
-        store="$HOME/.cmuxterm/claude-hook-sessions.json"
-        if command -v jq >/dev/null 2>&1 && [ -r "$store" ]; then
-          sfc=$(jq -r --arg sid "$sid" '.sessions[$sid].surfaceId // empty' "$store" 2>/dev/null)
-          [ -n "$sfc" ] && send_text_cmux "$sfc" "$prompt" && sent=1
-        fi
-      fi
+      handoff_send_once "$name" "$sid" "$t" "$prompt" && sent=1
 
       # Unreachable is not a timing problem, so retrying cannot fix it — report
       # it as "could not even ask" on the first attempt rather than burning the
@@ -3435,12 +3438,7 @@ do_stop() {
     printf 'saved %s session(s) to %s\n\n' "$count" "$STATE"
   fi
 
-  # `discover | while` would run the loop in a SUBSHELL, so nothing it counted
-  # could be reported afterwards. Read from a process substitution instead —
-  # the kept tally below is the whole point of failing closed: a stop that
-  # silently leaves three sessions running is no better than one that silently
-  # kills them unhandoffed.
-  local name t hrc kept=0 nohandoff=0 kept_names="" resume_only="" budget_left="$CL_HANDOFF_BUDGET"
+  local name t hrc kept=0 nohandoff=0 kept_names="" resume_only=""
   # Rotation accounting for the log. `sess_rotate` is decided PER SESSION, since
   # the stored policy can carry per-session overrides, so the mode recorded for
   # the whole stop is "mixed" when they disagreed — a week containing a mixed
@@ -3453,83 +3451,247 @@ do_stop() {
   if [ -n "${CL_ROTATE:-}" ] && [ -z "$env_rotate" ]; then
     printf 'claude-session: ignoring CL_ROTATE="%s" (expected 0/1, on/off, no/yes) — using the stored setting\n' "$CL_ROTATE" >&2
   fi
+  # The serial stop divided one budget BETWEEN sessions; this one shares a
+  # window between them, so a per-session floor has nothing left to describe.
+  # Said out loud rather than ignored, because silently dropping a variable
+  # somebody exported is how a machine quietly stops behaving as configured.
+  if [ -n "${CL_HANDOFF_MIN_SHARE:-}" ]; then
+    printf 'claude-session: CL_HANDOFF_MIN_SHARE=%s no longer applies — handoffs are now asked in parallel, so every session gets the whole CL_HANDOFF_TIMEOUT window (%ss)\n' \
+      "$CL_HANDOFF_MIN_SHARE" "$CL_HANDOFF_TIMEOUT" >&2
+  fi
   # Resolved once for the whole stop so --no-handoff can clear a stale handoff
   # without every session re-resolving the store in a subshell.
   _CL_STOP_ROOT=""
   if [ -z "$dry_run" ]; then handoff_root >/dev/null && _CL_STOP_ROOT="$_CL_HANDOFF_ROOT"; fi
 
-  # DISCOVERED ONCE, into a variable, so the count below is of the same set the
-  # loop then walks. Reading it twice could ask a different number of sessions
-  # than it budgeted for. Still not a pipeline into `while`, for the original
-  # reason: a subshell would discard every tally this function has to report.
-  local _rows _ask_left=0 _nn _ns _nc _ne _na _n_asked=0
-  _rows="$(discover)"
-  # DELIBERATELY NOT GATED ON dry_run. `cl stop --dry-run` is exactly where you
-  # want to be told the budget will not cover the sessions you have, while it is
-  # still free to change.
-  if true; then
-    # COUNTS ONLY WHAT WILL ACTUALLY BE ASKED. Counting every claude session
-    # made `cl stop --no-handoff` and a rotation-off machine warn about a
-    # budget nobody was going to spend — caught by test-rotate-toggle.sh,
-    # which asserts that "off" never even says the word "asked".
-    while IFS=$'\t' read -r _nn _ns _nc _ne _na; do
-      stop_rotate_resolve "$_nn" "$_na" "$no_handoff" "$require_handoff" "$env_rotate"
-      case "$_STOP_ROTATE" in off|n/a) continue ;; esac
-      _ask_left=$(( _ask_left + 1 ))
-    done <<< "$_rows"
-    # SAID UP FRONT, which is the whole point. On 2026-10-07 nineteen sessions
-    # shared a 300s budget; the operator learned it only from nineteen
-    # "budget is spent" lines AFTER the handoffs were already lost. A number
-    # you can act on before the stop runs is worth more than an accurate
-    # post-mortem.
-    if [ "$_ask_left" -gt 1 ] && [ $(( CL_HANDOFF_BUDGET / _ask_left )) -lt "$CL_HANDOFF_MIN_SHARE" ]; then
-      printf '⚠ %s sessions share a %ss handoff budget — %ss each, under the %ss a handoff needs.\n' \
-        "$_ask_left" "$CL_HANDOFF_BUDGET" "$(( CL_HANDOFF_BUDGET / _ask_left ))" "$CL_HANDOFF_MIN_SHARE" >&2
-      # At least one: with a budget below the floor the first session still
-      # gets what is left, and "About 0 will be asked" is not a true sentence.
-      _n_asked=$(( CL_HANDOFF_BUDGET / CL_HANDOFF_MIN_SHARE ))
-      [ "$_n_asked" -lt 1 ] && _n_asked=1
-      printf '   About %s will be asked; the rest stop and RESUME as-is. To ask them all:\n' \
-        "$_n_asked" >&2
-      printf '     CL_HANDOFF_BUDGET=%s cl stop\n' "$(( _ask_left * CL_HANDOFF_MIN_SHARE ))" >&2
-    fi
-  fi
+  # ── WHY THIS IS THREE PASSES AND NOT ONE LOOP ───────────────────────────────
+  #
+  # It used to be one loop: ask a session, WAIT for it, kill it, next. Waiting is
+  # the expensive part and it was serial, so the cost of a stop was
+  # `sessions × share` in wall clock while each session's share was
+  # `budget / sessions` — both numbers moving the wrong way as sessions
+  # accumulate. On 2026-10-07, nineteen sessions over a 300s budget came to 15s
+  # each, floored to 45s, which exhausted the budget after six; the other twelve
+  # were never asked at all. Raising the budget to give all nineteen a real
+  # window would have meant 19 × 90s = 28 minutes of a human watching a terminal.
+  #
+  # Sending is cheap and writing is concurrent, so the asks go out together and
+  # the waits overlap:
+  #
+  #   1. PLAN      — resolve every session's rotation policy. Nothing sent.
+  #   2. BROADCAST — ask every eligible session, in one pass, no waiting.
+  #   3. WAIT      — ONE shared window, polling all of them.
+  #   4. CONFIRM   — check which files actually landed, then close.
+  #
+  # Nineteen sessions now cost roughly `sends + one window`, and every one of
+  # them gets the FULL window instead of a nineteenth of the budget. It also
+  # fixes the busy case properly: a queued ask has the whole window to come due
+  # instead of burning a 45s share while the agent finishes something else.
+  #
+  # Nothing is killed before pass 4, so a Ctrl-C during the wait loses no
+  # session — the old shape had already killed everyone asked before it.
 
+  # `discover | while` would run the loop in a SUBSHELL, so nothing it counted
+  # could be reported afterwards. Read from a process substitution instead —
+  # the kept tally below is the whole point of failing closed: a stop that
+  # silently leaves three sessions running is no better than one that silently
+  # kills them unhandoffed.
+  local _rows; _rows="$(discover)"
+
+  # ── PASS 1: PLAN ────────────────────────────────────────────────────────────
+  # One slot per session, carrying everything the later passes need. Parallel
+  # indexed arrays rather than one associative array because macOS ships bash
+  # 3.2, which has no `declare -A`.
+  local -a _h_name _h_sid _h_cwd _h_tmux _h_agent _h_rot _h_state _h_path _h_nonce
+  local _n=0 i _ask_total=0 sid cwd epoch agent
   while IFS=$'\t' read -r name sid cwd epoch agent; do
     case "$agent" in claude|codex) ;; *) continue ;; esac
-    t=$(tmux_name "$name" "$agent")
-    # --dry-run must short-circuit BEFORE the kill logic regardless of
-    # --no-handoff — this check used to live only inside the `no_handoff=0`
-    # branch below, so `cl stop --dry-run --no-handoff` fell straight through
-    # to a REAL tmux kill-session / process kill while printing "[dry-run]".
-    # (Found in Codex review, 2026-09-23, via a fake-tmux fixture that
-    # recorded the real kill-session call.)
     # Resolve the policy for THIS session. A flag on the command outranks
     # everything, because it is the most explicit thing the operator can say;
     # below that, CL_ROTATE for a one-off, then the stored setting.
     stop_rotate_resolve "$name" "$agent" "$no_handoff" "$require_handoff" "$env_rotate"
-    sess_rotate="$_STOP_ROTATE"; sess_src="$_STOP_ROTATE_SRC"
-    if [ "$sess_rotate" != "n/a" ]; then
+    _h_name[$_n]="$name"; _h_sid[$_n]="$sid"; _h_cwd[$_n]="$cwd"
+    _h_tmux[$_n]="$(tmux_name "$name" "$agent")"; _h_agent[$_n]="$agent"
+    _h_rot[$_n]="$_STOP_ROTATE"
+    _h_state[$_n]="idle"; _h_path[$_n]=""; _h_nonce[$_n]=""
+    # SOURCE is tracked per session, independently of mode. Folding it into the
+    # mode comparison hid the case this exists to catch: with the default on and
+    # one session explicitly overridden to on, every effective mode is "on", so
+    # the row recorded whichever source happened to come first in discovery
+    # order — and a week containing a deliberate override was reported as a
+    # clean A/B sample. (Codex review, 2026-10-01.)
+    if [ "$_STOP_ROTATE" != "n/a" ]; then
       n_sessions=$((n_sessions+1))
-      # SOURCE is tracked per session, independently of mode. Folding it into the
-      # mode comparison hid the case this exists to catch: with the default on and
-      # one session explicitly overridden to on, every effective mode is "on", so
-      # the row recorded whichever source happened to come first in discovery
-      # order — and a week containing a deliberate override was reported as a
-      # clean A/B sample. (Codex review, 2026-10-01.)
-      if [ -z "$log_src" ]; then log_src="$sess_src"
-      elif [ "$log_src" != "$sess_src" ]; then log_src="mixed"; fi
-      if [ -z "$log_mode" ]; then log_mode="$sess_rotate"
-      elif [ "$log_mode" != "$sess_rotate" ]; then log_mode="mixed"; fi
+      if [ -z "$log_src" ]; then log_src="$_STOP_ROTATE_SRC"
+      elif [ "$log_src" != "$_STOP_ROTATE_SRC" ]; then log_src="mixed"; fi
+      if [ -z "$log_mode" ]; then log_mode="$_STOP_ROTATE"
+      elif [ "$log_mode" != "$_STOP_ROTATE" ]; then log_mode="mixed"; fi
+    fi
+    [ "$_STOP_ROTATE" = "on" ] && _ask_total=$((_ask_total+1))
+    _n=$((_n+1))
+  done <<< "$_rows"
+
+  # ── PASS 2: BROADCAST ───────────────────────────────────────────────────────
+  local _pending=0 _done=0 nonce prompt
+  if [ "$_ask_total" -gt 0 ]; then
+    # SAID UP FRONT, which is the whole point. The number that matters now is
+    # how long the stop may take, not how thin each session's slice is.
+    # Deliberately NOT the words "waiting up to": that phrase belongs to the
+    # round line below and nowhere else, so "how many waits did this stop do?"
+    # stays answerable from the transcript — by a reader and by the tests.
+    printf '⏳ asking %s session(s) for a handoff, all at once — then ONE shared window of up to %ss\n' \
+      "$_ask_total" "$CL_HANDOFF_TIMEOUT" >&2
+    if [ -z "$dry_run" ] && [ -z "$_CL_STOP_ROOT" ]; then
+      printf 'ℹ no durable location available to hand off (handoff dir and fallback both unusable) — plain stop for all %s\n' \
+        "$_ask_total" >&2
+    fi
+  fi
+  for (( i=0; i<_n; i++ )); do
+    [ "${_h_rot[$i]}" = "on" ] || continue
+    if [ -n "$dry_run" ]; then
+      # Preview ONLY, via the read-only resolver: resolving the real root means
+      # mkdir + a write probe, and a dry run must do neither. (Found in Codex
+      # review, 2026-09-23 — the original order built the real path first, so
+      # `cl stop --dry-run` could still create handoff directories.)
+      printf '[dry-run] would ask "%s" to write handoff to %s (via %s)\n' \
+        "${_h_name[$i]}" "$(handoff_path_preview "${_h_name[$i]}")" \
+        "$( [ -n "${_h_tmux[$i]}" ] && tmux has-session -t "=${_h_tmux[$i]}" 2>/dev/null && echo tmux || echo 'iterm/cmux' )" >&2
+      continue
+    fi
+    if [ -z "$_CL_STOP_ROOT" ]; then _h_state[$i]="unreachable"; continue; fi
+    _h_path[$i]="$(handoff_path "$_CL_STOP_ROOT" "${_h_name[$i]}")"
+    # A hand-written handoff is an ANSWER, not a leftover: it is how you satisfy
+    # this requirement when the pane cannot be reached at all (`cl handoff`, run
+    # inside the session). Honour it instead of asking. Its AGE is printed
+    # prominently, because the one real hazard here is acting on something
+    # written weeks ago and forgotten.
+    if handoff_is_manual "${_h_path[$i]}"; then
+      printf '✓ using the handoff you wrote by hand for "%s" — written %s ago (%s)\n' \
+        "${_h_name[$i]}" "$(handoff_age_human "${_h_path[$i]}")" "${_h_path[$i]}" >&2
+      _h_state[$i]="done"; _done=$((_done+1)); continue
+    fi
+    # A prior handoff still sitting here is LEFT ALONE while we ask for a new
+    # one. Sweeping it first destroyed a valid answer to buy nothing: the wait
+    # below cannot be fooled by it, because it matches THIS attempt's nonce in
+    # the terminal marker, and the agent's temp-file-then-rename replaces it
+    # atomically only when the new handoff is complete — so if every attempt
+    # fails, the last known-good answer is still there.
+    nonce="$(handoff_nonce)"
+    prompt="$(build_handoff_prompt "$_CL_STOP_ROOT" "${_h_name[$i]}" "$nonce")"
+    if handoff_send_once "${_h_name[$i]}" "${_h_sid[$i]}" "${_h_tmux[$i]}" "$prompt"; then
+      _h_nonce[$i]="$nonce"; _h_state[$i]="pending"; _pending=$((_pending+1))
+      printf '  → asked "%s" for %s\n' "${_h_name[$i]}" "${_h_path[$i]}" >&2
+    else
+      # Unreachable is not a timing problem, so retrying cannot fix it — report
+      # it as "could not even ask" rather than re-sending into nothing.
+      printf 'ℹ no reachable pane to hand off "%s" (not tmux, not a tagged iTerm tab, no cmux text-injection)\n' \
+        "${_h_name[$i]}" >&2
+      _h_state[$i]="unreachable"
+    fi
+  done
+
+  # ── PASS 3: ONE SHARED WAIT ─────────────────────────────────────────────────
+  # The budget is now wall clock for the whole handoff phase rather than a pool
+  # divided between sessions, which is both the simplification and the fix.
+  local round=1 budget_left="$CL_HANDOFF_BUDGET" window elapsed nextnote waiting_names
+  while [ "$_pending" -gt 0 ] && [ "$round" -le "$CL_HANDOFF_ATTEMPTS" ]; do
+    window="$CL_HANDOFF_TIMEOUT"
+    [ "$window" -gt "$budget_left" ] && window="$budget_left"
+    if [ "$window" -le 0 ]; then
+      printf '⏭ the %ss handoff budget for this stop is spent — not waiting further for %s session(s); they will resume as-is\n' \
+        "$CL_HANDOFF_BUDGET" "$_pending" >&2
+      break
+    fi
+    printf '⏳ waiting up to %ss for %s handoff(s) — round %s of %s\n' \
+      "$window" "$_pending" "$round" "$CL_HANDOFF_ATTEMPTS" >&2
+    elapsed=0; nextnote=30
+    while [ "$elapsed" -lt "$window" ] && [ "$_pending" -gt 0 ]; do
+      sleep 1; elapsed=$((elapsed+1))
+      for (( i=0; i<_n; i++ )); do
+        [ "${_h_state[$i]}" = "pending" ] || continue
+        # THIS attempt's nonce, not just "any change" — see handoff_nonce's
+        # comment for the two races a plain content hash still missed. The nonce
+        # must be the file's terminal MARKER, not merely present somewhere in
+        # it: that is what distinguishes a COMPLETE handoff from one cut off
+        # after the agent happened to mention the token.
+        if [ -e "${_h_path[$i]}" ] && [ "$(handoff_marker "${_h_path[$i]}" 2>/dev/null)" = "${_h_nonce[$i]}" ]; then
+          _h_state[$i]="done"; _done=$((_done+1)); _pending=$((_pending-1))
+          printf '✓ handoff written for "%s" (%s of %s, %ss in)\n' \
+            "${_h_name[$i]}" "$_done" "$_ask_total" "$elapsed" >&2
+        fi
+      done
+      # Progress, so a multi-minute wait is legible rather than a dead prompt.
+      if [ "$elapsed" -ge "$nextnote" ] && [ "$_pending" -gt 0 ]; then
+        waiting_names=""
+        for (( i=0; i<_n; i++ )); do
+          [ "${_h_state[$i]}" = "pending" ] || continue
+          waiting_names="${waiting_names}${waiting_names:+, }${_h_name[$i]}"
+        done
+        printf '   … %ss in, still writing: %s\n' "$elapsed" "$waiting_names" >&2
+        nextnote=$((nextnote+30))
+      fi
+    done
+    budget_left=$((budget_left - elapsed))
+    [ "$budget_left" -lt 0 ] && budget_left=0
+    round=$((round+1))
+    # A further round is for an ask that did not LAND. It cannot help an agent
+    # that is simply still working, and it actively harms it: a busy claude
+    # QUEUES typed input and runs it when it finishes — proven 2026-10-07 by
+    # injecting into a working session, which showed "Press up to edit queued
+    # messages" and executed nothing until the current task ended. Re-typing
+    # stacked three copies in one input box and changed nothing about when the
+    # handoff landed.
+    if [ "$_pending" -gt 0 ] && [ "$round" -le "$CL_HANDOFF_ATTEMPTS" ] && [ "$budget_left" -gt 0 ]; then
+      for (( i=0; i<_n; i++ )); do
+        [ "${_h_state[$i]}" = "pending" ] || continue
+        if handoff_target_busy "${_h_tmux[$i]}" "${_h_sid[$i]}" "${_h_name[$i]}"; then
+          printf '⏳ "%s" is still working — its handoff request is QUEUED, not lost; waiting without re-asking\n' \
+            "${_h_name[$i]}" >&2
+          continue
+        fi
+        # A FRESH nonce per attempt THAT ACTUALLY SENDS. Reusing one would let a
+        # late answer to round 1 be counted as confirmation of round 3 — the
+        # same stale-artifact confusion the nonce exists to prevent. The
+        # no-resend path above deliberately keeps the nonce it is already
+        # waiting on, because that is the request still in flight.
+        nonce="$(handoff_nonce)"
+        prompt="$(build_handoff_prompt "$_CL_STOP_ROOT" "${_h_name[$i]}" "$nonce")"
+        if handoff_send_once "${_h_name[$i]}" "${_h_sid[$i]}" "${_h_tmux[$i]}" "$prompt"; then
+          _h_nonce[$i]="$nonce"
+          printf '  → re-asked "%s" (round %s)\n' "${_h_name[$i]}" "$round" >&2
+        else
+          printf 'ℹ "%s" became unreachable before its handoff landed\n' "${_h_name[$i]}" >&2
+          _h_state[$i]="unreachable"; _pending=$((_pending-1))
+        fi
+      done
+    fi
+  done
+  # Anything still pending ran out of rounds or budget.
+  for (( i=0; i<_n; i++ )); do
+    if [ "${_h_state[$i]}" = "pending" ]; then
+      _h_state[$i]="timeout"
+      printf '⚠ no handoff from "%s" after %s round(s)\n' "${_h_name[$i]}" "$((round-1))" >&2
+      _pending=$((_pending-1))
+    fi
+  done
+  if [ "$_ask_total" -gt 0 ] && [ -z "$dry_run" ]; then
+    printf '\n%s of %s handoff(s) landed.\n' "$_done" "$_ask_total" >&2
+  fi
+
+  # ── PASS 4: CONFIRM, THEN CLOSE ─────────────────────────────────────────────
+  local sid_i
+  for (( i=0; i<_n; i++ )); do
+    name="${_h_name[$i]}"; sid_i="${_h_sid[$i]}"; t="${_h_tmux[$i]}"
+    agent="${_h_agent[$i]}"; sess_rotate="${_h_rot[$i]}"
+    if [ -n "$dry_run" ]; then
+      printf '[dry-run] would evaluate and, if not left running, kill "%s" (rotation %s)\n' "$name" "$sess_rotate" >&2
+      continue
+    fi
+    if [ "$sess_rotate" != "n/a" ]; then
       # Read BEFORE the session is killed: afterwards the transcript stops
       # growing, but this is the figure that matters — what this session had
       # grown to, i.e. what each further call would have carried on a resume.
-      ctxs="$ctxs $(context_size "$sid" "$agent")"
-    fi
-    if [ -n "$dry_run" ]; then
-      [ "$sess_rotate" = "on" ] && request_handoff "$name" "$sid" "$cwd" "$t" "$dry_run"
-      printf '[dry-run] would evaluate and, if not left running, kill "%s" (rotation %s)\n' "$name" "$sess_rotate" >&2
-      continue
+      ctxs="$ctxs $(context_size "$sid_i" "$agent")"
     fi
     # Rotation is a Claude mechanism: a Codex row is stopped and resumed as
     # itself, so it skips the whole handoff block rather than being asked for
@@ -3554,34 +3716,11 @@ do_stop() {
       # instead would redefine the one command you run before a reboot, and
       # would refuse hardest on the wedged session you most need gone.
       # `--require-handoff` opts into the strict behaviour.
-      if [ "$budget_left" -le 0 ]; then
-        printf '⏭ not asking "%s" for a handoff — the %ss handoff budget for this stop is spent; it will resume as-is\n' "$name" "$CL_HANDOFF_BUDGET" >&2
-        hrc=9
-      else
-        _CL_BUDGET_LEFT="$budget_left"
-        _CL_SESSION_CAP="$(handoff_session_cap "$budget_left" "$_ask_left")"
-        request_handoff "$name" "$sid" "$cwd" "$t" ""; hrc=$?
-        budget_left="$_CL_BUDGET_LEFT"
-      fi
-      # THIS SESSION'S SLOT IS NOW SPENT — exactly once, here, for a
-      # rotation-on session whose turn was reached, and before any `continue`
-      # below.
-      #
-      # It was at the bottom of the loop and fired for EVERY claude session,
-      # including rotation-off ones the prepass had deliberately excluded. With
-      # discovery order off,on,on the divisor began at 2, the `off` row took it
-      # to 1, and the first eligible session was handed the WHOLE remaining
-      # budget instead of half — starving the one after it, which is the
-      # ordering-dependent unfairness this was supposed to end. The comment
-      # there claimed the skipped row "used a slot in the divisor above"; that
-      # was simply false once the prepass stopped counting it.
-      #
-      # And the strict path `continue`s a few lines down, so a session that had
-      # already been attempted stayed in the divisor for everyone after it.
-      # (Codex review, 2026-10-08.)
-      if [ "$_ask_left" -gt 0 ]; then
-        _ask_left=$(( _ask_left - 1 ))
-      fi
+      case "${_h_state[$i]}" in
+        done)        hrc=0 ;;
+        unreachable) hrc=1 ;;
+        *)           hrc=2 ;;
+      esac
       if [ "$hrc" -ne 0 ]; then
         if [ "$require_handoff" = "1" ]; then
           printf '✋ leaving "%s" running — --require-handoff was given and no handoff arrived.\n' "$name" >&2
@@ -3606,8 +3745,8 @@ do_stop() {
     # moves on; its return value changes nothing here (a lost race, a decline,
     # a slow shutdown, or a session that was not cl's to kill are all just
     # "didn't get killed this time, re-run stop").
-    retire_session "$name" "$sid" "$t" "$close_tabs" "$agent"
-  done <<< "$_rows"
+    retire_session "$name" "$sid_i" "$t" "$close_tabs" "$agent"
+  done
 
   [ -n "$dry_run" ] && return 0
   mark_resume_only "$resume_only"
