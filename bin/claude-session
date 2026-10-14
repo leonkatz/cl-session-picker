@@ -3132,23 +3132,42 @@ send_text_cmux() {
 # `wait` on a killed child reports the signal, so the timeout status is returned
 # explicitly rather than inferred from it.
 #
-# LIMIT: it kills the direct child, not a process group — bash cannot make one
-# without setsid. That is sufficient for the backends here, which ARE the
-# process being killed (osascript, tmux, cmux), but a backend that forked and
-# exited would leave the grandchild running. If such a child inherits a pipe the
-# caller is capturing, the capture blocks until it exits, which is how a test
-# whose stub spawned `sleep` took 8s to observe a 1s timeout.
+# ── IT KILLS THE PROCESS GROUP, NOT JUST THE CHILD ──────────────────────────
+#
+# The first version killed `$!` only, and documented that as sufficient
+# "because the backends here ARE the process being killed". That was WRONG, and
+# Codex's PR #19 review proved it: every backend is a shell FUNCTION
+# (send_text_tmux, send_text_iterm, send_text_cmux), so backgrounding it makes
+# `$!` a SUBSHELL and the real osascript/tmux/cmux is its child. Killing the
+# subshell left the backend running while this printed "killed it" — a false
+# message, and an orphan that can go on holding a caller's pipe.
+#
+# Measured on bash 3.2, a function that backgrounds a sleep:
+#   without set -m, kill -9 $!        -> grandchild ALIVE
+#   with    set -m, kill -9 -- -$!    -> grandchild GONE
+#
+# `set -m` puts the job in its own process group, which is what makes the
+# negative-pid kill reach the whole tree. Job control is restored to whatever it
+# was: this runs inside a long-lived interactive-ish script, and leaving it on
+# would change how every later background job is reaped.
 run_bounded() {
   local limit="$1"; shift
-  local ticks=$(( limit * 10 )) i=0 pid rc
+  local ticks=$(( limit * 10 )) i=0 pid had_m=0
+  case "$-" in *m*) had_m=1 ;; esac
+  set -m
   "$@" & pid=$!
+  [ "$had_m" = "1" ] || set +m
   while [ "$i" -lt "$ticks" ]; do
     if ! kill -0 "$pid" 2>/dev/null; then
       wait "$pid"; return $?
     fi
     sleep 0.1; i=$((i+1))
   done
-  kill -9 "$pid" 2>/dev/null
+  # The GROUP: -pid. TERM first so a backend with a cleanup path can take it,
+  # then KILL, because a wedged GUI call will not.
+  kill -TERM -- -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+  sleep 0.3
+  kill -9 -- -"$pid" 2>/dev/null || kill -9 "$pid" 2>/dev/null
   wait "$pid" 2>/dev/null
   return 124
 }

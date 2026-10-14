@@ -70,8 +70,8 @@ extract_fns() {
 }
 
 LIB="$FIX/lib.sh"
-extract_fns "$CL" handoff_target_busy handoff_nonce run_bounded handoff_send_once request_handoff > "$LIB"
-for fn in handoff_target_busy handoff_nonce run_bounded handoff_send_once request_handoff; do
+extract_fns "$CL" handoff_target_busy handoff_nonce run_bounded send_text_tmux handoff_send_once request_handoff > "$LIB"
+for fn in handoff_target_busy handoff_nonce run_bounded send_text_tmux handoff_send_once request_handoff; do
   grep -q "^${fn}()" "$LIB" || setup_failed "could not extract ${fn} from the shipped script"
 done
 # Guards on the extract, not on the product: if these functions ever stop
@@ -188,6 +188,53 @@ start=$(date +%s)
 check "a command that overruns is killed and reports 124"  "124" "$(rb 1 sleep 30)"
 elapsed=$(( $(date +%s) - start ))
 check "…promptly, rather than waiting the full 30s"        "1"   "$([ "$elapsed" -lt 8 ] && echo 1 || echo 0)"
+
+echo "…and the BACKEND is what dies, not just the wrapper around it"
+# ── THE TEST THAT WAS HIDING THE BUG ────────────────────────────────────────
+#
+# The first version of this stubbed `send_text_tmux() { exec sleep 30; }`.
+# `exec` replaces the subshell with sleep, so `$!` WAS the sleep and killing it
+# worked — proving a topology production never has. Every real backend is a
+# shell FUNCTION, so backgrounding it makes `$!` a subshell and the actual
+# tmux/osascript is its CHILD; killing `$!` alone left the backend running while
+# the code printed "killed it". (Codex, PR #19 review, which reproduced it.)
+#
+# So this uses the REAL send_text_tmux with a fake `tmux` that records its own
+# pid and then sleeps — the production shape — and asserts that pid is gone.
+bk() { # <seconds-limit> -> "<verdict> <backend-alive>"
+  local bin="$FIX/bk"; rm -rf "$bin"; mkdir -p "$bin"
+  # A fake tmux: has-session succeeds, send-keys records its pid and hangs.
+  cat > "$bin/tmux" <<'TMUXEOF'
+#!/bin/sh
+case "$1" in
+  has-session) exit 0 ;;
+  send-keys)   echo $$ > "$BK_PIDFILE"; exec sleep 60 ;;
+esac
+exit 1
+TMUXEOF
+  chmod +x "$bin/tmux"
+  : > "$FIX/bk.pid"
+  (
+    . "$LIB"
+    PATH="$bin:$PATH"
+    BK_PIDFILE="$FIX/bk.pid"; export BK_PIDFILE
+    CL_HANDOFF_SEND_TIMEOUT="$1"
+    # THE REAL send_text_tmux, extracted, not a stub of it.
+    handoff_send_once "Wedged" "sid" "tname" "PROMPT" >/dev/null 2>&1 && echo -n sent || echo -n unreachable
+  )
+  printf ' '
+  local bp; bp="$(cat "$FIX/bk.pid" 2>/dev/null)"
+  if [ -n "$bp" ] && kill -0 "$bp" 2>/dev/null; then
+    printf 'ALIVE'; kill -9 "$bp" 2>/dev/null
+  else
+    printf 'gone'
+  fi
+}
+# Guard: the fake backend must actually have run, or "gone" is vacuous.
+out="$(bk 1)"
+check "the backend ran and was then killed with its wrapper" "unreachable gone" "$out"
+check "…and its pid was really recorded (not a vacuous pass)" "1" \
+  "$([ -s "$FIX/bk.pid" ] && echo 1 || echo 0)"
 
 echo "…and handoff_send_once reports the route that wedged, instead of hanging"
 hang() { # <seconds-limit>
