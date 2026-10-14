@@ -197,12 +197,26 @@ CL_HANDOFF_TIMEOUT="${CL_HANDOFF_TIMEOUT:-180}"
 # another chance, but one that is merely still WORKING is never re-asked — see
 # handoff_target_busy.
 CL_HANDOFF_ATTEMPTS="${CL_HANDOFF_ATTEMPTS:-3}"
-# WALL CLOCK for the whole handoff phase — the ceiling on how long `cl stop` may
-# sit there, across every round. It is no longer a pool divided between
-# sessions: since the asks are concurrent, the number that matters is how long
-# the operator waits, not how thin each slice is. Once it is spent, sessions
-# that have not answered are stopped as-is and told so.
+# WALL CLOCK FOR THE WAITING, across every round — not for the whole phase.
+#
+# The distinction is deliberate and was corrected after review (Codex, PR #19,
+# 2026-10-13): dispatch is NOT charged against this. Twelve real iTerm sends
+# measure about 10s, so a 3s budget can still take ~13s end to end.
+#
+# Dispatch is outside the bound ON PURPOSE. Asking every session is the entire
+# point of the broadcast; cutting dispatch short when a budget expires would
+# reintroduce exactly the fault this replaced — sessions that are never asked at
+# all. What a runaway dispatch must not do is hang the stop, and that is
+# CL_HANDOFF_SEND_TIMEOUT's job rather than this one's.
+#
+# So the worst case is roughly (sessions × SEND_TIMEOUT) + BUDGET, and both
+# halves are bounded.
 CL_HANDOFF_BUDGET="${CL_HANDOFF_BUDGET:-300}"
+# How long any ONE send may take before it is killed. Bounds the dispatch pass:
+# osascript waits on iTerm which waits on a GUI, tmux waits on its server, cmux
+# on its daemon — each can wedge, and an unbounded send is a `cl stop` that
+# never returns. Generous, because a busy GUI is slow but not stuck.
+CL_HANDOFF_SEND_TIMEOUT="${CL_HANDOFF_SEND_TIMEOUT:-20}"
 # Record of session names started fresh, with the OLD session id, so a fresh
 # start is never a dead end — the prior conversation stays resumable even
 # though its name now points at the new session.
@@ -3106,6 +3120,39 @@ send_text_cmux() {
     && cmux send-key --surface "$1" -- enter >/dev/null 2>&1
 }
 
+# run_bounded <seconds> <command...>: run it, kill it if it outlives the limit.
+# 124 on timeout, otherwise the command's own status.
+#
+# macOS ships no coreutils `timeout`, and this cannot be left unbounded: every
+# backend here talks to something that can wedge. `osascript` waits on iTerm,
+# which waits on a GUI; `tmux send-keys` waits on a server; `cmux send` waits on
+# a daemon. Codex's PR #19 review put it exactly right — one blocked backend
+# could hold `cl stop` indefinitely, before any budget accounting began.
+#
+# `wait` on a killed child reports the signal, so the timeout status is returned
+# explicitly rather than inferred from it.
+#
+# LIMIT: it kills the direct child, not a process group — bash cannot make one
+# without setsid. That is sufficient for the backends here, which ARE the
+# process being killed (osascript, tmux, cmux), but a backend that forked and
+# exited would leave the grandchild running. If such a child inherits a pipe the
+# caller is capturing, the capture blocks until it exits, which is how a test
+# whose stub spawned `sleep` took 8s to observe a 1s timeout.
+run_bounded() {
+  local limit="$1"; shift
+  local ticks=$(( limit * 10 )) i=0 pid rc
+  "$@" & pid=$!
+  while [ "$i" -lt "$ticks" ]; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      wait "$pid"; return $?
+    fi
+    sleep 0.1; i=$((i+1))
+  done
+  kill -9 "$pid" 2>/dev/null
+  wait "$pid" 2>/dev/null
+  return 124
+}
+
 # handoff_send_once <name> <sid> <tmux_name> <prompt>: type the ask into the
 # session, by whichever route reaches it. 0 if it went somewhere, 1 if there was
 # no route at all.
@@ -3122,16 +3169,26 @@ send_text_cmux() {
 # iTerm tab, and typing a handoff request into some other window is worse than
 # reporting it unreachable.
 handoff_send_once() {
-  local name="$1" sid="$2" t="$3" prompt="$4" store sfc
+  local name="$1" sid="$2" t="$3" prompt="$4" store sfc rc
+  # EVERY route is bounded. A send that hangs is not a slow send, it is a stop
+  # that never finishes, and the operator cannot tell the two apart from a dark
+  # terminal. The timeout is reported per route so a wedged backend names itself.
   if [ -n "$t" ] && tmux has-session -t "=${t}" 2>/dev/null; then
-    send_text_tmux "$t" "$prompt" && return 0
-  elif send_text_iterm "$t" "$prompt"; then
-    return 0
+    run_bounded "${CL_HANDOFF_SEND_TIMEOUT:-20}" send_text_tmux "$t" "$prompt"; rc=$?
+    [ "$rc" = "124" ] && printf '⚠ the tmux send for "%s" was still running after %ss — killed it\n' "$name" "${CL_HANDOFF_SEND_TIMEOUT:-20}" >&2
+    [ "$rc" = "0" ] && return 0
   else
+    run_bounded "${CL_HANDOFF_SEND_TIMEOUT:-20}" send_text_iterm "$t" "$prompt"; rc=$?
+    [ "$rc" = "124" ] && printf '⚠ the iTerm send for "%s" was still running after %ss — killed it\n' "$name" "${CL_HANDOFF_SEND_TIMEOUT:-20}" >&2
+    [ "$rc" = "0" ] && return 0
     store="$HOME/.cmuxterm/claude-hook-sessions.json"
     if command -v jq >/dev/null 2>&1 && [ -r "$store" ]; then
       sfc=$(jq -r --arg sid "$sid" '.sessions[$sid].surfaceId // empty' "$store" 2>/dev/null)
-      [ -n "$sfc" ] && send_text_cmux "$sfc" "$prompt" && return 0
+      if [ -n "$sfc" ]; then
+        run_bounded "${CL_HANDOFF_SEND_TIMEOUT:-20}" send_text_cmux "$sfc" "$prompt"; rc=$?
+        [ "$rc" = "124" ] && printf '⚠ the cmux send for "%s" was still running after %ss — killed it\n' "$name" "${CL_HANDOFF_SEND_TIMEOUT:-20}" >&2
+        [ "$rc" = "0" ] && return 0
+      fi
     fi
   fi
   return 1
@@ -3526,7 +3583,11 @@ do_stop() {
   # indexed arrays rather than one associative array because macOS ships bash
   # 3.2, which has no `declare -A`.
   local -a _h_name _h_sid _h_cwd _h_tmux _h_agent _h_rot _h_state _h_path _h_nonce
-  local _n=0 i _ask_total=0 sid cwd epoch agent
+  # SEPARATE COUNTERS, because one number cannot answer three questions and the
+  # transcript was mixing them (Codex, PR #19): _eligible is every rotation-on
+  # session, _manual those already answered by hand, _to_ask what will actually
+  # be dispatched, _sent what was, and _done what landed during THIS run.
+  local _n=0 i _eligible=0 _manual=0 _to_ask=0 _sent=0 sid cwd epoch agent
   while IFS=$'\t' read -r name sid cwd epoch agent; do
     case "$agent" in claude|codex) ;; *) continue ;; esac
     # Resolve the policy for THIS session. A flag on the command outranks
@@ -3550,23 +3611,52 @@ do_stop() {
       if [ -z "$log_mode" ]; then log_mode="$_STOP_ROTATE"
       elif [ "$log_mode" != "$_STOP_ROTATE" ]; then log_mode="mixed"; fi
     fi
-    [ "$_STOP_ROTATE" = "on" ] && _ask_total=$((_ask_total+1))
+    if [ "$_STOP_ROTATE" = "on" ]; then
+      _eligible=$(( _eligible + 1 ))
+      # A HAND-WRITTEN HANDOFF IS ALREADY AN ANSWER, and it is discovered HERE
+      # rather than mid-dispatch so the count announced below is true. It is how
+      # you satisfy this when the pane cannot be reached at all (`cl handoff`,
+      # run inside the session). Its AGE is printed prominently, because the one
+      # real hazard is acting on something written weeks ago and forgotten.
+      if [ -z "$dry_run" ] && [ -n "$_CL_STOP_ROOT" ]; then
+        _h_path[$_n]="$(handoff_path "$_CL_STOP_ROOT" "$name")"
+        if handoff_is_manual "${_h_path[$_n]}"; then
+          printf '✓ using the handoff you wrote by hand for "%s" — written %s ago (%s)\n' \
+            "$name" "$(handoff_age_human "${_h_path[$_n]}")" "${_h_path[$_n]}" >&2
+          _h_state[$_n]="manual"; _manual=$(( _manual + 1 ))
+        fi
+      fi
+    fi
     _n=$((_n+1))
   done <<< "$_rows"
+  _to_ask=$(( _eligible - _manual ))
 
   # ── PASS 2: BROADCAST ───────────────────────────────────────────────────────
-  local _pending=0 _done=0 nonce prompt
-  if [ "$_ask_total" -gt 0 ]; then
+  local _pending=0 _done=0 nonce prompt _announce=0
+  # Explicit rather than `a || b && c`: bash gives || and && equal precedence and
+  # parses left to right, so that form means (a || b) && c — which happened to
+  # be right here and would stop being right the moment anyone added a clause.
+  _announce=0
+  if [ -n "$dry_run" ]; then
+    [ "$_eligible" -gt 0 ] && _announce=1
+  else
+    [ "$_to_ask" -gt 0 ] && _announce=1
+  fi
+  if [ "$_announce" = "1" ]; then
     # SAID UP FRONT, which is the whole point. The number that matters now is
     # how long the stop may take, not how thin each session's slice is.
     # Deliberately NOT the words "waiting up to": that phrase belongs to the
     # round line below and nowhere else, so "how many waits did this stop do?"
     # stays answerable from the transcript — by a reader and by the tests.
     printf '⏳ asking %s session(s) for a handoff, all at once — then ONE shared window of up to %ss\n' \
-      "$_ask_total" "$CL_HANDOFF_TIMEOUT" >&2
+      "$( [ -n "$dry_run" ] && echo "$_eligible" || echo "$_to_ask" )" "$CL_HANDOFF_TIMEOUT" >&2
+    # Counted but NOT asked, said separately rather than folded into the number
+    # above — "asking 12" when three were already answered by hand is a
+    # transcript that misleads the next reader.
+    [ "$_manual" -gt 0 ] && printf '   (%s more already answered by hand, not asked)\n' "$_manual" >&2
     if [ -z "$dry_run" ] && [ -z "$_CL_STOP_ROOT" ]; then
       printf 'ℹ no durable location available to hand off (handoff dir and fallback both unusable) — plain stop for all %s\n' \
-        "$_ask_total" >&2
+        "$_eligible" >&2
     fi
   fi
   for (( i=0; i<_n; i++ )); do
@@ -3582,17 +3672,8 @@ do_stop() {
       continue
     fi
     if [ -z "$_CL_STOP_ROOT" ]; then _h_state[$i]="unreachable"; continue; fi
-    _h_path[$i]="$(handoff_path "$_CL_STOP_ROOT" "${_h_name[$i]}")"
-    # A hand-written handoff is an ANSWER, not a leftover: it is how you satisfy
-    # this requirement when the pane cannot be reached at all (`cl handoff`, run
-    # inside the session). Honour it instead of asking. Its AGE is printed
-    # prominently, because the one real hazard here is acting on something
-    # written weeks ago and forgotten.
-    if handoff_is_manual "${_h_path[$i]}"; then
-      printf '✓ using the handoff you wrote by hand for "%s" — written %s ago (%s)\n' \
-        "${_h_name[$i]}" "$(handoff_age_human "${_h_path[$i]}")" "${_h_path[$i]}" >&2
-      _h_state[$i]="done"; _done=$((_done+1)); continue
-    fi
+    # Already answered by hand — found and reported during planning.
+    [ "${_h_state[$i]}" = "manual" ] && continue
     # A prior handoff still sitting here is LEFT ALONE while we ask for a new
     # one. Sweeping it first destroyed a valid answer to buy nothing: the wait
     # below cannot be fooled by it, because it matches THIS attempt's nonce in
@@ -3602,7 +3683,7 @@ do_stop() {
     nonce="$(handoff_nonce)"
     prompt="$(build_handoff_prompt "$_CL_STOP_ROOT" "${_h_name[$i]}" "$nonce")"
     if handoff_send_once "${_h_name[$i]}" "${_h_sid[$i]}" "${_h_tmux[$i]}" "$prompt"; then
-      _h_nonce[$i]="$nonce"; _h_state[$i]="pending"; _pending=$((_pending+1))
+      _h_nonce[$i]="$nonce"; _h_state[$i]="pending"; _pending=$((_pending+1)); _sent=$((_sent+1))
       printf '  → asked "%s" for %s\n' "${_h_name[$i]}" "${_h_path[$i]}" >&2
     else
       # Unreachable is not a timing problem, so retrying cannot fix it — report
@@ -3640,7 +3721,7 @@ do_stop() {
         if [ -e "${_h_path[$i]}" ] && [ "$(handoff_marker "${_h_path[$i]}" 2>/dev/null)" = "${_h_nonce[$i]}" ]; then
           _h_state[$i]="done"; _done=$((_done+1)); _pending=$((_pending-1))
           printf '✓ handoff written for "%s" (%s of %s, %ss in)\n' \
-            "${_h_name[$i]}" "$_done" "$_ask_total" "$elapsed" >&2
+            "${_h_name[$i]}" "$_done" "$_sent" "$elapsed" >&2
         fi
       done
       # Progress, so a multi-minute wait is legible rather than a dead prompt.
@@ -3697,12 +3778,21 @@ do_stop() {
       _pending=$((_pending-1))
     fi
   done
-  if [ "$_ask_total" -gt 0 ] && [ -z "$dry_run" ]; then
-    printf '\n%s of %s handoff(s) landed.\n' "$_done" "$_ask_total" >&2
+  # The denominator is what was ASKED, not what was eligible: mixing in manual
+  # answers and unreachable panes made "N of N landed" unreadable.
+  if [ "$_eligible" -gt 0 ] && [ -z "$dry_run" ]; then
+    printf '\n%s of %s asked handoff(s) landed' "$_done" "$_sent" >&2
+    [ "$_manual" -gt 0 ] && printf '; %s already answered by hand' "$_manual" >&2
+    _unreach_n=0
+    for (( i=0; i<_n; i++ )); do
+      [ "${_h_state[$i]}" = "unreachable" ] && _unreach_n=$(( _unreach_n + 1 ))
+    done
+    [ "$_unreach_n" -gt 0 ] && printf '; %s unreachable' "$_unreach_n" >&2
+    printf '.\n' >&2
   fi
 
   # ── PASS 4: CONFIRM, THEN CLOSE ─────────────────────────────────────────────
-  local sid_i
+  local sid_i _unreach_n
   for (( i=0; i<_n; i++ )); do
     name="${_h_name[$i]}"; sid_i="${_h_sid[$i]}"; t="${_h_tmux[$i]}"
     agent="${_h_agent[$i]}"; sess_rotate="${_h_rot[$i]}"
@@ -3740,7 +3830,7 @@ do_stop() {
       # would refuse hardest on the wedged session you most need gone.
       # `--require-handoff` opts into the strict behaviour.
       case "${_h_state[$i]}" in
-        done)        hrc=0 ;;
+        done|manual) hrc=0 ;;
         unreachable) hrc=1 ;;
         *)           hrc=2 ;;
       esac

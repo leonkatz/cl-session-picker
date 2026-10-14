@@ -18,6 +18,15 @@ the whole phase instead of a pool divided between sessions.
 `cl start --fresh`; both it and the broadcast now send through one
 `handoff_send_once`.
 
+**Amended 2026-10-13 after review:** `CL_HANDOFF_BUDGET` bounds the **waiting**,
+not the whole phase. Dispatch is outside it deliberately — cutting the asking
+short when a budget expires would reintroduce the very fault this replaced — so
+the hazard it leaves (an unbounded backend hanging a stop) is closed by
+`CL_HANDOFF_SEND_TIMEOUT` bounding each send instead. Codex's review was right
+that the original wording promised a whole-phase ceiling the code did not
+deliver; the fix was to pick the honest contract and bound the other half
+separately, not to make dispatch obey the budget.
+
 **Forecloses:** any per-session rationing of the handoff budget, and any
 ordering-dependent fairness question — there is no divisor left.
 

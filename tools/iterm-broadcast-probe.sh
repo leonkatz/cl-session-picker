@@ -78,7 +78,13 @@ osascript -e 'tell application "System Events" to (name of processes) contains "
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/clprobe.XXXXXX")"
 PREFIX="clprobe-$$"
 
+_CLEANED=0
 cleanup() {
+  # Once only. Belt and braces beside the trap change above: a second pass would
+  # re-scan iTerm and re-report, and "cleaned up 0 probe tab(s)" after a real
+  # cleanup reads like a failure.
+  [ "$_CLEANED" = "1" ] && return 0
+  _CLEANED=1
   # By TAG PREFIX, never by window or position: iTerm's "current window" moves,
   # and closing the wrong session here would kill one of the user's sessions.
   #
@@ -145,7 +151,20 @@ OSA
   fi
   rm -rf "$WORK"
 }
-trap cleanup EXIT INT TERM
+# ── WHY INT AND TERM DO NOT SHARE THE EXIT TRAP ─────────────────────────────
+#
+# This was `trap cleanup EXIT INT TERM`. A trap handler that RETURNS does not
+# terminate the script: bash resumes where it was interrupted. So Ctrl-C ran
+# cleanup — closing the tabs and deleting $WORK — and then carried on polling
+# for capture files that no longer existed, attempting sends into tabs that were
+# gone, and finally ran cleanup a second time at exit.
+#
+# Especially wrong for a GUI probe, where Ctrl-C is exactly what an operator
+# reaches for when the tabs look wrong. The signal handlers now EXIT, which runs
+# the EXIT trap once, through the single cleanup path. (Codex, PR #19 review.)
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # ── the REAL send, lifted verbatim ──────────────────────────────────────────
 # Extracted rather than reimplemented: a probe that proves a copy of the send

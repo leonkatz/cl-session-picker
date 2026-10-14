@@ -247,8 +247,33 @@ Asking is retried in **rounds** (`CL_HANDOFF_ATTEMPTS`, default 3): a round
 re-asks every session that has not answered and is not visibly busy, with a
 fresh nonce, then waits another window. A session that is merely still working
 is never re-asked — re-typing stacks a second copy in the same input box and
-changes nothing about when the handoff lands. `CL_HANDOFF_BUDGET` (300s)
-bounds the whole phase in wall clock across every round.
+changes nothing about when the handoff lands.
+
+### What the budget bounds, exactly
+
+`CL_HANDOFF_BUDGET` (300s) is wall clock for the **waiting**, across every
+round. It deliberately does **not** cover dispatch, and the distinction was
+corrected after review: twelve real iTerm sends measure about 10 seconds, so a
+3-second budget can still take ~13 seconds end to end.
+
+Dispatch sits outside the bound on purpose. Asking every session is the entire
+point of the broadcast, so cutting dispatch short when a budget expires would
+reintroduce the fault this replaced — sessions never asked at all. What a
+runaway dispatch must not do is hang the stop, and that is a separate setting's
+job: `CL_HANDOFF_SEND_TIMEOUT` (default 20s) bounds **each individual send**,
+because every backend can wedge — `osascript` waits on iTerm which waits on a
+GUI, `tmux` on its server, `cmux` on its daemon — and macOS ships no
+coreutils `timeout`. A send that overruns is killed and the route that wedged
+names itself.
+
+So the worst case is roughly `(sessions × SEND_TIMEOUT) + BUDGET`, and both
+halves are bounded.
+
+The transcript counts three things separately, because one number cannot answer
+all of them: how many sessions were **eligible**, how many were actually
+**asked** (a hand-written handoff is already an answer, so it is honoured rather
+than asked for), and how many **landed** during this run. "N of N landed" used
+to mix them.
 
 Nothing is killed until the wait is over, so interrupting a slow stop loses no
 handoff still in flight. Under the serial shape, by the time the last session

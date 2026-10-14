@@ -70,8 +70,8 @@ extract_fns() {
 }
 
 LIB="$FIX/lib.sh"
-extract_fns "$CL" handoff_target_busy handoff_nonce handoff_send_once request_handoff > "$LIB"
-for fn in handoff_target_busy handoff_nonce handoff_send_once request_handoff; do
+extract_fns "$CL" handoff_target_busy handoff_nonce run_bounded handoff_send_once request_handoff > "$LIB"
+for fn in handoff_target_busy handoff_nonce run_bounded handoff_send_once request_handoff; do
   grep -q "^${fn}()" "$LIB" || setup_failed "could not extract ${fn} from the shipped script"
 done
 # Guards on the extract, not on the product: if these functions ever stop
@@ -118,6 +118,99 @@ check "…and only that route"  "tmux" "$(sort -u "$FIX/route.log" | tr -d '\n')
 not_contains "…and the prompt is NOT then typed into iTerm" "$(cat "$FIX/route.log")" "iterm"
 : > "$FIX/route.log"; check "no tmux session falls through to iTerm" "sent" "$(sd 1 1 0 '')"
 : > "$FIX/route.log"; check "…and with neither, it reports unreachable" "unreachable" "$(sd 1 1 1 '')"
+
+echo "the probe's signal handling terminates rather than resuming"
+# ── WHY A TRAP THAT RETURNS IS NOT A TRAP ───────────────────────────────────
+#
+# tools/iterm-broadcast-probe.sh had `trap cleanup EXIT INT TERM`. A handler
+# that RETURNS does not terminate the script: bash resumes where it was
+# interrupted. So Ctrl-C closed the probe's tabs and deleted its working
+# directory, then the probe carried on polling for capture files that no longer
+# existed and ran cleanup a second time at exit.
+#
+# Worst possible script for it: a GUI probe, where Ctrl-C is exactly what an
+# operator reaches for when the tabs look wrong. (Codex, PR #19 review.)
+PROBE="$HERE/../tools/iterm-broadcast-probe.sh"
+[ -r "$PROBE" ] || setup_failed "the probe is missing"
+# ANCHORED TO REAL TRAP LINES, not to any occurrence of the text: the probe's
+# own comment quotes the old form verbatim to explain what was wrong with it, so
+# a plain substring search finds the documentation and condemns the fix.
+check "no live trap shares one handler across EXIT INT TERM" "0" \
+  "$(grep -c '^trap cleanup EXIT INT TERM' "$PROBE")"
+check "…EXIT owns the cleanup"       "1" "$(grep -c '^trap cleanup EXIT$' "$PROBE")"
+check "…and INT exits through it"    "1" "$(grep -c "^trap 'exit 130' INT\$" "$PROBE")"
+check "…as does TERM"                "1" "$(grep -c "^trap 'exit 143' TERM\$" "$PROBE")"
+
+# And the BEHAVIOUR, on a reduced fixture carrying only that structure — no
+# iTerm tab is opened, so this runs anywhere.
+TRAPFIX="$FIX/traps.sh"
+cat > "$TRAPFIX" <<'TRAPEOF'
+#!/usr/bin/env bash
+set -u
+LOG="$1"
+_CLEANED=0
+cleanup() { [ "$_CLEANED" = "1" ] && return 0; _CLEANED=1; echo "cleanup" >> "$LOG"; }
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+i=0; while [ $i -lt 300 ]; do sleep 0.1; i=$((i+1)); done
+echo "RESUMED" >> "$LOG"
+TRAPEOF
+# The control: the OLD form, which must FAIL these same assertions. Without it
+# this section would pass against any script that happens to exit.
+sed "s/trap 'exit 130' INT/trap cleanup INT/; s/trap 'exit 143' TERM/trap cleanup TERM/" \
+  "$TRAPFIX" > "$FIX/traps-old.sh"
+run_trap() { # <script> <signal> -> "<status> <cleanups> <resumed>"
+  local lg="$FIX/trap.log"; : > "$lg"
+  bash "$1" "$lg" & local tp=$!
+  sleep 1; kill -"$2" "$tp" 2>/dev/null; wait "$tp" 2>/dev/null; local rc=$?
+  printf '%s %s %s' "$rc" "$(grep -c '^cleanup$' "$lg")" "$(grep -c RESUMED "$lg")"
+}
+# TERM rather than INT: bash sets SIGINT to IGNORED for a background job in a
+# non-interactive shell, so a harness cannot deliver it this way — measured, the
+# INT case reaches the end of the script untouched. TERM exercises the identical
+# code path, and the structural assertions above cover INT's spelling.
+check "TERM terminates with its own status, cleaning up once" "143 1 0" "$(run_trap "$TRAPFIX" TERM)"
+check "…where the old form resumed instead (status 0, work done after cleanup)" \
+  "0 1 1" "$(run_trap "$FIX/traps-old.sh" TERM)"
+
+echo "run_bounded puts a ceiling on a send that would otherwise hang a stop"
+# ── WHY EVERY SEND IS BOUNDED ───────────────────────────────────────────────
+#
+# Codex's PR #19 review: "an unbounded backend call can still hold the stop
+# before the budget starts." Every route here talks to something that can wedge
+# — osascript waits on iTerm which waits on a GUI, tmux on its server, cmux on
+# its daemon — and macOS ships no coreutils `timeout`.
+rb() { ( . "$LIB"; run_bounded "$@" >/dev/null 2>&1; echo $? ); }
+check "a command inside the limit returns its own status"  "0"   "$(rb 2 true)"
+check "…including a non-zero one"                          "3"   "$(rb 2 sh -c 'exit 3')"
+start=$(date +%s)
+check "a command that overruns is killed and reports 124"  "124" "$(rb 1 sleep 30)"
+elapsed=$(( $(date +%s) - start ))
+check "…promptly, rather than waiting the full 30s"        "1"   "$([ "$elapsed" -lt 8 ] && echo 1 || echo 0)"
+
+echo "…and handoff_send_once reports the route that wedged, instead of hanging"
+hang() { # <seconds-limit>
+  (
+    . "$LIB"
+    CL_HANDOFF_SEND_TIMEOUT="$1"
+    eval "tmux() { case \"\$1\" in has-session) return 0 ;; esac; return 1; }"
+    # `exec`, so the backgrounded process IS the sleep rather than a parent of
+    # it — which is how the real backends behave (osascript/tmux/cmux are the
+    # process run_bounded kills). A stub that forks leaves a grandchild holding
+    # the captured stdout pipe, and the capture then blocks for the full 30s
+    # even though the timeout fired correctly at 1s.
+    send_text_tmux() { exec sleep 30; }
+    handoff_send_once "Wedged" "sid" "tname" "PROMPT" && echo sent || echo unreachable
+  ) 2>&1
+}
+start=$(date +%s)
+out="$(hang 1)"
+elapsed=$(( $(date +%s) - start ))
+check "a hanging send does not hang the caller"  "1" "$([ "$elapsed" -lt 8 ] && echo 1 || echo 0)"
+contains "…it says which backend was killed"     "$out" "tmux send"
+contains "…and how long it waited"               "$out" "after 1s"
+contains "…reporting the session unreachable"    "$out" "unreachable"
 
 # ── request_handoff: still the SINGLE-session path (`cl start --fresh`) ──────
 # `cl stop` no longer uses it; it remains the right shape for one session, where
@@ -290,7 +383,7 @@ check "…and the LAST ask precedes the FIRST wait" "1" \
 echo "…they then write concurrently, and the window is shared"
 check "all three handoffs landed"  "3" "$(grep -c 'handoff written for' "$FIX/par.out")"
 contains "…counted off as they arrive"  "$par" "(3 of 3"
-contains "…and totalled at the end"     "$par" "3 of 3 handoff(s) landed."
+contains "…and totalled at the end"     "$par" "3 of 3 asked handoff(s) landed."
 # THE WHOLE POINT, IN SECONDS. Three agents each sleeping 1s land together in
 # about a second; serially this was three separate waits. The early exit makes
 # it faster still — the loop stops the moment nothing is pending.
@@ -331,7 +424,7 @@ check "…and the run really did wait (not a vacuous fast pass)" "1" \
   "$([ "$none_elapsed" -ge 3 ] && echo 1 || echo 0)"
 contains "each silent session is reported"     "$none" 'no handoff from "NoAnsA"'
 contains "…and stopped anyway, resuming as-is" "$none" "stopping it anyway"
-contains "…and the total says none landed"     "$none" "0 of 3 handoff(s) landed."
+contains "…and the total says none landed"     "$none" "0 of 3 asked handoff(s) landed."
 rtmux kill-server >/dev/null 2>&1
 
 echo "a file is not a handoff — only THIS request's terminal marker is"
@@ -376,7 +469,7 @@ contains "…nor is one carrying an earlier rotation's marker" "$badout" 'no han
 contains "…nor one that quotes this run's token mid-prose and stops" "$badout" 'no handoff from "QuotedD"'
 check "the quoted-token file really does contain the live nonce" "1" \
   "$(grep -c 'I will finish by writing' "$FIX/store-bad/QuotedD.md" 2>/dev/null | head -1)"
-check "…so nothing landed"  "1" "$(printf '%s' "$badout" | grep -c '0 of 4 handoff(s) landed.')"
+check "…so nothing landed"  "1" "$(printf '%s' "$badout" | grep -c '0 of 4 asked handoff(s) landed.')"
 not_contains "…and neither is announced as written" "$badout" "handoff written for"
 # The last known-good answer is left where it is: the agent's temp-then-rename
 # replaces it only on success, so a failed ask must not destroy it.
@@ -399,6 +492,47 @@ contains "a 3s budget clamps a 60s window" "$(cat "$FIX/bud.out")" "waiting up t
 check "…and the stop really is that quick" "1" \
   "$([ "$bud_elapsed" -lt 25 ] && echo 1 || echo 0)"
 contains "…then says the budget is spent" "$(cat "$FIX/bud.out")" "budget for this stop is spent"
+rtmux kill-server >/dev/null 2>&1
+
+echo "the budget bounds the WAITING, and never cuts the asking short"
+# ── THE CONTRACT, CHOSEN DELIBERATELY ───────────────────────────────────────
+#
+# Codex offered two: make CL_HANDOFF_BUDGET a true whole-phase bound (stop
+# dispatching once it expires), or call it a wait budget and say dispatch sits
+# outside it. The first would reintroduce the exact fault this PR replaced —
+# sessions that are never asked at all — so this is the second, and it is
+# asserted here so a future "optimisation" to cut dispatch short fails loudly.
+#
+# What must NOT be unbounded is any individual send, and that is
+# CL_HANDOFF_SEND_TIMEOUT's job, tested above.
+reset_sessions
+mk_agent AskAllA 202610121200 1 0
+mk_agent AskAllB 202610121100 1 0
+mk_agent AskAllC 202610121000 1 0
+out=$(env -i HOME="$HOME" PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
+  CL_HANDOFF_DIR="$FIX/store-askall" CL_HANDOFF_TIMEOUT=30 CL_HANDOFF_ATTEMPTS=1 \
+  CL_HANDOFF_BUDGET=1 bash "$CL" stop --keep-tabs 2>&1)
+check "a 1s budget still asks every session" "3" "$(printf '%s\n' "$out" | grep -c '→ asked')"
+contains "…and clamps the WAIT to what is left" "$out" "waiting up to 1s"
+rtmux kill-server >/dev/null 2>&1
+
+echo "the transcript counts what was ASKED, not what was eligible"
+# A hand-written handoff is an answer, so it is neither asked for nor counted in
+# the denominator. Folding it in made "N of N landed" unreadable (Codex P3).
+reset_sessions
+mk_agent CountA 202610121200 1 1
+mk_agent CountB 202610121100 1 0
+mkdir -p "$FIX/store-count"
+printf 'written by hand\n\n<!-- cl:manual:2026-10-12T00:00:00Z -->\n' > "$FIX/store-count/CountB.md"
+out=$(env -i HOME="$HOME" PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
+  CL_HANDOFF_DIR="$FIX/store-count" CL_HANDOFF_TIMEOUT=20 CL_HANDOFF_ATTEMPTS=1 \
+  bash "$CL" stop --keep-tabs 2>&1)
+contains "the manual one is honoured, not asked"      "$out" "wrote by hand for \"CountB\""
+check "…so only the other is asked"                   "1" "$(printf '%s\n' "$out" | grep -c '→ asked')"
+contains "…the announcement says 1, not 2"            "$out" "asking 1 session(s)"
+contains "…and names the one it did not ask"          "$out" "1 more already answered by hand"
+contains "…the tally denominator is what was asked"   "$out" "1 of 1 asked handoff(s) landed"
+contains "…crediting the hand-written one separately" "$out" "1 already answered by hand"
 rtmux kill-server >/dev/null 2>&1
 
 echo "a retired setting is reported, not silently ignored"
