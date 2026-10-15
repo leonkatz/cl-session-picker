@@ -658,7 +658,9 @@ keep_out=$(env -i HOME="$HOME" PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
   CL_HANDOFF_DIR="$FIX/keep-store" CL_HANDOFF_TIMEOUT=1 CL_HANDOFF_ATTEMPTS=2 \
   bash "$CL" stop --keep-tabs 2>&1)
 alive=0; rtmux has-session -t KeepAlive 2>/dev/null && alive=1
-contains "it is asked more than once"   "$keep_out" "attempt 2 of 2"
+# A second ROUND, not a second "attempt": the asks are concurrent now, so the
+# unit of retrying is a round over every session that has not answered.
+contains "it tries again rather than giving up after one round" "$keep_out" "round 2 of 2"
 check "…and then stopped regardless"    "0" "$alive"
 rtmux kill-session -t KeepAlive >/dev/null 2>&1 || true
 rm -f "$HOME/.claude/projects/p1/sid-keepalive.jsonl"

@@ -4,6 +4,65 @@ Form-factor choices that could have gone another way. Each entry records what
 was chosen, what it forecloses, and what would reverse it — so a later change
 is a deliberate reversal, not an accident.
 
+## 2026-10-12 — `cl stop` broadcasts the handoff ask, then waits once for all of them
+
+**Chose:** `cl stop` runs in four passes — plan every session's rotation policy,
+send every eligible session its ask, wait in **one shared window**
+(`CL_HANDOFF_TIMEOUT`, default raised 90s → 180s) polling all of them, then
+confirm which files landed and close. Retries are **rounds** over everyone still
+silent and not visibly busy. `CL_HANDOFF_BUDGET` (300s) becomes wall clock for
+the whole phase instead of a pool divided between sessions.
+`CL_HANDOFF_MIN_SHARE` and `handoff_session_cap` are **deleted**, and a set
+`CL_HANDOFF_MIN_SHARE` is reported rather than silently ignored.
+`request_handoff` keeps its serial shape and stays the single-session path for
+`cl start --fresh`; both it and the broadcast now send through one
+`handoff_send_once`.
+
+**Amended 2026-10-13 after review:** `CL_HANDOFF_BUDGET` bounds the **waiting**,
+not the whole phase. Dispatch is outside it deliberately — cutting the asking
+short when a budget expires would reintroduce the very fault this replaced — so
+the hazard it leaves (an unbounded backend hanging a stop) is closed by
+`CL_HANDOFF_SEND_TIMEOUT` bounding each send instead. Codex's review was right
+that the original wording promised a whole-phase ceiling the code did not
+deliver; the fix was to pick the honest contract and bound the other half
+separately, not to make dispatch obey the budget.
+
+**Forecloses:** any per-session rationing of the handoff budget, and any
+ordering-dependent fairness question — there is no divisor left.
+
+**Reverses by:** evidence that concurrent asks harm the agents being asked (a
+rate limit, or sessions interfering through a shared resource), which would
+argue for waves of N rather than a return to one-at-a-time.
+
+**Why:** the serial loop cost `sessions × share` in wall clock while giving each
+session `budget / sessions`. Both numbers move the wrong way as sessions
+accumulate, so on two separate nineteen-session stops (2026-10-07 and
+2026-10-12) the budget was exhausted after six sessions and **thirteen were
+never asked at all**. The fair-share machinery added after the first incident
+was rationing a resource that did not need rationing: sending is cheap and
+writing is concurrent. Raising the budget was not a fix — 19 × 90s is
+twenty-eight minutes of a human watching a terminal.
+
+It also fixes the busy case properly rather than mitigating it. A busy claude
+queues typed input, so an ask sent to a working session is waiting its turn;
+serially that session spent its share finishing something else and was killed
+unhandoffed, while now the queued ask has the whole window to come due.
+
+**Note:** nothing is killed until the wait is over, so a Ctrl-C during a slow
+stop loses no handoff still in flight. Under the serial shape every session
+asked before the interrupt was already dead.
+
+**Found by the revert matrix, not by review:** with the broadcast in place and
+53 assertions green, replacing the entire completion check with
+`[ -e "$path" ]` broke **nothing** — and so did accepting the nonce anywhere in
+the file rather than as its terminal line. The stop path had never been tested
+against a file that exists but is not a finished handoff, because every fixture
+either answered correctly or not at all. The suite now drives a **simulated
+agent**: a pane that reads the prompt off its own stdin, extracts the path and
+nonce from that text, and writes the file temp-then-rename — in four modes
+(correct, silent, truncated, truncated-after-quoting-the-token). It is the first
+fixture in this project to watch a handoff actually land.
+
 ## 2026-10-01 — rotation can be switched off, and the tool records which way it ran
 
 **Chose:** a global default plus optional per-session overrides
@@ -866,6 +925,10 @@ unstamped marker as foreign.
 **Chose:** `cl stop` asks for a handoff within a stop-wide budget
 (`CL_HANDOFF_BUDGET`, default 300s total, not per session), reports failure
 prominently, and then stops the session regardless — `cl start` resumes it.
+
+> Superseded in part by **2026-10-12**: the budget is still stop-wide, but it is
+> now wall clock for one shared wait rather than a pool divided between
+> sessions. Everything below still holds.
 `--require-handoff` (alias `--rotate`) opts into failing closed and exits
 non-zero if anything is left running. `--no-handoff` now also *clears* any
 pending handoff, so its promise of "resume it as-is" is actually true.

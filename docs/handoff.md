@@ -213,11 +213,74 @@ an mtime without this request's handoff having landed at all. The instruction
 asks for a token to be written verbatim into the file; `cl` waits for that
 exact token.
 
-The request is made up to `CL_HANDOFF_ATTEMPTS` times (default 3) with a fresh
-nonce each round, because a session mid-task may not read the first one. All of
-this shares **one budget for the whole stop** — `CL_HANDOFF_BUDGET`, 300
-seconds by default, not per session. Attempts × timeout × sessions is how a
-handoff feature turns an eight-session `cl stop` into a half-hour one.
+### Every session is asked before any is waited for
+
+`cl stop` broadcasts. It resolves each session's rotation policy, sends every
+eligible session its ask, and only then waits — one shared window
+(`CL_HANDOFF_TIMEOUT`, default 180s) covering all of them at once, polled until
+each handoff lands or the window closes.
+
+This replaced a serial loop that asked one session, waited for it, killed it,
+and moved on. Waiting is the expensive part, so that shape cost
+`sessions × share` in wall clock while giving each session `budget / sessions`:
+
+| sessions | serial, 300s budget | broadcast, 180s window |
+|---|---|---|
+| 1 | 1 × 90s window | 180s |
+| 8 | 45s each, 6 asked, 2 never | 180s each, all asked |
+| 19 | 45s each, 6 asked, **13 never** | 180s each, all asked |
+
+Both of the serial numbers move the wrong way as sessions accumulate, which is
+why the fair-share machinery it needed (a per-session cap, a minimum share, a
+warning that the budget would not cover the working set) is gone rather than
+ported: with concurrent asks there is no divisor left to be unfair. Raising the
+budget was never a fix either — 19 × 90s is twenty-eight minutes of watching a
+terminal.
+
+The broadcast also fixes the busy case properly. A busy claude **queues** typed
+input and runs it when it finishes, so an ask sent to a working session is not
+lost — it is waiting its turn. Serially that session burned its 45s share
+finishing something else and was killed unhandoffed; now the queued ask has the
+whole window to come due.
+
+Asking is retried in **rounds** (`CL_HANDOFF_ATTEMPTS`, default 3): a round
+re-asks every session that has not answered and is not visibly busy, with a
+fresh nonce, then waits another window. A session that is merely still working
+is never re-asked — re-typing stacks a second copy in the same input box and
+changes nothing about when the handoff lands.
+
+### What the budget bounds, exactly
+
+`CL_HANDOFF_BUDGET` (300s) is wall clock for the **waiting**, across every
+round. It deliberately does **not** cover dispatch, and the distinction was
+corrected after review: twelve real iTerm sends measure about 10 seconds, so a
+3-second budget can still take ~13 seconds end to end.
+
+Dispatch sits outside the bound on purpose. Asking every session is the entire
+point of the broadcast, so cutting dispatch short when a budget expires would
+reintroduce the fault this replaced — sessions never asked at all. What a
+runaway dispatch must not do is hang the stop, and that is a separate setting's
+job: `CL_HANDOFF_SEND_TIMEOUT` (default 20s) bounds **each individual send**,
+because every backend can wedge — `osascript` waits on iTerm which waits on a
+GUI, `tmux` on its server, `cmux` on its daemon — and macOS ships no
+coreutils `timeout`. A send that overruns is killed and the route that wedged
+names itself.
+
+So the worst case is roughly `(sessions × SEND_TIMEOUT) + BUDGET`, and both
+halves are bounded.
+
+The transcript counts three things separately, because one number cannot answer
+all of them: how many sessions were **eligible**, how many were actually
+**asked** (a hand-written handoff is already an answer, so it is honoured rather
+than asked for), and how many **landed** during this run. "N of N landed" used
+to mix them.
+
+Nothing is killed until the wait is over, so interrupting a slow stop loses no
+handoff still in flight. Under the serial shape, by the time the last session
+was asked every earlier one was already dead.
+
+`CL_HANDOFF_MIN_SHARE` is retired. If it is set, `cl stop` says so rather than
+ignoring it silently.
 
 **A session whose handoff never lands is still stopped.** It comes back by
 resuming rather than rotating, and `cl stop` says so plainly. Rotation is the

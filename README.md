@@ -282,9 +282,15 @@ it launched with; only a fresh launch upgrades).
   back by resuming rather than rotating, and says so loudly. Pass
   `--require-handoff` (alias `--rotate`) to fail closed instead; that exits
   non-zero if any session is left running. `--no-handoff` also clears any
-  pending handoff, so the session really does come back as-is. The whole stop
-  shares one handoff budget (`CL_HANDOFF_BUDGET`, default 300s total — not per
-  session). It then writes the live sessions to
+  pending handoff, so the session really does come back as-is. **Every session
+  is asked at once**, then one shared window waits for all of them
+  (`CL_HANDOFF_TIMEOUT`, default 180s). `CL_HANDOFF_BUDGET` (default 300s)
+  bounds the **waiting** across every round — not the asking, which is never cut
+  short because asking everyone is the point; each individual send is bounded
+  separately by `CL_HANDOFF_SEND_TIMEOUT` (default 20s) so one wedged terminal
+  cannot hang a stop. The cost of a stop is one window rather than one per
+  session, and nineteen sessions each get the full 180s instead of a nineteenth
+  of the budget. It then writes the live sessions to
   `~/.config/claude-session/state.json` (one record per session: name, session
   id, cwd, agent), and kills them. Before killing a session that still looks
   **mid-task** after the handoff wait, it asks `Kill it anyway? [y/N]`; answer
