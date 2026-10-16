@@ -33,6 +33,12 @@ cleanup() {
 trap cleanup EXIT
 pass=0; fail=0
 check() { if [ "$2" = "$3" ]; then pass=$((pass+1)); printf '  ok   %s\n' "$1"; else fail=$((fail+1)); printf '  FAIL %s\n       expected [%s] got [%s]\n' "$1" "$2" "$3"; fi; }
+# Substring assertions, same definition as the sibling suites. Defined rather
+# than assumed: a missing helper does not fail, it prints "command not found"
+# to stderr and the assertion silently no-ops — which has bitten this project
+# three times.
+contains()     { case "$2" in *"$3"*) pass=$((pass+1)); printf '  ok   %s\n' "$1" ;; *) fail=$((fail+1)); printf '  FAIL %s\n       wanted [%s] in: %s\n' "$1" "$3" "$2" ;; esac; }
+not_contains() { case "$2" in *"$3"*) fail=$((fail+1)); printf '  FAIL %s\n       did NOT want [%s] in: %s\n' "$1" "$3" "$2" ;; *) pass=$((pass+1)); printf '  ok   %s\n' "$1" ;; esac; }
 setup_failed() { printf 'FIXTURE SETUP FAILED: %s\n' "$1" >&2; exit 2; }
 command -v jq >/dev/null 2>&1 || setup_failed "jq is required by the code under test"
 
@@ -538,6 +544,87 @@ if [ -z "${CL_SELFCHECK:-}" ]; then
     pass=$((pass+1)); printf '  ok   %s\n' "this suite emits no shell errors"
   fi
 fi
+
+echo "cl start re-arms the coordination lanes, and never fails over it"
+# ── WHY A START HAS TO DO THIS ──────────────────────────────────────────────
+#
+# A coordination watcher is elected by an agent's SessionStart hook, and
+# SessionStart fires on a TURN, not on TUI resume. So `cl start` brought the
+# session back and the watcher stayed dead until somebody typed into it. On
+# 2026-10-07 that cost two days: eighteen review requests queued behind a lane
+# reporting a current heartbeat and the right directory. The next instance would
+# be a week away from the machine.
+#
+# Six behaviours, each driven separately, because the ones that must stay SILENT
+# matter as much as the one that speaks.
+RA="$FIX/rearm-stub.sh"
+ra_fixture() { # <exit-code> <stdout...>
+  printf '#!/bin/sh\n' > "$RA"
+  shift_rc="$1"; shift
+  printf 'cat <<EOF\n%s\nEOF\nexit %s\n' "$*" "$shift_rc" >> "$RA"
+  chmod +x "$RA"
+}
+run_start() { CL_COORD_REARM="$RA" CL_COORD_REARM_TIMEOUT="${2:-20}" \
+  bash "$CL" start 2>&1; }
+
+# A saved state with ONE row, so `cl start` reaches an exit path. An empty
+# state makes it exit early with "saved state is empty" before the re-arm runs
+# at all — which is how the first two assertions here passed vacuously on the
+# first attempt. The row's session is not live and this shell is not iTerm, so
+# start prints the command to run by hand and then re-arms, which is the path
+# under test.
+mkdir -p "$(dirname "$STATE")" 2>/dev/null || true
+printf '[{"name":"RearmProbe","sid":"%s","cwd":"%s","agent":"claude"}]\n' \
+  "11111111-2222-3333-4444-555555555555" "$FIX" > "$STATE"
+# Guard: if start ever stops reaching the re-arm, every assertion below would
+# pass by describing an early exit instead.
+_reach="$(CL_COORD_REARM="$FIX/nope.sh" bash "$CL" start 2>&1)"
+case "$_reach" in
+  *"saved state is empty"*) setup_failed "cl start exits before the re-arm — the fixture state is not usable" ;;
+esac
+
+printf '  …an absent helper is silent, because cl ships without the watcher\n'
+rm -f "$RA"
+out="$(CL_COORD_REARM="$FIX/not-installed.sh" bash "$CL" start 2>&1 || true)"
+not_contains "no mention of re-arming when the helper is not installed" "$out" "re-arm"
+
+printf '  …a machine that declares no lanes is silent too\n'
+# A warning that fires for everyone is a warning nobody reads.
+ra_fixture 1 "coord-rearm: no lanes declared on this machine."
+out="$(run_start || true)"
+not_contains "no lanes declared says nothing"      "$out" "reported a problem"
+not_contains "…and does not mention re-arming"     "$out" "re-armed"
+
+printf '  …a successful re-arm reports only the verified lines\n'
+ra_fixture 0 "  /some/lane
+    thread abc (codex_review)
+    [coordination-watcher] plumbing identifiers that are NOT this session
+    verified: watcher pid 4242 is live, acknowledged, and beating"
+out="$(run_start || true)"
+contains "it says the lanes were re-armed"   "$out" "coordination lanes re-armed"
+contains "…and shows what was verified"      "$out" "pid 4242 is live"
+not_contains "…without echoing the plumbing identifiers it warns about" \
+  "$out" "plumbing identifiers"
+
+printf '  …a failed re-arm is reported, and the start still succeeds\n'
+# THE CONTRACT. `cl start` is how you get your work back; refusing because a
+# background helper did not arm is worse than saying so and carrying on.
+ra_fixture 1 "  /some/lane
+    NOT ARMED — the recorded watcher pid 999 is not running"
+rc=0; out="$(run_start)" || rc=$?
+contains "the problem is surfaced"              "$out" "reported a problem"
+contains "…naming the lane's actual complaint"  "$out" "NOT ARMED"
+contains "…while saying the sessions are fine"  "$out" "sessions are fine"
+check "…and the start still exits zero"         "0" "$rc"
+
+printf '  …and a helper that hangs cannot hang a start\n'
+printf '#!/bin/sh\nsleep 60\n' > "$RA"; chmod +x "$RA"
+start=$(date +%s); rc=0; out="$(run_start x 2)" || rc=$?
+elapsed=$(( $(date +%s) - start ))
+check "it gives up rather than hanging"  "1" "$([ "$elapsed" -lt 25 ] && echo 1 || echo 0)"
+contains "…and says so"                  "$out" "timed out"
+check "…and the start still exits zero"  "0" "$rc"
+rm -f "$RA"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
