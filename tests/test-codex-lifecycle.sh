@@ -21,13 +21,42 @@ set -u
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 CL="$HERE/../bin/claude-session"
 FIX="$(mktemp -d "${TMPDIR:-/tmp}/cl-codex.XXXXXX")"
+
+# ── NOR DOES $HOME FIXTURE THE tmux SERVER ──────────────────────────────────
+#
+# `cl start` wraps a restored session in tmux, and this suite had NO
+# TMUX_TMPDIR, so every such launch went to the operator's REAL tmux server.
+# On 2026-10-16 that left a live session named RearmProbe running
+# `claude --resume <fixture-sid> --dangerously-skip-permissions` for hours —
+# found only because its tabs were noticed.
+#
+# The leak predates the test that exposed it: the CL_TMUX=1 case below has
+# always used the real server. Same class as the iTerm one above and as this
+# project's earlier escapes into ~/.claude — a daemon, like an application, is
+# not redirected by any path variable the code already honoured. TMUX_TMPDIR is
+# the one tmux does honour, so the suite gets its own server and takes it with
+# it. The sibling suite (test-handoff-budget.sh) has done this since it was
+# written; this one simply never did.
+export TMUX_TMPDIR="$FIX/tmux-tmp"
+mkdir -p "$TMUX_TMPDIR"
+# The REAL server's sessions, fingerprinted before anything runs, so the
+# assertion at the end is about THIS suite rather than about what happens to be
+# on the machine. Captured with the real TMUX_TMPDIR, i.e. none.
+_real_tmux_before="$(TMUX_TMPDIR= tmux list-sessions -F '#{session_name}' 2>/dev/null | sort | tr '\n' ',')"
+
 cleanup() {
   local v
   for v in "${VICTIM:-}" "${BYSTANDER:-}" "${LIVE:-}" "${OLDPROC:-}" "${NOTCODEX:-}" \
            "${WRAP:-}" "${KID:-}" "${CSHARED:-}" "${XSHARED:-}" "${STILLUP:-}"; do
     [ -n "$v" ] && kill "$v" 2>/dev/null
   done
-  rm -rf "$FIX"
+  # The suite's OWN server, and only it — addressed by the fixture TMUX_TMPDIR,
+  # never by name, so this can never reach the operator's sessions.
+  TMUX_TMPDIR="$FIX/tmux-tmp" tmux kill-server >/dev/null 2>&1
+  # tmux unlinks its socket directory asynchronously, so a single rm -rf races
+  # it and reports "Directory not empty". One retry is enough and silence here
+  # is correct: a leftover fixture directory is litter, not a test result.
+  rm -rf "$FIX" 2>/dev/null || { sleep 0.5; rm -rf "$FIX" 2>/dev/null; }
   return 0
 }
 trap cleanup EXIT
@@ -579,7 +608,7 @@ ra_fixture() { # <exit-code> <stdout...>
   printf 'cat <<EOF\n%s\nEOF\nexit %s\n' "$*" "$shift_rc" >> "$RA"
   chmod +x "$RA"
 }
-run_start() { CL_COORD_REARM="$RA" CL_COORD_REARM_TIMEOUT="${2:-20}" \
+run_start() { seed_state; CL_COORD_REARM="$RA" CL_COORD_REARM_TIMEOUT="${2:-20}" \
   bash "$CL" start 2>&1; }
 
 # A saved state with ONE row, so `cl start` reaches an exit path. An empty
@@ -588,19 +617,28 @@ run_start() { CL_COORD_REARM="$RA" CL_COORD_REARM_TIMEOUT="${2:-20}" \
 # first attempt. The row's session is not live and this shell is not iTerm, so
 # start prints the command to run by hand and then re-arms, which is the path
 # under test.
-mkdir -p "$(dirname "$STATE")" 2>/dev/null || true
-printf '[{"name":"RearmProbe","sid":"%s","cwd":"%s","agent":"claude"}]\n' \
-  "11111111-2222-3333-4444-555555555555" "$FIX" > "$STATE"
+# SEEDED BEFORE EVERY USE, not once. A successful `cl start` calls
+# consume_state, which removes the file — so a block that wrote it once and ran
+# start several times worked only while some EARLIER start was failing. Giving
+# the suite its own tmux server made that earlier start succeed, the state was
+# consumed, and six assertions here began failing on "no saved state". An
+# ordering dependency that was invisible until an unrelated fix removed it.
+seed_state() {
+  mkdir -p "$(dirname "$STATE")" 2>/dev/null || true
+  printf '[{"name":"RearmProbe","sid":"%s","cwd":"%s","agent":"claude"}]\n' \
+    "11111111-2222-3333-4444-555555555555" "$FIX" > "$STATE"
+}
+seed_state
 # Guard: if start ever stops reaching the re-arm, every assertion below would
 # pass by describing an early exit instead.
-_reach="$(CL_COORD_REARM="$FIX/nope.sh" bash "$CL" start 2>&1)"
+seed_state; _reach="$(CL_COORD_REARM="$FIX/nope.sh" bash "$CL" start 2>&1)"
 case "$_reach" in
   *"saved state is empty"*) setup_failed "cl start exits before the re-arm — the fixture state is not usable" ;;
 esac
 
 printf '  …an absent helper is silent, because cl ships without the watcher\n'
 rm -f "$RA"
-out="$(CL_COORD_REARM="$FIX/not-installed.sh" bash "$CL" start 2>&1 || true)"
+seed_state; out="$(CL_COORD_REARM="$FIX/not-installed.sh" bash "$CL" start 2>&1 || true)"
 not_contains "no mention of re-arming when the helper is not installed" "$out" "re-arm"
 
 printf '  …a machine that declares no lanes is silent too\n'
@@ -620,7 +658,7 @@ printf '  …and no test here may open a real iTerm tab\n'
 # takes the quiet path and never prints either. Asserting the absence of
 # "opened N iTerm tab(s)" holds on every path and needs no AppleScript, so it
 # works wherever the suite runs.
-_notabs="$(CL_COORD_REARM="$FIX/nope.sh" bash "$CL" start 2>&1 || true)"
+seed_state; _notabs="$(CL_COORD_REARM="$FIX/nope.sh" bash "$CL" start 2>&1 || true)"
 not_contains "start never reports opening iTerm tabs" "$_notabs" "iTerm tab(s)"
 check "…and the suite has cleared TERM_PROGRAM, which is what gates that" "" "$TERM_PROGRAM"
 
@@ -654,6 +692,18 @@ check "it gives up rather than hanging"  "1" "$([ "$elapsed" -lt 25 ] && echo 1 
 contains "…and says so"                  "$out" "timed out"
 check "…and the start still exits zero"  "0" "$rc"
 rm -f "$RA"
+
+echo "and this suite left nothing in the operator's real tmux server"
+# THE ASSERTION THAT WOULD HAVE CAUGHT IT. A test that starts a session on the
+# machine's own tmux server is invisible until somebody looks — the RearmProbe
+# session ran for hours. A set comparison is the detector, and it is cheap.
+_real_tmux_after="$(TMUX_TMPDIR= tmux list-sessions -F '#{session_name}' 2>/dev/null | sort | tr '\n' ',')"
+check "the real tmux server has the same sessions it started with" \
+  "$_real_tmux_before" "$_real_tmux_after"
+# And the suite really did use a server of its own, or the line above passes by
+# describing a suite that never touched tmux at all.
+check "…while the suite did have its own server to use" "1" \
+  "$([ -d "$TMUX_TMPDIR" ] && echo 1 || echo 0)"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
