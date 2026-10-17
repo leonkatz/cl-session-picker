@@ -43,6 +43,21 @@ setup_failed() { printf 'FIXTURE SETUP FAILED: %s\n' "$1" >&2; exit 2; }
 command -v jq >/dev/null 2>&1 || setup_failed "jq is required by the code under test"
 
 export HOME="$FIX/home"; export CODEX_HOME="$HOME/.codex"
+# ── FIXTURING $HOME DOES NOT FIXTURE THE GUI ─────────────────────────────────
+#
+# `cl start` opens a tab per saved session through open_iterm_tabs, which talks
+# to the RUNNING iTerm over AppleScript. No HOME override sandboxes that: on
+# 2026-10-16 a test here inherited TERM_PROGRAM=iTerm.app, in_iterm() was true,
+# and every run opened real tabs in the operator's own window — each running
+# `cl "RearmProbe"` for a fixture session that does not exist, so they sat there
+# dead. Several suite runs left a screenful of them.
+#
+# Same class as this project's earlier leaks into ~/.claude/scripts and
+# ~/.claude/settings.local.json, with a destination no path variable can
+# redirect. The only lever is the condition in_iterm() tests, so it is cleared
+# for the whole suite: a test must never be able to touch the terminal the
+# person is using.
+export TERM_PROGRAM=""
 STATE="$HOME/.config/claude-session/state.json"
 PIDDIR="$HOME/.config/claude-session/pids"
 mkdir -p "$CODEX_HOME/sessions/2026/01/01" "$HOME/.claude/projects/p1" \
@@ -594,6 +609,20 @@ ra_fixture 1 "coord-rearm: no lanes declared on this machine."
 out="$(run_start || true)"
 not_contains "no lanes declared says nothing"      "$out" "reported a problem"
 not_contains "…and does not mention re-arming"     "$out" "re-armed"
+
+printf '  …and no test here may open a real iTerm tab\n'
+# The observable proof: not being iTerm-hosted, start PRINTS the commands
+# instead of opening tabs. If this assertion ever fails, the suite has regained
+# the ability to open windows on the operator's desktop.
+# A NEGATIVE on the line printed only when tabs are actually opened. The first
+# version asserted the "open a tab and run" fallback, which assumed the
+# tab-printing branch — but this fixture's row reads as already live, so start
+# takes the quiet path and never prints either. Asserting the absence of
+# "opened N iTerm tab(s)" holds on every path and needs no AppleScript, so it
+# works wherever the suite runs.
+_notabs="$(CL_COORD_REARM="$FIX/nope.sh" bash "$CL" start 2>&1 || true)"
+not_contains "start never reports opening iTerm tabs" "$_notabs" "iTerm tab(s)"
+check "…and the suite has cleared TERM_PROGRAM, which is what gates that" "" "$TERM_PROGRAM"
 
 printf '  …a successful re-arm reports only the verified lines\n'
 ra_fixture 0 "  /some/lane
