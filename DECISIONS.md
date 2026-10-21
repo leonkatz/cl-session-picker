@@ -8,8 +8,16 @@ is a deliberate reversal, not an accident.
 
 **Chose:** delete every cmux path — native cmux launches (`cmux claude-teams` /
 `cmux codex-teams`), workspace restore in `cl start`, surface close on stop,
-`cmux send` handoff injection, `CMUX_*` environment scrubbing, the cmux sidebar
-and its install step. `cl` now has two hosts: an iTerm2 tab (the agent as the
+`cmux send` handoff injection, the cmux sidebar and its install step.
+
+**But KEEP the `CMUX_*` scrub, now unconditional.** The first cut removed it
+with everything else, and Codex's review showed that regressed the hosts being
+kept: a tmux server first started under cmux holds `CMUX_*` in its global
+environment and hands it to every later pane, iTerm ones included, where cmux's
+Claude hooks read the ids and dial a dead socket. So every direct exec still
+strips inherited `CMUX_*`, and `tmux_setup` still clears it from the server's
+global environment — always, now, since no launch is a cmux launch. Removing
+cmux as a *host* made the rule simpler, not unnecessary. `cl` now has two hosts: an iTerm2 tab (the agent as the
 tab's own process) and tmux everywhere else. `install.sh --no-sidebars` is kept
 as an accepted no-op, because callers pass it — mac_setup's own shell-wiring
 suite does — and the installer's `set -euo pipefail` would abort on an unknown
@@ -34,9 +42,12 @@ supported host. Codex's review found it; 717 green assertions did not, because
 every new test drove the non-cmux path. A host that every cross-cutting change
 has to remember, for a host nobody uses, is a standing source of that bug.
 
-The net change is roughly 300 lines removed from the script, 12 cmux-only test
-assertions removed, and no behaviour change for iTerm or tmux — confirmed by the
-full suite and by driving the branch against the live session list read-only.
+The net change is roughly 280 lines removed from the script and 12 cmux-only
+test assertions removed, with two regressions added for the scrub — a direct
+iTerm launch handed stale `CMUX_*` passes none to the agent, and `tmux_setup`
+clears it from a real tmux server's global environment. iTerm and tmux launch
+behaviour is otherwise unchanged, confirmed by the full suite and by driving the
+branch against the live session list read-only.
 
 **Note:** the entries below that describe cmux behaviour are kept as written.
 They record what was decided and why at the time; this entry is what reverses

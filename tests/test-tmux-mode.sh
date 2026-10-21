@@ -36,6 +36,7 @@ printf '{"cwd":"%s"}\n{"customTitle":"Solo Two"}\n' "$FIX/work" > "$HOME/.claude
 cat > "$FIX/bin/claude" <<SH
 #!/bin/sh
 for a in "\$@"; do printf '%s\n' "\$a"; done > "$FIX/argv.claude"
+env | grep '^CMUX_' > "$FIX/env.claude" 2>/dev/null
 exit 0
 SH
 cat > "$FIX/bin/tmux" <<SH
@@ -397,6 +398,46 @@ check "a directory at the claim path is refused, not walked into" "2" "$rc"
 check "…and nothing was created inside it" "0" "$(find "$STRAY" -mindepth 1 | wc -l | tr -d ' ')"
 rmdir "$STRAY" 2>/dev/null
 rm -rf "$HOME/.config/claude-session/pids"
+
+printf 'no agent inherits stale CMUX_* — the hosts that REMAIN are still protected\n'
+# ── WHY THIS OUTLIVED cmux SUPPORT ──────────────────────────────────────────
+#
+# Removing cmux as a host first removed this scrub too, and that regressed the
+# iTerm and tmux launches it was protecting (Codex, PR #21 review). A tmux server
+# started under cmux keeps CMUX_* in its GLOBAL environment and hands them to
+# every later pane, iTerm ones included; cmux's Claude hooks then read those ids
+# and dial a dead socket. The old tests for this were deleted along with the
+# cmux-host tests, which is why the first removal's green suite could not see it.
+#
+# 1. A direct iTerm launch, handed stale CMUX_* values, passes none to the agent.
+rm -f "$FIX/argv.claude" "$FIX/env.claude"
+env -i HOME="$HOME" PATH="$PATHF" TERM_PROGRAM=iTerm.app \
+    CMUX_WORKSPACE_ID=stale-ws CMUX_SURFACE_ID=stale-surf CMUX_SOCKET_PATH=/nope \
+    bash "$CL" Solo >/dev/null 2>&1
+# Control first: an empty env file proves nothing unless the agent really ran.
+check "the agent really was launched" "1" "$([ -s "$FIX/argv.claude" ] && echo 1 || echo 0)"
+check "…and it inherited no CMUX_* at all" "" "$(cat "$FIX/env.claude" 2>/dev/null)"
+
+# 2. tmux_setup clears stale CMUX_* from the SERVER's global environment, which
+#    is where a tmux pane inherits them from. Driven against a REAL tmux server
+#    in an isolated socket directory — the fake tmux above records argv and
+#    cannot hold an environment, and the operator's own server must never be
+#    touched (2026-10-16).
+_TS="$FIX/tmux-real"; mkdir -p "$_TS"
+_TSLIB="$FIX/tmux_setup.sh"
+awk '/^tmux_setup\(\) *\{/{f=1} f{print} f&&/^\}$/{exit}' "$CL" > "$_TSLIB"
+grep -q 'set-environment -gu' "$_TSLIB" || setup_failed "extracted tmux_setup does not clear the global environment"
+TMUX_TMPDIR="$_TS" tmux new-session -d -s holder 'sleep 30' 2>/dev/null \
+  || setup_failed "could not start an isolated tmux server"
+TMUX_TMPDIR="$_TS" tmux set-environment -g CMUX_WORKSPACE_ID stale-ws
+TMUX_TMPDIR="$_TS" tmux set-environment -g CMUX_SOCKET_PATH /nope
+# Control: the stale values really are on the server before the scrub runs.
+check "the server starts out carrying stale CMUX_*" "2" \
+  "$(TMUX_TMPDIR="$_TS" tmux show-environment -g 2>/dev/null | grep -c '^CMUX_')"
+( . "$_TSLIB"; TMUX_TMPDIR="$_TS"; export TMUX_TMPDIR; tmux_setup ) >/dev/null 2>&1
+check "tmux_setup leaves none on the server's global environment" "0" \
+  "$(TMUX_TMPDIR="$_TS" tmux show-environment -g 2>/dev/null | grep -c '^CMUX_')"
+TMUX_TMPDIR="$_TS" tmux kill-server >/dev/null 2>&1
 
 printf 'stop revalidates identity at the destructive boundary\n'
 # cl stop can sit on a "kill it anyway?" prompt for as long as a person takes.

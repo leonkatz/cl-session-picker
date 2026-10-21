@@ -47,10 +47,11 @@
 #                             #   --no-handoff skips the request AND clears any
 #                             #   pending handoff, so the session really does come
 #                             #   back as-is; --dry-run prints what would happen.
-#                             #   Every session is asked at once, then one
-#                             #   shared window waits for them all
-#                             #   (CL_HANDOFF_TIMEOUT, default 180s). Asks before
-#                             #   killing anything still mid-task.
+#                             #   Every session is asked at once; each round
+#                             #   waits one shared CL_HANDOFF_TIMEOUT window
+#                             #   (180s) for all of them, and CL_HANDOFF_BUDGET
+#                             #   (300s) bounds the waiting across rounds. Asks
+#                             #   before killing anything still mid-task.
 #   claude-session handoff    # write THIS session's handoff by hand, from inside
 #                             #   it — the way out when a pane can't be reached.
 #                             #   Pipe the text in, or run it bare to be told
@@ -880,6 +881,30 @@ in_iterm() { [ "${TERM_PROGRAM:-}" = "iTerm.app" ]; }
 use_tmux() {
   command -v tmux >/dev/null 2>&1 || return 1
   if in_iterm; then [ "${CL_TMUX:-0}" = "1" ]; else return 0; fi
+}
+
+# drop_cmux_env: strip every inherited CMUX_* before handing control to an
+# agent. ALWAYS — there is no cmux host any more, so every launch is a non-cmux
+# launch.
+#
+# ── WHY THIS SURVIVED REMOVING cmux ─────────────────────────────────────────
+#
+# It was never only a cmux-host feature; it protects the two hosts that remain.
+# A tmux server first started under cmux keeps CMUX_* in its GLOBAL environment
+# and hands them to every pane opened later — including panes opened from iTerm
+# long after that cmux context died. cmux's own Claude hooks read those ids and
+# dial a dead or wrong socket on every tool call. Removing the scrub along with
+# the cmux branches regressed iTerm and tmux launches, which the first cut of
+# this removal did; Codex's PR #21 review caught it.
+#
+# Removing cmux as a host makes the rule simpler, not unnecessary: the old code
+# had to decide whether this shell was a live cmux pane before scrubbing, and
+# now the answer is always no.
+drop_cmux_env() {
+  local v
+  for v in $(env | sed -n 's/^\(CMUX_[A-Za-z0-9_]*\)=.*/\1/p'); do
+    unset "$v" 2>/dev/null
+  done
 }
 
 # claude_cmd / codex_cmd: the one place each agent's binary name lives, so the
@@ -2170,6 +2195,13 @@ tmux_setup() {
   tmux set -g allow-passthrough on 2>/dev/null
   tmux set -s extended-keys on 2>/dev/null
   tmux set -as terminal-features 'xterm*:extkeys' 2>/dev/null
+  # The server outlives the cmux context that may have started it and keeps
+  # CMUX_* in its GLOBAL environment, so every later pane would inherit them.
+  # Unconditional now: no launch is a cmux launch. See drop_cmux_env.
+  local _v
+  for _v in $(tmux show-environment -g 2>/dev/null | sed -n 's/^\(CMUX_[A-Za-z0-9_]*\)=.*/\1/p'); do
+    tmux set-environment -gu "$_v" 2>/dev/null
+  done
 }
 
 # iterm_running: true when iTerm2 is actually running. Env vars are unreliable
@@ -2254,7 +2286,7 @@ launch_session() { # name sid cwd [agent]
     # one actually being resumed, so a row for a different generation of this
     # name is left alone.
     ack_state_row "$name" "$agent" "$sid"
-    cd "$cwd" || exit 1; eval "exec $cmd"
+    drop_cmux_env; cd "$cwd" || exit 1; eval "exec $cmd"
   fi
 }
 
@@ -2269,7 +2301,7 @@ launch_new() { # cwd [agent]
     tmux_setup
     tmux_start_and_attach "$t" "$cwd" "$cmd" "$agent" "-" "" || exit 1
   else
-    cd "$cwd" || exit 1; eval "exec $cmd"
+    drop_cmux_env; cd "$cwd" || exit 1; eval "exec $cmd"
   fi
 }
 
@@ -2343,7 +2375,7 @@ launch_named() { # name cwd [agent]
     fi
     cd "$cwd" || exit 1
     commit_pending_model "$agent" "$name"
-    eval "exec $cmd"
+    drop_cmux_env; eval "exec $cmd"
   fi
 }
 
@@ -2437,7 +2469,7 @@ launch_fresh() {
     # Same instant as the claim commit: the handoff and the restart row are two
     # records of one launch, so they are acknowledged on the same proof.
     ack_state_row "$name" claude "$old_sid"
-    eval "exec $cmd"
+    drop_cmux_env; eval "exec $cmd"
   fi
 }
 
