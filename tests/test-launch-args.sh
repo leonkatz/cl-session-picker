@@ -4,7 +4,7 @@
 # The property (not a string grep): resuming a Codex session executes
 #   codex [<CL_CODEX_ARGS words>] resume <id>
 # with the top-level args BEFORE the subcommand, the id as ONE argv element,
-# and nothing added when CL_CODEX_ARGS is empty. Proven by fake codex/cmux
+# and nothing added when CL_CODEX_ARGS is empty. Proven by a fake codex
 # binaries that record their real argv. Some Codex builds reject top-level
 # options placed after `resume`; this pins the grammar every build accepts.
 set -u
@@ -29,32 +29,13 @@ BASEPATH="$FIX/bin:/usr/bin:/bin"
 
 run_cl() { ( cd "$FIX" && env -i HOME="$HOME" CODEX_HOME="$CODEX_HOME" PATH="$BASEPATH" ${1:+CL_CODEX_ARGS="$1"} bash "$CL" --codex T >/dev/null 2>&1 ); }
 
-echo "direct (no tmux, no cmux)"
+echo "direct (no tmux)"
 run_cl '--approve-for-me'
 check "argv = --approve-for-me resume <id>" "--approve-for-me|resume|$SID" "$(paste -sd'|' - < "$FIX/argv.codex")"
 run_cl ''
 check "empty CL_CODEX_ARGS adds nothing" "resume|$SID" "$(paste -sd'|' - < "$FIX/argv.codex")"
 run_cl '-m gpt-5 --approve-for-me'
 check "multi-word args stay separate elements, before the subcommand" "-m|gpt-5|--approve-for-me|resume|$SID" "$(paste -sd'|' - < "$FIX/argv.codex")"
-
-echo "cmux (codex-teams wrapper)"
-cat > "$FIX/bin/cmux" <<CMUX
-#!/bin/sh
-case "\$1" in
-  --help) echo "  codex-teams [codex-args...]"; exit 0 ;;
-  workspace) printf '{"workspaces":[{"id":"ws-under-test"}]}\n'; exit 0 ;;
-  rename-tab) exit 0 ;;
-  codex-teams) shift; for a in "\$@"; do printf '%s\n' "\$a"; done > "$FIX/argv.cmux"; exit 0 ;;
-esac
-exit 0
-CMUX
-chmod +x "$FIX/bin/cmux"
-# in_cmux asks the live cmux to affirm THIS shell's workspace id, so the fake
-# must report that id among its workspaces — presence of a cmux is not enough.
-( cd "$FIX" && env -i HOME="$HOME" CODEX_HOME="$CODEX_HOME" PATH="$BASEPATH" \
-    CMUX_WORKSPACE_ID=ws-under-test CL_CODEX_ARGS='--approve-for-me' \
-    bash "$CL" --codex T >/dev/null 2>&1 )
-check "cmux path forwards the same grammar to codex-teams" "--approve-for-me|resume|$SID" "$(paste -sd'|' - < "$FIX/argv.cmux")"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

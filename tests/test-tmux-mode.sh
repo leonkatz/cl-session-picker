@@ -36,7 +36,6 @@ printf '{"cwd":"%s"}\n{"customTitle":"Solo Two"}\n' "$FIX/work" > "$HOME/.claude
 cat > "$FIX/bin/claude" <<SH
 #!/bin/sh
 for a in "\$@"; do printf '%s\n' "\$a"; done > "$FIX/argv.claude"
-env | grep '^CMUX_' > "$FIX/env.claude" 2>/dev/null
 exit 0
 SH
 cat > "$FIX/bin/tmux" <<SH
@@ -53,23 +52,7 @@ cat > "$FIX/bin/osascript" <<SH
 echo true
 exit 0
 SH
-# A cmux that is RUNNING and healthy, but whose live workspaces do not include
-# the stale id the environment carries. This is the case an app-presence check
-# gets wrong: cmux exists, so stale vars look authoritative.
-# Records what it was asked to do, so the affirmed path can be proved to have
-# actually run rather than merely "not printed a tag". One live workspace, plus
-# a decoy string parked in a title field.
-cat > "$FIX/bin/cmux" <<SH
-#!/bin/sh
-printf '%s\n' "\$*" >> "$FIX/cmux.log"
-case "\$1 \$2" in
-  "workspace list")
-    if [ -n "\${CMUX_FAKE_BADJSON:-}" ]; then printf 'not json at all\n'; exit 0; fi
-    printf '{"workspaces":[{"id":"a-real-live-workspace","custom_title":"decoy-in-title"},{"id":"other-ws"}]}\n' ;;
-esac
-exit 0
-SH
-chmod +x "$FIX/bin/claude" "$FIX/bin/tmux" "$FIX/bin/osascript" "$FIX/bin/cmux" || setup_failed "chmod"
+chmod +x "$FIX/bin/claude" "$FIX/bin/tmux" "$FIX/bin/osascript" || setup_failed "chmod"
 PATHF="$FIX/bin:/usr/bin:/bin:/usr/sbin"
 
 printf 'launch host\n'
@@ -414,46 +397,6 @@ check "a directory at the claim path is refused, not walked into" "2" "$rc"
 check "…and nothing was created inside it" "0" "$(find "$STRAY" -mindepth 1 | wc -l | tr -d ' ')"
 rmdir "$STRAY" 2>/dev/null
 rm -rf "$HOME/.config/claude-session/pids"
-
-printf 'stale CMUX_* does not make a launch think it is in cmux\n'
-# A tmux server started under cmux keeps CMUX_* in its GLOBAL environment, so
-# panes opened from iTerm long after that context died inherit them. Note the
-# fake cmux here is ALIVE and answering — this is the case "is a cmux app
-# running?" gets wrong, because presence is not identity. The stale workspace
-# id is simply not among the live ones.
-rm -f "$FIX/argv.claude" "$FIX/env.claude"
-out=$(env -i HOME="$HOME" PATH="$PATHF" TERM_PROGRAM=iTerm.app \
-        CMUX_WORKSPACE_ID=stale-ws CMUX_SURFACE_ID=stale-surf CMUX_SOCKET_PATH=/nope \
-        bash "$CL" Solo 2>&1)
-check "stale ids + a LIVE cmux still take the iTerm path" "yes" "$(bare)"
-has   "…so the tab is still tagged for cl stop" "$out" "1337;SetUserVar=clSession="
-check "…and the agent inherits no stale CMUX_* at all" "" "$(cat "$FIX/env.claude" 2>/dev/null)"
-# Membership must be an EXACT field match, not a substring of the document.
-# "bare" must mean the iTerm path actually ran — a command that aborted before
-# launching anything also fails to call rename-tab, and would otherwise be
-# scored the same as a correct negative.
-cmux_case() { # env-id [bad-json] -> "cmux" | "bare" | "aborted"
-  local rc
-  rm -f "$FIX/argv.claude" "$FIX/cmux.log"
-  env -i HOME="$HOME" PATH="$PATHF" TERM_PROGRAM=iTerm.app \
-      ${2:+CMUX_FAKE_BADJSON=1} CMUX_WORKSPACE_ID="$1" bash "$CL" Solo >"$FIX/case.out" 2>&1
-  rc=$?
-  if grep -qF 'rename-tab' "$FIX/cmux.log" 2>/dev/null; then echo cmux
-  elif [ "$rc" -eq 0 ] && [ -s "$FIX/argv.claude" ]; then echo bare
-  else echo aborted; fi
-}
-check "an id that is a SUBSTRING of a live one is not affirmed" "bare" "$(cmux_case workspace)"
-check "an id appearing only in a title field is not affirmed"   "bare" "$(cmux_case decoy-in-title)"
-check "unparseable JSON leaves the context unaffirmed"          "bare" "$(cmux_case a-real-live-workspace bad)"
-
-# The affirmed path must be shown to RUN, not merely to omit the iTerm tag —
-# an aborted command omits it too.
-check "an exact id match takes the cmux path" "cmux" "$(cmux_case a-real-live-workspace)"
-# In cmux the agent is launched THROUGH cmux (claude_cmd -> `cmux claude-teams`),
-# so proof of launch is in the cmux log, not in a bare claude invocation.
-has   "…and the agent really was launched, resuming this session" \
-      "$(cat "$FIX/cmux.log")" "claude-teams --resume $SID"
-hasnt "…without the iTerm tab tag" "$(cat "$FIX/case.out")" "1337;SetUserVar=clSession="
 
 printf 'stop revalidates identity at the destructive boundary\n'
 # cl stop can sit on a "kill it anyway?" prompt for as long as a person takes.

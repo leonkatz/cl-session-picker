@@ -7,8 +7,8 @@
 #
 # Two things here are load-bearing beyond "does it work":
 #
-#   * The value is spliced into shell command strings (tmux's command argument,
-#     cmux --command, and the exec paths), so it is validated on the way in and
+#   * The value is spliced into shell command strings (tmux's command argument
+#     and the exec paths), so it is validated on the way in and
 #     quoted on the way out. A stored file is user-editable, so reading is
 #     validated too — the tests below plant a hostile value by hand.
 #   * It is stored in its own file, not in state.json. state.json is a snapshot
@@ -493,13 +493,11 @@ claude_cmd() { printf 'claude'; }
 codex_cmd()  { printf 'codex'; }
 codex_args() { printf ''; }
 tmux_name()  { printf '%s' "$1"; }
-in_cmux()    { return 1; }
 in_iterm()   { return 1; }
 use_tmux()   { return 0; }
 tmux_setup() { :; }
 tag_iterm_session() { :; }
 acquire_launch() { printf ''; return 0; }
-drop_cmux_env()  { :; }
 STUBS
 } > "$SEAM"
 if bash -n "$SEAM" 2>/dev/null; then pass=$((pass+1)); printf '  ok   %s\n' "the extracted seam parses"

@@ -166,7 +166,7 @@ name_component() { # a standalone copy of the shipped function, for direct
   # unit testing without sourcing the whole script (which runs its dispatch
   # unconditionally at the bottom) — kept byte-for-byte in sync with
   # bin/claude-session's version; if this test ever drifts from the real
-  # function, the real-tmux/cmux tests above still exercise the real one
+  # function, the real-tmux tests above still exercise the real one
   # end-to-end.
   local n="$1" out="" c i hex
   for (( i=0; i<${#n}; i++ )); do
@@ -368,46 +368,6 @@ rm -f "$HOME/.claude/projects/p1/sid-handoffonly.jsonl"
 
 cleanup_rtmux
 
-echo "send_text_cmux uses the real 'cmux send' / 'send-key' contract"
-# cmux has no 'send-text' subcommand (an earlier version of this function
-# guessed one and always fell back silently). Confirmed against an installed
-# cmux build (0.64.22): 'cmux send --surface <id> -- <text>' then a SEPARATE
-# 'cmux send-key --surface <id> -- enter' — never relying on \n in the text,
-# since `cmux send` documents \n/\r/\t in the text itself as key presses.
-FIX2="$(mktemp -d "${TMPDIR:-/tmp}/cl-cmux.XXXXXX")"
-mkdir -p "$FIX2/bin" "$FIX2/home/.claude/projects/p1" "$FIX2/work" "$FIX2/home/.cmuxterm"
-printf '{"cwd":"%s"}\n{"customTitle":"CmuxSendTarget"}\n' "$FIX2/work" > "$FIX2/home/.claude/projects/p1/sid-cmuxsend.jsonl"
-SFC="surface-under-test"
-printf '{"sessions":{"sid-cmuxsend":{"surfaceId":"%s"}}}\n' "$SFC" > "$FIX2/home/.cmuxterm/claude-hook-sessions.json"
-cat > "$FIX2/bin/cmux" <<CMUXFAKE
-#!/bin/sh
-case "\$1" in
-  --help) printf '  send [flags] <text>\n  send-key [flags] <key>\n'; exit 0 ;;
-  send)     shift; printf '%s\n' "\$@" > "$FIX2/argv.send"; exit 0 ;;
-  send-key) shift; printf '%s\n' "\$@" > "$FIX2/argv.sendkey"; exit 0 ;;
-  *) exit 1 ;;
-esac
-CMUXFAKE
-chmod +x "$FIX2/bin/cmux"
-# A fake, harmless osascript (never touches the real iTerm app) so
-# send_text_iterm reliably misses instead of possibly hitting a real
-# Terminal/iTerm running on this machine — same pattern test-tmux-mode.sh
-# uses. jq IS real (symlinked): request_handoff needs it to read the surface
-# store. Real tmux is simply absent from this PATH, so its branch can't match.
-printf '#!/bin/sh\necho no\n' > "$FIX2/bin/osascript"; chmod +x "$FIX2/bin/osascript"
-ln -sf "$(command -v jq)" "$FIX2/bin/jq"
-# $FIX2/bin (cmux, fake osascript, jq) first, then /usr/bin:/bin for ordinary
-# coreutils (grep, mkdir, date, stat, ...) that discover()/request_handoff
-# call by bare name — deliberately NOT including a real tmux (Homebrew-only,
-# so plain /usr/bin:/bin already excludes it).
-env -i HOME="$FIX2/home" PATH="$FIX2/bin:/usr/bin:/bin" CL_HANDOFF_DIR="$FIX2/dir-cmux" CL_HANDOFF_TIMEOUT=1 \
-  bash "$CL" stop --keep-tabs >/dev/null 2>&1
-sendkey_ok=0; [ -e "$FIX2/argv.sendkey" ] && grep -qx "enter" "$FIX2/argv.sendkey" && sendkey_ok=1
-send_ok=0; [ -e "$FIX2/argv.send" ] && grep -q -- "--surface" "$FIX2/argv.send" && grep -q "$SFC" "$FIX2/argv.send" && send_ok=1
-check "cmux send was called with --surface and the recorded surface id" "1" "$send_ok"
-check "cmux send-key enter was called as a SEPARATE step (never folded into the text)" "1" "$sendkey_ok"
-rm -rf "$FIX2"
-
 echo "the instruction is replaceable — the tool supplies mechanism, you supply workflow"
 # The original version of this feature had one person's note-keeping rules
 # typed into the script. What a session should tidy before it ends is a
@@ -468,7 +428,7 @@ printf 'handoff_path() { printf "%%s/%%s.md" "$1" "$2"; }\n' >> "$BUILD"
 bp() { env CL_HANDOFF_PROMPT_FILE="${1:-/nonexistent}" CL_RESUME_PROMPT_FILE=/nonexistent \
         bash -c "source '$BUILD'; build_handoff_prompt \"\$@\"" _ "$2" "$3" "$4" 2>"$FIX/bp.err"; }
 
-# A CRLF file keeps one CR per line after tr '\n'; cmux reads CR as Enter, and
+# A CRLF file keeps one CR per line after tr '\n'; a pane reads CR as Enter, and
 # a tab is a real Tab keystroke.
 printf 'one {{nonce}}\r\ntwo\tafter tab {{handoff}}\r\n' > "$PROMPTS/handoff-prompt.txt"
 out=$(bp "$PROMPTS/handoff-prompt.txt" /store Name clho:1:1:1:1)
