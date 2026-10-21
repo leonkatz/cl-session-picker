@@ -12,7 +12,7 @@ with a rotating state history so a failed restart never loses the list.
 
 In iTerm2 the agent runs as the tab's own process so iTerm's Claude Code
 integration can see it; elsewhere it runs inside tmux. See
-[Where the agent runs](#where-the-agent-runs--tmux-iterm2-cmux).
+[Where the agent runs](#where-the-agent-runs--tmux-iterm2).
 
 ## Install
 
@@ -159,7 +159,7 @@ export CL_CODEX_ARGS='-m gpt-5 -s workspace-write'
 storage, so the ids it finds only mean something to a local `codex`.
 
 **Naming.** Codex has no launch-time name flag, so `cl new --codex "Name"`
-names the tmux session / cmux tab only; the Codex thread itself is unnamed —
+names the tmux session only; the Codex thread itself is unnamed —
 and invisible to `cl --list` — until you run `/rename Name` inside it. `cl`
 prints that reminder when it launches.
 
@@ -168,10 +168,6 @@ a reason to refuse launching a second one, not proof the thread is idle or
 alive (Codex threads can also run under its app-server daemon or the desktop
 app, which `cl` can't see). `cl stop` / `cl start` are Claude-only for now.
 
-**In cmux**, Codex launches via `cmux codex-teams` when that subcommand exists
-(probed, not assumed), otherwise plain `codex`. `CL_TEAMS=0` opts out for both
-agents.
-
 Discovery reads `~/.codex/session_index.jsonl` and the rollout transcripts
 under `~/.codex/sessions/` (`CODEX_HOME` overrides the base dir). Those are
 Codex's private files, not an API: if a Codex release moves them, `cl` prints
@@ -179,14 +175,13 @@ Codex's private files, not an API: if a Codex release moves them, `cl` prints
 Archived sessions (`codex archive`) are excluded. `tests/test-discover.sh`
 exercises all of this against fixtures.
 
-## Where the agent runs — tmux, iTerm2, cmux
+## Where the agent runs — tmux, iTerm2
 
 `cl` picks the host for you:
 
 | Terminal | Agent runs | Why |
 |---|---|---|
 | **iTerm2** | as the tab's own process (no tmux) | iTerm2's Claude Code integration keys on the tab's foreground job name and finds the tab from the agent's tty. Wrapped in tmux the job is `tmux` and the tty is a tmux pty, so the integration silently does nothing. |
-| **cmux** | as the pane's own process | cmux owns persistence and restore. Detected by asking cmux to confirm this pane's `CMUX_WORKSPACE_ID` is one of its live workspaces — stale ids inherited from a dead cmux context (a tmux server keeps them in its global environment) must not route a launch there. A pane carrying only `CMUX_SURFACE_ID` cannot be confirmed, since cmux lists surfaces by ref rather than id, and is treated as not-cmux. |
 | anything else | inside tmux when available | there, detach/reattach is the only persistence there is. |
 
 **In iTerm this trades detach for the integration.** Closing the tab ends the
@@ -242,7 +237,7 @@ held by both is refused — `cl model <name> <id>` fails the same way
 `cl <name>` does, rather than guessing.
 
 The remembered model is applied at every launch path — `cl <name>`, `cl start`,
-the picker, and the tmux/cmux/iTerm variants of each. A session with no
+the picker, and the tmux/iTerm variants of each. A session with no
 remembered model launches exactly as it did before: no flag is added.
 
 It becomes `--model <id>` for Claude and `-m <id>` for Codex. If
@@ -325,7 +320,7 @@ it launched with; only a fresh launch upgrades).
     from whichever file survived: `cl stop` marks it resume-only when no handoff
     arrived or `--no-handoff` was used, and `cl start` obeys that.
   - A row is **consumed only once some process has confirmed the launch**. Where
-    `cl start` creates the session itself (tmux, cmux) it confirms it directly.
+    `cl start` creates the session itself (tmux) it confirms it directly.
     Where it opens an iTerm tab instead, the tab does the launching, so the row
     is cleared by that child once it has been granted ownership of the name —
     the same proof, and the same moment, that lets it claim the handoff. A row
@@ -502,13 +497,18 @@ title per session, skips any whose recorded working directory no longer exists,
 and dedupes by name. (An older `agent-name` record exists only for a subset of
 sessions, so it is deliberately **not** used — it would hide most named sessions.)
 
-## cmux sidebar
+## cmux is not supported
 
-If you use [cmux](https://cmux.com), `cmux/sidebars/sessions.swift` is a custom
-sidebar that groups your sessions by real activity (Active / Recent / Idle /
-Cold, with live ago-times and last-message previews) instead of cmux's built-in
-idle-timer "Needs input" label. See [cmux/sidebars/README.md](cmux/sidebars/README.md)
-for install and caveats.
+Earlier versions ran agents natively inside [cmux](https://cmux.com) and
+shipped a custom cmux sidebar. Both were **removed on 2026-10-20**: cmux added a
+second launch host to nearly every path that starts or stops a session, and that
+duplication had just produced a real bug — `cl start` exited from its cmux branch
+before re-arming the coordination lanes. Run `cl` from iTerm2 or any terminal
+with tmux. The full reasoning is in [DECISIONS.md](DECISIONS.md); the last
+version with cmux support is recoverable from git history.
+
+`install.sh --no-sidebars` is still accepted and ignored, so existing callers do
+not break.
 
 ## Requirements
 

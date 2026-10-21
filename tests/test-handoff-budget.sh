@@ -93,31 +93,30 @@ tb() { # <tmux-has-session-rc> <session_busy-rc> <pid> <claude_busy-rc>
 }
 check "a live tmux pane mid-task is busy"              "busy" "$(tb 0 0 '' 1)"
 check "…and an idle one is not"                        "idle" "$(tb 0 1 '' 1)"
-# The iTerm/cmux case: no tmux session, so the recorded pid is the only handle.
+# The iTerm case: no tmux session, so the recorded pid is the only handle.
 check "no tmux but a recorded pid mid-task is busy"    "busy" "$(tb 1 1 4242 0)"
 check "…and no pid at all is not busy, not an error"   "idle" "$(tb 1 1 '' 0)"
 
 echo "handoff_send_once picks ONE route and does not spray the prompt around"
-sd() { # <tmux-has-session-rc> <tmux-send-rc> <iterm-rc> <cmux-sfc>
+sd() { # <tmux-has-session-rc> <tmux-send-rc> <iterm-rc>
   (
     . "$LIB"
     HOME="$FIX/sendhome"
     eval "tmux() { case \"\$1\" in has-session) return $1 ;; esac; return 1; }"
     eval "send_text_tmux() { echo tmux >> '$FIX/route.log'; return $2 ; }"
     eval "send_text_iterm() { echo iterm >> '$FIX/route.log'; return $3 ; }"
-    eval "send_text_cmux() { echo cmux >> '$FIX/route.log'; return 0 ; }"
     handoff_send_once "N" "sid" "tname" "PROMPT" && echo sent || echo unreachable
   )
 }
-: > "$FIX/route.log"; check "a live tmux pane takes the tmux route" "sent" "$(sd 0 0 1 '')"
+: > "$FIX/route.log"; check "a live tmux pane takes the tmux route" "sent" "$(sd 0 0 1)"
 check "…and only that route"  "tmux" "$(sort -u "$FIX/route.log" | tr -d '\n')"
 # THE DELIBERATE NON-FALLTHROUGH. A live tmux session that refuses send-keys is
 # a broken pane, not an iTerm tab — typing a handoff request into some other
 # window is worse than reporting it unreachable.
-: > "$FIX/route.log"; check "a tmux pane that refuses the send is unreachable" "unreachable" "$(sd 0 1 0 '')"
+: > "$FIX/route.log"; check "a tmux pane that refuses the send is unreachable" "unreachable" "$(sd 0 1 0)"
 not_contains "…and the prompt is NOT then typed into iTerm" "$(cat "$FIX/route.log")" "iterm"
-: > "$FIX/route.log"; check "no tmux session falls through to iTerm" "sent" "$(sd 1 1 0 '')"
-: > "$FIX/route.log"; check "…and with neither, it reports unreachable" "unreachable" "$(sd 1 1 1 '')"
+: > "$FIX/route.log"; check "no tmux session falls through to iTerm" "sent" "$(sd 1 1 0)"
+: > "$FIX/route.log"; check "…and with neither, it reports unreachable" "unreachable" "$(sd 1 1 1)"
 
 echo "the probe's signal handling terminates rather than resuming"
 # ── WHY A TRAP THAT RETURNS IS NOT A TRAP ───────────────────────────────────
@@ -179,8 +178,8 @@ echo "run_bounded puts a ceiling on a send that would otherwise hang a stop"
 #
 # Codex's PR #19 review: "an unbounded backend call can still hold the stop
 # before the budget starts." Every route here talks to something that can wedge
-# — osascript waits on iTerm which waits on a GUI, tmux on its server, cmux on
-# its daemon — and macOS ships no coreutils `timeout`.
+# — osascript waits on iTerm which waits on a GUI, and tmux on its server —
+# and macOS ships no coreutils `timeout`.
 rb() { ( . "$LIB"; run_bounded "$@" >/dev/null 2>&1; echo $? ); }
 check "a command inside the limit returns its own status"  "0"   "$(rb 2 true)"
 check "…including a non-zero one"                          "3"   "$(rb 2 sh -c 'exit 3')"
@@ -243,7 +242,7 @@ hang() { # <seconds-limit>
     CL_HANDOFF_SEND_TIMEOUT="$1"
     eval "tmux() { case \"\$1\" in has-session) return 0 ;; esac; return 1; }"
     # `exec`, so the backgrounded process IS the sleep rather than a parent of
-    # it — which is how the real backends behave (osascript/tmux/cmux are the
+    # it — which is how the real backends behave (osascript/tmux are the
     # process run_bounded kills). A stub that forks leaves a grandchild holding
     # the captured stdout pipe, and the capture then blocks for the full 30s
     # even though the timeout fired correctly at 1s.

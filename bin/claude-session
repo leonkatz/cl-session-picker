@@ -16,7 +16,6 @@
 #                Ctrl-Z suspends the agent (no tmux keybind to swallow it).
 #                Recovery is `cl <name>`, which resumes by session id.
 #                CL_TMUX=1 restores the old tmux wrapping instead.
-#   in cmux    — as the pane's own process; cmux owns persistence/restore.
 #   elsewhere  — inside tmux when available (detach/reattach is the only
 #                persistence there), otherwise directly.
 #
@@ -48,10 +47,11 @@
 #                             #   --no-handoff skips the request AND clears any
 #                             #   pending handoff, so the session really does come
 #                             #   back as-is; --dry-run prints what would happen.
-#                             #   The whole stop shares one handoff budget
-#                             #   (CL_HANDOFF_BUDGET, default 300s). Asks before
-#                             #   killing anything still mid-task. Covers
-#                             #   cmux-native sessions too.
+#                             #   Every session is asked at once; each round
+#                             #   waits one shared CL_HANDOFF_TIMEOUT window
+#                             #   (180s) for all of them, and CL_HANDOFF_BUDGET
+#                             #   (300s) bounds the waiting across rounds. Asks
+#                             #   before killing anything still mid-task.
 #   claude-session handoff    # write THIS session's handoff by hand, from inside
 #                             #   it — the way out when a pane can't be reached.
 #                             #   Pipe the text in, or run it bare to be told
@@ -89,7 +89,7 @@
 #                             #   (claim -> commit, or roll back on refusal); a
 #                             #   session whose launch is refused keeps its row
 #                             #   and the command exits non-zero. Skips any
-#                             #   already live. In cmux: one workspace per session.
+#                             #   already live.
 #   claude-session start --fresh "Name" [--dry-run]
 #                             # hand off + retire ONE named session, then launch
 #                             #   a NEW claude under the SAME name/dir whose first
@@ -110,9 +110,8 @@
 #   claude-session restore    # restore state.json from the newest history
 #                             #   snapshot (add --list to pick; then run start)
 #
-# In cmux panes, sessions launch via `cmux claude-teams` so Agent Teams
-# teammates appear as native cmux splits. Set CL_TEAMS=0 to launch plain
-# `claude` instead. (Outside cmux this is always plain `claude`.)
+# cmux is NOT supported (removed 2026-10-20; see DECISIONS.md). Run cl from
+# iTerm or a plain terminal.
 
 PROJECTS="$HOME/.claude/projects"
 # Codex CLI storage. Both files are private implementation details of the Codex
@@ -213,8 +212,8 @@ CL_HANDOFF_ATTEMPTS="${CL_HANDOFF_ATTEMPTS:-3}"
 # halves are bounded.
 CL_HANDOFF_BUDGET="${CL_HANDOFF_BUDGET:-300}"
 # How long any ONE send may take before it is killed. Bounds the dispatch pass:
-# osascript waits on iTerm which waits on a GUI, tmux waits on its server, cmux
-# on its daemon — each can wedge, and an unbounded send is a `cl stop` that
+# osascript waits on iTerm which waits on a GUI, and tmux waits on its server —
+# either can wedge, and an unbounded send is a `cl stop` that
 # never returns. Generous, because a busy GUI is slow but not stuck.
 CL_HANDOFF_SEND_TIMEOUT="${CL_HANDOFF_SEND_TIMEOUT:-20}"
 # Record of session names started fresh, with the OLD session id, so a fresh
@@ -660,13 +659,13 @@ handoff_age_human() {
 # that lossy (found ".foo" and "_foo" both mapping to "_foo" — one session
 # could then overwrite another's handoff) and found that it let raw
 # control bytes (newline, CR, tab) straight through, which could re-open the
-# cmux early-submit/key-injection risk documented above send_text_cmux if a
-# name ever reached that path.
+# early-submit/key-injection risk of typing into a pane if a name ever reached
+# that path.
 #
 # Fixed with byte-wise percent-encoding, restricted to exactly the bytes that
 # are unsafe here: '/' (path traversal), '%' (so the encoding is unambiguous
 # to reverse), and C0 controls + DEL (0x00-0x1F, 0x7F — never let one of
-# these reach a filesystem path or a downstream terminal/AppleScript/cmux
+# these reach a filesystem path or a downstream terminal/AppleScript
 # argument as a raw byte). Every other byte, including multibyte UTF-8
 # glyphs, passes through unchanged — handoff dir filenames tolerate those fine.
 # This is injective (two different inputs can never encode to the same
@@ -853,7 +852,7 @@ reltime() {
   else echo "$((diff/86400))d ago"; fi
 }
 
-# tmux_name <name> [agent]: the tmux/cmux session identity. Codex sessions are
+# tmux_name <name> [agent]: the tmux session identity. Codex sessions are
 # prefixed so a Claude and a Codex session sharing a display name never share
 # a tmux session — `tmux new-session -A` would otherwise silently attach to
 # whichever agent got there first and drop the launch command on the floor.
@@ -862,67 +861,11 @@ tmux_name() {
   case "${2:-claude}" in codex) printf 'codex_%s' "$base" ;; *) printf '%s' "$base" ;; esac
 }
 
-# in_cmux: this shell is hosted by a cmux pane (cmux exports surface/workspace
-# ids into every terminal it spawns). In cmux mode cl skips tmux entirely —
-# cmux's Claude integration owns persistence/restore (quit cmux = save; relaunch
-# = resume by session id), so wrapping claude in tmux would only hide it from
-# cmux's lifecycle badges, Feed, and restore.
-# in_cmux: is this shell really a live cmux pane?
-#
-# Neither the environment nor "a cmux is running somewhere" is enough. A tmux
-# server started under cmux keeps CMUX_* in its GLOBAL environment and hands
-# them to every pane opened later — including panes opened from another
-# terminal long after that cmux context died. If cmux has since reopened, or a
-# second instance is running, "an app exists" makes those stale ids look
-# authoritative and routes an iTerm launch down the cmux branch: no tab tag, no
-# claim, and commands aimed at a surface that no longer exists.
-#
-# So ask cmux to affirm THIS shell's identity — the workspace id must appear in
-# the live instance's own workspace list. If it cannot be affirmed (cmux gone,
-# cmux restarted, ids belonging to some other context) the environment is
-# stale, and the normal host path is taken. The launch paths also strip CMUX_*
-# before exec, so nothing downstream inherits the lie.
-#
-# Surfaces cannot be checked this way — cmux lists them by ref, not by uuid —
-# so a pane carrying only CMUX_SURFACE_ID counts as unaffirmed, which is the
-# safe direction.
-#
-# Memoised: it shells out, and it is consulted on every launch decision.
-in_cmux() {
-  case "${_CL_IN_CMUX:-}" in yes) return 0 ;; no) return 1 ;; esac
-  _CL_IN_CMUX=no
-  [ -n "${CMUX_WORKSPACE_ID:-}" ] || return 1
-  command -v cmux >/dev/null 2>&1 || return 1
-  # Structural, exact comparison against the `.workspaces[].id` field. A
-  # substring test over the raw JSON is not affirmation: the id `workspace`
-  # matches a live `a-real-live-workspace`, and an id can match a title,
-  # directory or any other value in the document. jq is already this tool's
-  # dependency for stop/start; if it or the command or the schema is missing,
-  # the context is simply unaffirmed — the safe direction.
-  command -v jq >/dev/null 2>&1 || return 1
-  if cmux workspace list --json 2>/dev/null \
-     | jq -e --arg id "$CMUX_WORKSPACE_ID" \
-         'any((.workspaces // [])[]?; (.id // "") == $id)' >/dev/null 2>&1; then
-    _CL_IN_CMUX=yes; return 0
-  fi
-  return 1
-}
-
-# drop_cmux_env: strip inherited CMUX_* before exec'ing an agent outside cmux.
-# Otherwise the agent — and cmux's own Claude hooks, which fire on every tool
-# call — believe they are inside cmux and dial a socket that is not there.
-drop_cmux_env() {
-  local v
-  for v in $(env | sed -n 's/^\(CMUX_[A-Za-z0-9_]*\)=.*/\1/p'); do
-    unset "$v" 2>/dev/null
-  done
-}
-
 # in_iterm: this shell is hosted by iTerm2 itself. Distinct from iterm_running:
-# "iTerm is open somewhere" is the wrong gate for OPENING tabs — with cmux in
-# the picture it would open tabs in a terminal the user isn't looking at.
-# (iterm_running stays correct for CLOSING previously-tagged iTerm tabs.)
-in_iterm() { ! in_cmux && [ "${TERM_PROGRAM:-}" = "iTerm.app" ]; }
+# "iTerm is open somewhere" is the wrong gate for OPENING tabs — it would open
+# them in a terminal the user isn't looking at. (iterm_running stays correct for
+# CLOSING previously-tagged iTerm tabs.)
+in_iterm() { [ "${TERM_PROGRAM:-}" = "iTerm.app" ]; }
 
 # use_tmux: should this launch be wrapped in tmux?
 #
@@ -930,50 +873,50 @@ in_iterm() { ! in_cmux && [ "${TERM_PROGRAM:-}" = "iTerm.app" ]; }
 # profile triggers key on the tab's foreground job name, and whose status hooks
 # locate the tab from the agent's tty. Wrapped in tmux the job is `tmux` and the
 # tty is a tmux pty, so neither can find the tab — the integration silently does
-# nothing. Running the agent as the tab's own process is what makes it work,
-# which is the same reason the cmux path skips tmux (cmux owns persistence
-# there). CL_TMUX=1 opts back in, trading the integration for detach/reattach.
+# nothing. Running the agent as the tab's own process is what makes it work.
+# CL_TMUX=1 opts back in, trading the integration for detach/reattach.
 #
 # Outside iTerm (Terminal.app, ssh, other emulators) nothing changes: tmux when
 # it is available, because there detach/reattach is the only persistence there is.
 use_tmux() {
   command -v tmux >/dev/null 2>&1 || return 1
-  in_cmux && return 1   # cmux owns persistence; never nest tmux inside it
   if in_iterm; then [ "${CL_TMUX:-0}" = "1" ]; else return 0; fi
 }
 
-# claude_cmd: the command used to start claude in a cmux pane. Defaults to
-# `cmux claude-teams`, which deploys cmux's fake-tmux shim so Agent Teams
-# teammates render as native cmux splits — the teams *feature* comes from
-# CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS in ~/.claude/settings.json; without the
-# shim teammates run headless. CL_TEAMS=0 opts out (e.g. a cmux build without
-# the claude-teams subcommand). Outside cmux this is always plain `claude`:
-# the shim must not be nested inside real tmux, where teams uses real panes.
-claude_cmd() {
-  if in_cmux && [ "${CL_TEAMS:-1}" != "0" ] && command -v cmux >/dev/null 2>&1; then
-    printf 'cmux claude-teams'
-  else
-    printf 'claude'
-  fi
+# drop_cmux_env: strip every inherited CMUX_* before handing control to an
+# agent. ALWAYS — there is no cmux host any more, so every launch is a non-cmux
+# launch.
+#
+# ── WHY THIS SURVIVED REMOVING cmux ─────────────────────────────────────────
+#
+# It was never only a cmux-host feature; it protects the two hosts that remain.
+# A tmux server first started under cmux keeps CMUX_* in its GLOBAL environment
+# and hands them to every pane opened later — including panes opened from iTerm
+# long after that cmux context died. cmux's own Claude hooks read those ids and
+# dial a dead or wrong socket on every tool call. Removing the scrub along with
+# the cmux branches regressed iTerm and tmux launches, which the first cut of
+# this removal did; Codex's PR #21 review caught it.
+#
+# Removing cmux as a host makes the rule simpler, not unnecessary: the old code
+# had to decide whether this shell was a live cmux pane before scrubbing, and
+# now the answer is always no.
+drop_cmux_env() {
+  local v
+  for v in $(env | sed -n 's/^\(CMUX_[A-Za-z0-9_]*\)=.*/\1/p'); do
+    unset "$v" 2>/dev/null
+  done
 }
 
-# codex_cmd: the command used to start codex in a cmux pane. `cmux codex-teams`
-# is cmux's Codex analog of claude-teams; it is probed (not assumed) because
-# cmux builds differ. CL_TEAMS=0 opts out, same switch as for claude. Outside
-# cmux, plain `codex`.
-codex_cmd() {
-  if in_cmux && [ "${CL_TEAMS:-1}" != "0" ] && command -v cmux >/dev/null 2>&1 \
-     && cmux --help 2>/dev/null | grep -q 'codex-teams'; then
-    printf 'cmux codex-teams'
-  else
-    printf 'codex'
-  fi
-}
+# claude_cmd / codex_cmd: the one place each agent's binary name lives, so the
+# launch paths never spell it themselves. They once chose a cmux wrapper
+# (`cmux claude-teams`); cmux support was removed 2026-10-20 — see DECISIONS.md.
+claude_cmd() { printf 'claude'; }
+codex_cmd()  { printf 'codex'; }
 
 # Codex launch policy. cl adds NO approval/sandbox flag of its own: codex's
 # configured defaults apply, exactly as if the user had typed `codex resume`.
 # CL_CODEX_ARGS is purely additive and is TRUSTED SHELL SYNTAX — it is spliced
-# into the tmux/cmux command string verbatim, so quote it as you would on a
+# into the tmux command string verbatim, so quote it as you would on a
 # command line (e.g. CL_CODEX_ARGS='-m gpt-5 --approve-for-me'). It is placed
 # BEFORE the subcommand (`codex <args> resume <id>`): these are top-level
 # options, and some Codex builds reject them after `resume` while every build
@@ -986,7 +929,7 @@ codex_args() { printf '%s' "${CL_CODEX_ARGS:-}"; }
 
 # --- per-session model -------------------------------------------------------
 # A remembered model is spliced into shell command strings (tmux's command
-# argument, cmux --command, and the exec paths), so it is validated on the way
+# argument and the exec paths), so it is validated on the way
 # IN and quoted on the way out. The charset allows what real model identifiers
 # use — letters, digits, dot, underscore, hyphen, colon, slash, so both a plain
 # id and a fully qualified cloud resource name pass — plus SQUARE BRACKETS, for
@@ -1012,7 +955,7 @@ valid_model() {
     #
     # Safe because every consumer goes through model_flag, which applies
     # `printf '%q'`, and the result always lands in a shell command STRING that
-    # tmux/cmux/sh then evaluates — there is no path that takes the escaped form
+    # tmux/sh then evaluates — there is no path that takes the escaped form
     # as a literal argv element. Widening this without that single choke point
     # would be a glob-injection.
     #
@@ -1662,7 +1605,7 @@ do_model() {
 }
 
 # resume_cmd <agent> <sid>: the shell command string that resumes a session.
-# Used verbatim as a tmux/cmux pane command; for exec paths the same words
+# Used verbatim as a tmux pane command; for exec paths the same words
 # are re-split by the caller.
 # A third argument supplies the session NAME, which is what a remembered model
 # is keyed by; without it the command is built exactly as before.
@@ -1679,7 +1622,7 @@ resume_cmd() {
 # without being told. It reaches the agent two different ways, because the two
 # launch shapes are genuinely different:
 #
-#   pane command  — tmux/cmux run the command string in a NEW shell that does
+#   pane command  — tmux runs the command string in a NEW shell that does
 #                   not inherit this one's environment, so the assignment has
 #                   to be part of the string. That is env_prefix.
 #   exec          — `exec VAR=x cmd` is not valid shell (exec would take the
@@ -1702,7 +1645,7 @@ env_prefix() {
 # fresh_cmd <name> <initial_prompt>: the shell command string that starts a NEW
 # claude registered under an EXISTING name, with the prompt as its first
 # message. The twin of resume_cmd, and for the same reason: `cl start` has to
-# put this into a detached tmux pane or a cmux workspace, where it cannot exec.
+# put this into a detached tmux pane, where it cannot exec.
 # launch_fresh builds its command from here too, so the two cannot drift.
 # _agent_runnable: is the configured agent actually launchable? claude_cmd can
 # be a wrapper with arguments, so only its first word is a command to resolve.
@@ -1718,9 +1661,9 @@ fresh_cmd() {
 }
 
 # session_pid <sid> [agent]: pid of a local process that resumed this session,
-# if any. Guards cmux mode against double --resume of one session (two
-# processes on the same transcript) — the hazard tmux's attach-don't-duplicate
-# used to prevent.
+# if any. Guards the bare (non-tmux) path against double --resume of one
+# session — two processes on the same transcript — the hazard tmux's
+# attach-don't-duplicate prevents on the tmux path.
 #
 # For codex this is a "matching local resume process" marker, NOT proof the
 # thread is live or idle: Codex also runs threads through a shared app-server
@@ -2119,8 +2062,8 @@ session_pid() { # sid [agent] [name]
 # get Ctrl-Z so job control works in normal panes. Applied here rather than
 # ~/.tmux.conf so cl is self-contained on any machine.
 # agent_hint <agent>: the substring a process running this agent must contain.
-# Deliberately loose — it has to match `claude`, `cmux claude-teams`, `codex`
-# and `cmux codex-teams` alike. It is a check that the pid is still the KIND of
+# Deliberately loose — it matches `claude` and `codex` however they were
+# wrapped. It is a check that the pid is still the KIND of
 # thing we launched, never a way to find a process.
 agent_hint() { case "$1" in codex) printf 'codex' ;; *) printf 'claude' ;; esac; }
 
@@ -2252,15 +2195,13 @@ tmux_setup() {
   tmux set -g allow-passthrough on 2>/dev/null
   tmux set -s extended-keys on 2>/dev/null
   tmux set -as terminal-features 'xterm*:extkeys' 2>/dev/null
-  # The server outlives the cmux session that started it and keeps CMUX_* in
-  # its global environment, so every later pane inherits them. Clear them when
-  # this launch is not in cmux, or those panes keep failing at a dead socket.
-  if ! in_cmux; then
-    local _v
-    for _v in $(tmux show-environment -g 2>/dev/null | sed -n 's/^\(CMUX_[A-Za-z0-9_]*\)=.*/\1/p'); do
-      tmux set-environment -gu "$_v" 2>/dev/null
-    done
-  fi
+  # The server outlives the cmux context that may have started it and keeps
+  # CMUX_* in its GLOBAL environment, so every later pane would inherit them.
+  # Unconditional now: no launch is a cmux launch. See drop_cmux_env.
+  local _v
+  for _v in $(tmux show-environment -g 2>/dev/null | sed -n 's/^\(CMUX_[A-Za-z0-9_]*\)=.*/\1/p'); do
+    tmux set-environment -gu "$_v" 2>/dev/null
+  done
 }
 
 # iterm_running: true when iTerm2 is actually running. Env vars are unreliable
@@ -2323,18 +2264,9 @@ launch_session() { # name sid cwd [agent]
   # because the tmux server's own environment is whatever it was started with.
   export CL_SESSION_NAME="$name" CL_SESSION_ID="$sid"
   # `tmux new-session -A` attaches instead of duplicating; nothing does that
-  # for us otherwise, so a second launch has to be refused here. cmux keeps the
-  # plain check (it owns its own workspace lifecycle); the bare path below uses
-  # the atomic claim, because there two tabs really can race.
-  if in_cmux; then
-    pid=$(session_pid "$sid" "$agent" "$name")
-    if [ -n "$pid" ]; then
-      echo "\"$name\" already has a local process resuming it (pid $pid) — switch to its tab instead of resuming it twice." >&2
-      exit 1
-    fi
-    cmux rename-tab "$name" >/dev/null 2>&1
-    cd "$cwd" || exit 1; eval "exec $cmd"
-  fi
+  # for us otherwise, so a second launch has to be refused here — the bare path
+  # below uses the atomic claim, because there two tabs really can race.
+  #
   # The iTerm tab is tagged in BOTH branches: `cl stop` closes tabs by that
   # user variable, and that has nothing to do with tmux.
   in_iterm && tag_iterm_session "$t"
@@ -2364,9 +2296,6 @@ launch_new() { # cwd [agent]
     codex) cmd="$(codex_cmd) $(codex_args)" ;;
     *)     cmd="$(claude_cmd) --dangerously-skip-permissions" ;;
   esac
-  if in_cmux; then
-    cd "$cwd" || exit 1; eval "exec $cmd"
-  fi
   t="$agent-$(basename "$cwd")"
   if use_tmux; then
     tmux_setup
@@ -2381,7 +2310,7 @@ launch_new() { # cwd [agent]
 #   claude: `claude --name` sets the title at launch, so discovery finds it
 #           immediately.
 #   codex:  there is NO launch-time name flag. The name labels the tmux
-#           session / cmux tab only; the thread is unnamed (and invisible to
+#           session only; the thread is unnamed (and invisible to
 #           `cl --list`) until the user runs /rename inside codex. Said so
 #           on screen rather than pretended.
 # agent_cmd_word <agent>: the first word of the command that launches it —
@@ -2430,12 +2359,6 @@ launch_named() { # name cwd [agent]
       "$( [ -n "${CL_PENDING_MODEL:-}" ] && printf ', and --model was not stored' )" >&2
     exit 1
   fi
-  if in_cmux; then
-    cmux rename-tab "$name" >/dev/null 2>&1
-    cd "$cwd" || exit 1
-    commit_pending_model "$agent" "$name"
-    eval "exec $cmd"
-  fi
   t=$(tmux_name "$name" "$agent")
   in_iterm && tag_iterm_session "$t"
   if use_tmux; then
@@ -2450,9 +2373,9 @@ launch_named() { # name cwd [agent]
     elif [ "$arc" -ne 0 ]; then
       exit 1
     fi
-    drop_cmux_env; cd "$cwd" || exit 1
+    cd "$cwd" || exit 1
     commit_pending_model "$agent" "$name"
-    eval "exec $cmd"
+    drop_cmux_env; eval "exec $cmd"
   fi
 }
 
@@ -2510,11 +2433,6 @@ launch_fresh() {
     [ -n "$claim" ] && rollback_claim "$root" "$name" "$claim"
     echo "claude-session: cannot enter $cwd — not starting fresh" >&2
     exit 1
-  fi
-  if in_cmux; then
-    cmux rename-tab "$name" >/dev/null 2>&1
-    [ -n "$claim" ] && commit_claim "$root" "$name" "$claim" "rotating now"
-    eval "exec $cmd"
   fi
   t=$(tmux_name "$name" claude)
   in_iterm && tag_iterm_session "$t"
@@ -2621,18 +2539,6 @@ do_new() {
     *)     cmd="$(claude_cmd) --name $qname --dangerously-skip-permissions$mf" ;;
   esac
 
-  if in_cmux; then
-    if [ -t 1 ] && [ -t 0 ]; then
-      launch_named "$name" "$cwd" "$agent"
-    else
-      # no TTY (script / Claude Bash call): open a fresh cmux workspace so the
-      # caller isn't blocked, mirroring the detached-tmux path below.
-      cmux new-workspace --name "$name" --cwd "$cwd" --command "$cmd" >/dev/null \
-        && { remember_model; echo "created cmux workspace '$name' in $cwd"; }
-    fi
-    exit 0
-  fi
-
   if [ -t 1 ] && [ -t 0 ]; then
     # interactive: create + attach, like the picker
     launch_named "$name" "$cwd" "$agent"
@@ -2665,7 +2571,7 @@ do_new() {
 
 # claude_busy <pid>: 0 (true) if that claude process looks mid-task — a
 # caffeinate child, or CPU over ~15%. Works on any claude pid (tmux pane or
-# cmux pane); the terminal doesn't matter, only the process tree does.
+# bare tab); the terminal doesn't matter, only the process tree does.
 claude_busy() {
   local pid="$1" kid cmd cpu
   [ -n "$pid" ] || return 1
@@ -2713,37 +2619,8 @@ handoff_target_busy() {
   claude_busy "$pid"
 }
 
-# close_cmux_surface <sid> [display_name]: best-effort close of the cmux surface
-# hosting this session, looked up in cmux's own session store. Called after the
-# claude is dead, so the surface holds nothing but a bare shell.
-#
-# The gate is "is cmux installed", NOT in_cmux. `cl stop` is routinely run from
-# iTerm or a plain terminal while cmux surfaces are alive elsewhere, and gating
-# on in_cmux made this a no-op exactly then — leaving every cmux workspace
-# holding an orphaned shell. Whether a surface exists is already answered by the
-# session store, not by where the operator happens to be typing.
-close_cmux_surface() {
-  local sid="$1" name="${2:-$1}" sfc
-  local store="$HOME/.cmuxterm/claude-hook-sessions.json"
-  command -v cmux >/dev/null 2>&1 || return 0
-  [ -r "$store" ] || return 0
-  if ! command -v jq >/dev/null 2>&1; then
-    printf '⚠ left cmux workspace for "%s" open — jq is needed to read the surface id\n' "$name" >&2
-    return 0
-  fi
-  sfc=$(jq -r --arg sid "$sid" '.sessions[$sid].surfaceId // empty' "$store" 2>/dev/null)
-  # No recorded surface means cmux never hosted this session: there is nothing to
-  # close, and `--surface ""` would close the operator's OWN pane. Stay silent —
-  # warning here would fire on every plain tmux session.
-  [ -n "$sfc" ] || return 0
-  if ! cmux close-surface --surface "$sfc" >/dev/null 2>&1; then
-    printf '⚠ left cmux workspace for "%s" open — cmux close-surface %s failed\n' "$name" "$sfc" >&2
-  fi
-  return 0
-}
-
 # retire_session <name> <sid> <tmux_name> <close_tabs> [agent]: kill the live
-# session identified by these — tmux-hosted, cmux-native, or bare — the ONE
+# session identified by these — tmux-hosted or bare — the ONE
 # way, for every caller and BOTH agents. `do_stop`, `do_fresh_start` and the
 # Codex stop path need this exact logic; it used to be duplicated, and the
 # duplicate in `do_fresh_start` had silently dropped the hidden-tmux ownership
@@ -2790,16 +2667,14 @@ retire_session() {
     if tmux kill-session -t "=${t}" 2>/dev/null; then
       printf '✓ killed %s\n' "$name" >&2
       [ "$close_tabs" = "1" ] && close_iterm_tab "$t"
-      close_cmux_surface "$sid" "$name"
       return 0
     fi
     printf '⚠ tmux kill-session failed for "%s" — leaving it registered\n' "$name" >&2
     return 2
   fi
 
-  # No tmux session — a cmux-native (or bare) agent: kill the process itself,
-  # the SAME way do_stop always has (SIGTERM, then close the now-bare surface
-  # best-effort).
+  # No tmux session — a bare agent: kill the process itself, the SAME way
+  # do_stop always has (SIGTERM).
   #
   # The handle differs by agent, and for Codex it is deliberately narrower:
   # only a process THIS tool launched and still recognises. Everything else —
@@ -2866,11 +2741,9 @@ retire_session() {
        printf '✓ killed %s\n' "$name" >&2
        clear_launch "$name" "$agent" "$pid" "$ptok"
        [ "$close_tabs" = "1" ] && close_iterm_tab "$t"
-       close_cmux_surface "$sid" "$name"
        return 0 ;;
     2) printf '✓ signalled %s — still shutting down, leaving it registered\n' "$name" >&2
        [ "$close_tabs" = "1" ] && close_iterm_tab "$t"
-       close_cmux_surface "$sid" "$name"
        return 2 ;;
     3) # retire_process checked the command line BEFORE signalling: this pid is
        # running something else now, so our session is gone and nothing of ours
@@ -2902,7 +2775,7 @@ retire_session() {
 # context; `cl` never does. The mechanism is "type into the
 # pane", the same trust boundary `cl` already crosses for close_iterm_tab/
 # open_iterm_tabs: a literal, single-line instruction (no embedded newlines, so
-# there is no multi-line-paste/early-submit ambiguity across tmux/iTerm/cmux),
+# there is no multi-line-paste/early-submit ambiguity across tmux/iTerm),
 # sent as if a person typed it, then Enter. `cl` never reads the pane back
 # (claude's TUI is on the alt-screen, same reason session_busy exists) — it
 # polls for the handoff FILE to appear, which is the one observable outcome
@@ -2923,8 +2796,7 @@ retire_session() {
 # Two rules govern everything below.
 #
 # ONE LITERAL LINE. The text is typed into a live agent's pane. A newline
-# submits it; under cmux a carriage return does too, and a tab is a real Tab
-# keystroke. So every C0 control and DEL is folded to a space AFTER placeholder
+# submits it, a carriage return does too, and a tab is a real Tab keystroke. So every C0 control and DEL is folded to a space AFTER placeholder
 # expansion — flattening only the template would miss a CRLF file (tr removes
 # the LF and leaves the CR) and would not touch a session name or a configured
 # path that carries one.
@@ -3068,7 +2940,7 @@ send_text_tmux() {
 #
 # Both halves are therefore load-bearing: CR because LF does not submit, and
 # the pause because a long line needs the CR to arrive separately. The delay is
-# the same reason send_text_cmux keeps its Enter as its own `send-key` call.
+# the same reason send_text_tmux sends Enter as its own `send-keys` call.
 #
 # WHY IT WAS NOT CAUGHT EARLIER, since the lesson is the point: a tmux probe on
 # 2026-10-08 sent 427 characters followed immediately by Enter and submitted
@@ -3104,29 +2976,12 @@ OSA
   [ "$found" = "yes" ]
 }
 
-# send_text_cmux <surface_id> <text>: best-effort text injection into a cmux
-# surface, via cmux's real `send`/`send-key` contract (confirmed against an
-# installed cmux build, 2026-09-23 — an earlier version of this function
-# probed for a nonexistent `send-text` subcommand and always fell back). `cmux
-# send` treats a literal \n/\r/\t IN THE TEXT as Enter/Tab, which would let a
-# path or name containing those bytes submit early or inject a stray
-# keystroke — so Enter is sent as its own `send-key enter` afterward, never
-# folded into the text. Still probed, not assumed: cmux builds differ, and a
-# build without `send` at all falls back to "unsupported" rather than guessing.
-send_text_cmux() {
-  command -v cmux >/dev/null 2>&1 || return 1
-  cmux --help 2>/dev/null | grep -qE '^\s*send\s' || return 1
-  cmux send --surface "$1" -- "$2" >/dev/null 2>&1 \
-    && cmux send-key --surface "$1" -- enter >/dev/null 2>&1
-}
-
 # run_bounded <seconds> <command...>: run it, kill it if it outlives the limit.
 # 124 on timeout, otherwise the command's own status.
 #
 # macOS ships no coreutils `timeout`, and this cannot be left unbounded: every
 # backend here talks to something that can wedge. `osascript` waits on iTerm,
-# which waits on a GUI; `tmux send-keys` waits on a server; `cmux send` waits on
-# a daemon. Codex's PR #19 review put it exactly right — one blocked backend
+# which waits on a GUI; `tmux send-keys` waits on a server. Codex's PR #19 review put it exactly right — one blocked backend
 # could hold `cl stop` indefinitely, before any budget accounting began.
 #
 # `wait` on a killed child reports the signal, so the timeout status is returned
@@ -3137,8 +2992,8 @@ send_text_cmux() {
 # The first version killed `$!` only, and documented that as sufficient
 # "because the backends here ARE the process being killed". That was WRONG, and
 # Codex's PR #19 review proved it: every backend is a shell FUNCTION
-# (send_text_tmux, send_text_iterm, send_text_cmux), so backgrounding it makes
-# `$!` a SUBSHELL and the real osascript/tmux/cmux is its child. Killing the
+# (send_text_tmux, send_text_iterm), so backgrounding it makes `$!` a
+# SUBSHELL and the real osascript/tmux is its child. Killing the
 # subshell left the backend running while this printed "killed it" — a false
 # message, and an orphan that can go on holding a caller's pipe.
 #
@@ -3194,7 +3049,7 @@ run_bounded() {
 # iTerm tab, and typing a handoff request into some other window is worse than
 # reporting it unreachable.
 handoff_send_once() {
-  local name="$1" sid="$2" t="$3" prompt="$4" store sfc rc
+  local name="$1" sid="$2" t="$3" prompt="$4" rc
   # EVERY route is bounded. A send that hangs is not a slow send, it is a stop
   # that never finishes, and the operator cannot tell the two apart from a dark
   # terminal. The timeout is reported per route so a wedged backend names itself.
@@ -3206,15 +3061,6 @@ handoff_send_once() {
     run_bounded "${CL_HANDOFF_SEND_TIMEOUT:-20}" send_text_iterm "$t" "$prompt"; rc=$?
     [ "$rc" = "124" ] && printf '⚠ the iTerm send for "%s" was still running after %ss — killed it\n' "$name" "${CL_HANDOFF_SEND_TIMEOUT:-20}" >&2
     [ "$rc" = "0" ] && return 0
-    store="$HOME/.cmuxterm/claude-hook-sessions.json"
-    if command -v jq >/dev/null 2>&1 && [ -r "$store" ]; then
-      sfc=$(jq -r --arg sid "$sid" '.sessions[$sid].surfaceId // empty' "$store" 2>/dev/null)
-      if [ -n "$sfc" ]; then
-        run_bounded "${CL_HANDOFF_SEND_TIMEOUT:-20}" send_text_cmux "$sfc" "$prompt"; rc=$?
-        [ "$rc" = "124" ] && printf '⚠ the cmux send for "%s" was still running after %ss — killed it\n' "$name" "${CL_HANDOFF_SEND_TIMEOUT:-20}" >&2
-        [ "$rc" = "0" ] && return 0
-      fi
-    fi
   fi
   return 1
 }
@@ -3268,7 +3114,7 @@ request_handoff() {
   # the real path first, so `cl stop --dry-run` could still create
   # handoff dir/fallback directories.)
   if [ "$dry" = "--dry-run" ]; then
-    printf '[dry-run] would ask "%s" to write handoff to %s (via %s)\n' "$name" "$(handoff_path_preview "$name")" "$( [ -n "$t" ] && tmux has-session -t "=${t}" 2>/dev/null && echo tmux || echo 'iterm/cmux' )" >&2
+    printf '[dry-run] would ask "%s" to write handoff to %s (via %s)\n' "$name" "$(handoff_path_preview "$name")" "$( [ -n "$t" ] && tmux has-session -t "=${t}" 2>/dev/null && echo tmux || echo iterm )" >&2
     return 3
   fi
 
@@ -3333,7 +3179,7 @@ request_handoff() {
       # it as "could not even ask" on the first attempt rather than burning the
       # remaining attempts sending into nothing.
       if [ "$sent" != "1" ]; then
-        printf 'ℹ no reachable pane to hand off "%s" (not tmux, not a tagged iTerm tab, no cmux text-injection)\n' "$name" >&2
+        printf 'ℹ no reachable pane to hand off "%s" (not tmux, not a tagged iTerm tab)\n' "$name" >&2
         return 1
       fi
     else
@@ -3693,7 +3539,7 @@ do_stop() {
       # `cl stop --dry-run` could still create handoff directories.)
       printf '[dry-run] would ask "%s" to write handoff to %s (via %s)\n' \
         "${_h_name[$i]}" "$(handoff_path_preview "${_h_name[$i]}")" \
-        "$( [ -n "${_h_tmux[$i]}" ] && tmux has-session -t "=${_h_tmux[$i]}" 2>/dev/null && echo tmux || echo 'iterm/cmux' )" >&2
+        "$( [ -n "${_h_tmux[$i]}" ] && tmux has-session -t "=${_h_tmux[$i]}" 2>/dev/null && echo tmux || echo iterm )" >&2
       continue
     fi
     if [ -z "$_CL_STOP_ROOT" ]; then _h_state[$i]="unreachable"; continue; fi
@@ -3713,7 +3559,7 @@ do_stop() {
     else
       # Unreachable is not a timing problem, so retrying cannot fix it — report
       # it as "could not even ask" rather than re-sending into nothing.
-      printf 'ℹ no reachable pane to hand off "%s" (not tmux, not a tagged iTerm tab, no cmux text-injection)\n' \
+      printf 'ℹ no reachable pane to hand off "%s" (not tmux, not a tagged iTerm tab)\n' \
         "${_h_name[$i]}" >&2
       _h_state[$i]="unreachable"
     fi
@@ -3877,7 +3723,7 @@ do_stop() {
         n_handoffs=$((n_handoffs+1))
       fi
     fi
-    # retire_session covers both branches (tmux-hosted and cmux/bare process)
+    # retire_session covers both branches (tmux-hosted and bare process)
     # with the busy-check-and-prompt, tab/surface cleanup, the hidden-tmux
     # ownership guard, and the Codex ownership rules — do_stop just runs it and
     # moves on; its return value changes nothing here (a lost race, a decline,
@@ -4089,64 +3935,6 @@ do_start() {
   # here as much as it does during a stop.
   handoff_root >/dev/null && root="$_CL_HANDOFF_ROOT"
   [ -n "$root" ] || echo "claude-session: no usable handoff store — resuming every session as-is (no rotation)" >&2
-
-  if in_cmux; then
-    # cmux mode: one workspace per saved session, claude resumed tmux-free so
-    # cmux's integration owns it. --focus false so eight restores don't fight
-    # over focus. Live sessions (either kind) are left alone.
-    local name sid cwd agent ronly i=0 claim cmd rsid_env refused=0 _kept
-    _kept="$STATE.kept.$$"; : > "$_kept"
-    while IFS=$'\t' read -r name sid cwd agent ronly; do
-      agent="${agent:-claude}"
-      if agent_live "$agent" "$sid" "$name"; then
-        printf '● %s already live\n' "$name"
-        printf '%s\t%s\n' "$agent" "$name" >> "$_kept"
-      else
-        [ -d "$cwd" ] || cwd="$HOME"
-        claim=""; rsid_env=""
-        # Rotation is Claude-only: a Codex row has no handoff mechanism, so it
-        # resumes as itself and never consults the store.
-        if [ "$agent" != "claude" ]; then
-          rsid_env="$sid"; cmd=$(resume_cmd "$agent" "$sid" "$name")
-        # The saved row wins over whatever file happens to be present: this
-        # cycle was explicitly decided to resume.
-        elif [ "$ronly" = "true" ]; then
-          [ -n "$root" ] && [ -f "$(handoff_path "$root" "$name")" ] \
-            && consume_handoff "$root" "$name" "this cycle was recorded resume-only" >/dev/null
-          rsid_env="$sid"; cmd=$(resume_cmd claude "$sid" "$name")
-        elif claim=$(claim_handoff "$root" "$name" "$sid"); then
-          cmd=$(fresh_cmd "$name" "$(build_resume_prompt "$claim")")
-        else
-          claim=""; rsid_env="$sid"; cmd=$(resume_cmd claude "$sid" "$name")
-        fi
-        # A row is consumed only when its session actually exists. A failed
-        # create that vanished from the list was a session lost to a best-effort
-        # archive nobody knows to look in.
-        if cmux new-workspace --name "$name" --cwd "$cwd" --focus false \
-             --command "$(env_prefix "$name" "$rsid_env")$cmd" >/dev/null; then
-          if [ -n "$claim" ]; then
-            record_fresh_history "$name" "$sid" "$cwd"
-            commit_claim "$root" "$name" "$claim" "rotating on start"
-          fi
-          printf '✓ opened %s  (%s)\n' "$name" "$cwd"; i=$((i+1))
-        else
-          # The workspace was refused, so nothing was started: put the handoff
-          # back and keep the row, so a re-run behaves exactly as this one
-          # should have.
-          [ -n "$claim" ] && rollback_claim "$root" "$name" "$claim"
-          printf '⚠ could not open %s — keeping it for the next start\n' "$name" >&2
-          printf '%s\t%s\n' "$agent" "$name" >> "$_kept"
-          refused=1
-        fi
-      fi
-    done < <(jq -r '.[] | [.name, .sid, .cwd, (.agent // "claude"), (.resume_only // false)] | @tsv' "$STATE")
-    consume_state "$(cat "$_kept")"; rm -f "$_kept"
-    printf '\nopened %s cmux workspace(s).\n' "$i"
-    # Non-zero only for a REFUSED launch. An already-live session is a skip, not
-    # a failure, and must not make `cl start` look like it failed.
-    [ "$refused" = "1" ] && exit 1
-    exit 0
-  fi
 
   # 1. Ensure each session's tmux exists (detached). `cl <name>` in each tab
   #    then attaches it. Creating here (not relying on the tab) means a failed
@@ -4424,7 +4212,7 @@ EOF
   fi
 
   # 2. Retire it — the SAME safety-sensitive logic `cl stop` uses (tmux vs
-  #    cmux/bare, the hidden-tmux ownership guard, busy-check prompts).
+  #    bare, the hidden-tmux ownership guard, busy-check prompts).
   #    A failed or declined RETIREMENT must also fail closed: launching a
   #    second claude under this name while the first is still alive
   #    (declined kill, still shutting down, or the kill itself failed) is

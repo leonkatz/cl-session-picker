@@ -130,8 +130,8 @@ closing that would need the replacement to acknowledge, which nothing here does.
 replacement elsewhere points it at the wrong repository while handing it notes
 about a different one. A plain launch may still fall back; a rotation will not.
 
-Where the launch *is* synchronous — a detached tmux session, a cmux workspace —
-the launching process sees the backend answer. For tmux that means **creating**
+Where the launch *is* synchronous — a detached tmux session — the launching
+process sees the backend answer. For tmux that means **creating**
 and then attaching, never `new-session -A`: `-A` attaches to an existing session
 of the same name and returns success *without running the fresh-agent command*,
 so committing before it answered would spend a handoff on a replacement that
@@ -198,8 +198,8 @@ The session writes the handoff, not `cl`: the session has the context and `cl`
 never does. The mechanism is to **type an instruction into the pane**, the same
 trust boundary `cl` already crosses for `close_iterm_tab` and
 `open_iterm_tabs`: one literal, single-line instruction sent as if a person had
-typed it, then Enter. It works under tmux (`send-keys -l`), a tagged iTerm tab
-(`write text`), and cmux (`send` plus a separate `send-key enter`).
+typed it, then Enter. It works under tmux (`send-keys -l`) and a tagged iTerm
+tab (`write text`).
 
 `cl` never reads the pane back. The agent's TUI runs on the alternate screen
 buffer, so `capture-pane` cannot see it — the same reason `session_busy`
@@ -262,7 +262,7 @@ reintroduce the fault this replaced — sessions never asked at all. What a
 runaway dispatch must not do is hang the stop, and that is a separate setting's
 job: `CL_HANDOFF_SEND_TIMEOUT` (default 20s) bounds **each individual send**,
 because every backend can wedge — `osascript` waits on iTerm which waits on a
-GUI, `tmux` on its server, `cmux` on its daemon — and macOS ships no
+GUI, and `tmux` on its server — and macOS ships no
 coreutils `timeout`. A send that overruns is killed and the route that wedged
 names itself.
 
@@ -478,5 +478,4 @@ write probe against the handoff directory either.
 and age flag, handoff-directory resolution including an unwritable base,
 `--no-handoff`, unrecognised-flag rejection, `--fresh`'s dry-run output and its
 unknown-name error, prompt overriding and placeholder substitution, and the
-pane-injection contract against real tmux and a real (faked-argv) cmux rather
-than stand-ins.
+pane-injection contract against real tmux rather than stand-ins.
