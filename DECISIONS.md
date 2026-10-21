@@ -4,6 +4,55 @@ Form-factor choices that could have gone another way. Each entry records what
 was chosen, what it forecloses, and what would reverse it — so a later change
 is a deliberate reversal, not an accident.
 
+## 2026-10-20 — cmux support is removed
+
+**Chose:** delete every cmux path — native cmux launches (`cmux claude-teams` /
+`cmux codex-teams`), workspace restore in `cl start`, surface close on stop,
+`cmux send` handoff injection, the cmux sidebar and its install step.
+
+**But KEEP the `CMUX_*` scrub, now unconditional.** The first cut removed it
+with everything else, and Codex's review showed that regressed the hosts being
+kept: a tmux server first started under cmux holds `CMUX_*` in its global
+environment and hands it to every later pane, iTerm ones included, where cmux's
+Claude hooks read the ids and dial a dead socket. So every direct exec still
+strips inherited `CMUX_*`, and `tmux_setup` still clears it from the server's
+global environment — always, now, since no launch is a cmux launch. Removing
+cmux as a *host* made the rule simpler, not unnecessary. `cl` now has two hosts: an iTerm2 tab (the agent as the
+tab's own process) and tmux everywhere else. `install.sh --no-sidebars` is kept
+as an accepted no-op, because callers pass it — mac_setup's own shell-wiring
+suite does — and the installer's `set -euo pipefail` would abort on an unknown
+flag.
+
+**Forecloses:** running `cl` inside cmux as a first-class host. A cmux pane is
+now just a terminal that is not iTerm, so it gets tmux.
+
+**Reverses by:** cmux becoming the operator's daily terminal again. Everything
+removed is recoverable from git history at the commit before this entry.
+
+**Why:** the cost had stopped being paid back. cmux was installed on both Macs
+but unused — its session store last written 2026-09-23 — and no cmux hooks were
+registered in either Claude settings file. Meanwhile it was a branch in nineteen
+functions: every launch path, both command builders, host detection, `do_start`,
+`do_stop`, `retire_session` and the handoff send. That duplication had just
+produced a real bug. PR #20 added a coordination re-arm to `cl start` and
+reached it on both of the iTerm/tmux exit paths; `do_start`'s cmux branch
+returned before either, so a cmux restore brought every session back with the
+lanes still unarmed — the exact failure the change existed to prevent, on a
+supported host. Codex's review found it; 717 green assertions did not, because
+every new test drove the non-cmux path. A host that every cross-cutting change
+has to remember, for a host nobody uses, is a standing source of that bug.
+
+The net change is roughly 280 lines removed from the script and 12 cmux-only
+test assertions removed, with two regressions added for the scrub — a direct
+iTerm launch handed stale `CMUX_*` passes none to the agent, and `tmux_setup`
+clears it from a real tmux server's global environment. iTerm and tmux launch
+behaviour is otherwise unchanged, confirmed by the full suite and by driving the
+branch against the live session list read-only.
+
+**Note:** the entries below that describe cmux behaviour are kept as written.
+They record what was decided and why at the time; this entry is what reverses
+them.
+
 ## 2026-10-12 — `cl stop` broadcasts the handoff ask, then waits once for all of them
 
 **Chose:** `cl stop` runs in four passes — plan every session's rotation policy,
@@ -527,6 +576,9 @@ never render a state that looks identical to "that's everything" when it isn't
 findings this month.
 
 ## 2026-09-11 — In iTerm the agent is the tab's own process; tmux is opt-in
+
+> The cmux parts of this entry are superseded by **2026-10-20 — cmux support is
+> removed**. The iTerm and tmux reasoning still holds.
 
 **Chose:** `use_tmux()` decides per launch — false in iTerm2 (unless
 `CL_TMUX=1`), true elsewhere when tmux exists, and the cmux path is untouched.
