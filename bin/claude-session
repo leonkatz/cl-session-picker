@@ -3010,7 +3010,13 @@ run_bounded() {
   local ticks=$(( limit * 10 )) i=0 pid had_m=0
   case "$-" in *m*) had_m=1 ;; esac
   set -m
-  "$@" & pid=$!
+  # STDIN FROM /dev/null. With `set -m` the child is in its own process group,
+  # so any attempt to READ the terminal earns it SIGTTIN and it stops — and this
+  # would then wait out the whole timeout before killing a process that was
+  # never going to finish. Measured: a child running `cat` returned 124 at the
+  # limit instead of immediately. None of the callers need stdin, and EOF is the
+  # honest answer for all of them.
+  "$@" < /dev/null & pid=$!
   [ "$had_m" = "1" ] || set +m
   while [ "$i" -lt "$ticks" ]; do
     if ! kill -0 "$pid" 2>/dev/null; then
@@ -3836,6 +3842,63 @@ tab_cmd() {
   esac
 }
 
+# rearm_coordination_lanes: after a start, ask the coordination watcher to
+# re-elect itself. ALWAYS returns 0 — see below.
+#
+# ── WHY A START HAS TO DO THIS ──────────────────────────────────────────────
+#
+# A coordination watcher is elected by an agent's SessionStart hook, and
+# SessionStart fires on a TURN, not on TUI resume. So `cl start` brings the
+# session back and the watcher stays dead until somebody happens to type into
+# it. On 2026-10-07 that cost two days: eighteen review requests queued behind a
+# lane that reported a current heartbeat and the right directory, because the
+# watcher had died at a reboot and nothing re-elected it. The next instance
+# would be a week off, where "it looked fine" is discovered on return.
+#
+# ── WHY IT CANNOT FAIL A START ──────────────────────────────────────────────
+#
+# `cl start` is the command you run to get your work back. A start that refuses,
+# or exits non-zero, because a background helper did not arm is worse than a
+# start that says so and carries on — the sessions are the point and the watcher
+# is an optimisation on top. So every path here returns 0, and the only
+# consequence of trouble is a message.
+#
+# A SOFT dependency in both directions: this script is public and standalone,
+# while the coordination watcher lives in a private repo, so its absence is the
+# normal case and is silent. "No lanes declared" is silent too — most machines
+# do not coordinate, and a warning that fires for everyone is one nobody reads.
+#
+# Bounded, because re-arming waits for a heartbeat per lane to prove the watcher
+# is really running its loop, and an unbounded helper would turn `cl start` into
+# something you cannot predict the length of.
+rearm_coordination_lanes() {
+  local script="${CL_COORD_REARM:-$HOME/.claude/scripts/coord-rearm.sh}"
+  [ -x "$script" ] || return 0
+  local tmp rc
+  tmp="$(mktemp -t clrearm 2>/dev/null)" || return 0
+  run_bounded "${CL_COORD_REARM_TIMEOUT:-90}" bash "$script" > "$tmp" 2>&1
+  rc=$?
+  if [ "$rc" = "124" ]; then
+    printf '\n⚠ coordination re-arm timed out after %ss — your sessions are fine; run it yourself:\n    %s\n' \
+      "${CL_COORD_REARM_TIMEOUT:-90}" "$script" >&2
+  elif [ "$rc" = "0" ]; then
+    # Only the verified lines: the helper is chatty about plumbing identifiers
+    # that are deliberately not this session's, and repeating them here invites
+    # exactly the confusion its own output warns about.
+    if grep -q 'verified:' "$tmp" 2>/dev/null; then
+      printf '\ncoordination lanes re-armed:\n'
+      sed -n 's/^ *verified: /  ✓ /p' "$tmp"
+    fi
+  elif grep -q 'no lanes declared' "$tmp" 2>/dev/null; then
+    : # this machine does not coordinate; nothing to say
+  else
+    printf '\n⚠ coordination re-arm reported a problem. Your sessions are fine; the lane is not:\n' >&2
+    sed 's/^/  /' "$tmp" >&2
+  fi
+  rm -f "$tmp"
+  return 0
+}
+
 # do_start: bring back every session in STATE — one real iTerm tab each,
 # tmux-backed via `cl <name>`. First it ensures each session's tmux exists
 # (detached), then opens a tab per session. Falls back to printing the commands
@@ -3979,6 +4042,10 @@ do_start() {
   # degrades to printing the commands instead of guessing a terminal to target.
   if [ "${#tab_cmds[@]}" -eq 0 ]; then
     printf '\nevery saved session is already live — nothing to open.\n'
+    # STILL RE-ARMED. "Already live" describes the agent sessions, and says
+    # nothing about the watcher that feeds their lanes — which is precisely the
+    # state that looks healthiest and is not.
+    rearm_coordination_lanes
     return 0
   fi
 
@@ -3994,6 +4061,7 @@ do_start() {
     fi
     for cmd in "${tab_cmds[@]}"; do printf '  %s\n' "$cmd"; done
   fi
+  rearm_coordination_lanes
 }
 
 # consume_state <live-lines>: archive the snapshot, then keep only the rows
