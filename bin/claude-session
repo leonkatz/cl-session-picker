@@ -1660,10 +1660,31 @@ fresh_cmd() {
     "$(claude_cmd)" "$(printf '%q' "$1")" "$(printf '%q' "$2")"
 }
 
-# session_pid <sid> [agent]: pid of a local process that resumed this session,
-# if any. Guards the bare (non-tmux) path against double --resume of one
-# session — two processes on the same transcript — the hazard tmux's
-# attach-don't-duplicate prevents on the tmux path.
+# session_pid <sid> [agent] [name]: pid of the local process running this
+# session, if any. Guards the bare (non-tmux) path against double --resume of
+# one session — two processes on the same transcript — the hazard tmux's
+# attach-don't-duplicate prevents on the tmux path. `cl stop` also KILLS the
+# pid this returns, so being wrong here is not a cosmetic error.
+#
+# ── FOR CLAUDE, THREE SOURCES, IN ORDER OF HOW MUCH THEY CAN BE TRUSTED ─────
+#
+# 1. Claude Code's OWN registry, ~/.claude/sessions/<pid>.json, which records
+#    the real sessionId for every running session — proven by start time, so a
+#    reused pid cannot pass. See claude_registry_pid.
+# 2. cl's own launch record, for sessions cl started (registered_pid).
+# 3. argv matching, `--resume <sid>`, as a fallback for a Claude Code too old
+#    to keep a registry — and NEVER counting a `--fork-session` process.
+#
+# This used to be argv first, `pgrep … | head -1`, and that was wrong in a way
+# that killed the wrong session. `claude --resume P --fork-session` runs a NEW
+# session with its own id, but its argv still names the PARENT's id P. So the
+# fork matched the parent; pgrep lists in ascending pid order; and on
+# 2026-10-21 the fork (pid 595) sorted before the real parent (pid 42453).
+# `cl stop` would have signalled the fork as if it were the parent — killing a
+# session that was never asked for a handoff — and left the parent running,
+# reported as stopped. The fork itself was invisible (its own id appears in no
+# argv), so it was neither saved nor restored. Found by asking why a session
+# the operator could see open was listed as not running.
 #
 # For codex this is a "matching local resume process" marker, NOT proof the
 # thread is live or idle: Codex also runs threads through a shared app-server
@@ -2042,13 +2063,60 @@ ack_state_row() {
   return 0
 }
 
+# claude_registry_pid <sid>: the live pid Claude Code itself recorded as
+# running this session, or nothing.
+#
+# Claude Code writes ~/.claude/sessions/<pid>.json for every running session,
+# carrying `sessionId` and `procStart` — the process's own start time, which
+# equals `ps -o lstart` in UTC exactly (verified 2026-10-21 against every live
+# session). Requiring that match is what makes a hit PROOF: a file left behind
+# by a dead session whose pid has since been reused by something else names a
+# different start time and is rejected. Absence of the directory or of jq
+# returns nothing, and session_pid falls back.
+#
+# This is an internal Claude Code file, not a documented interface — which is
+# exactly why it is first in a chain rather than the only source, and why any
+# shape it does not recognise yields nothing rather than a guess.
+claude_registry_pid() {
+  local sid="$1" dir="${CL_CLAUDE_SESSIONS_DIR:-$HOME/.claude/sessions}" f pid want now
+  [ -d "$dir" ] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  case "$sid" in ''|*[!0-9A-Za-z-]*) return 0 ;; esac
+  for f in "$dir"/*.json; do
+    [ -f "$f" ] || continue
+    grep -qF "\"$sid\"" "$f" 2>/dev/null || continue
+    pid=$(jq -r --arg s "$sid" 'select(.sessionId == $s) | .pid // empty' "$f" 2>/dev/null)
+    case "$pid" in ''|*[!0-9]*) continue ;; esac
+    want=$(jq -r '.procStart // empty' "$f" 2>/dev/null | tr -s ' ')
+    [ -n "$want" ] || continue
+    now=$(TZ=UTC ps -p "$pid" -o lstart= 2>/dev/null | tr -s ' ' | sed 's/^ //; s/ $//')
+    [ -n "$now" ] && [ "$now" = "$want" ] && { printf '%s\n' "$pid"; return 0; }
+  done
+  return 0
+}
+
+# argv_resume_pid <sid>: a pid whose ARGUMENTS resume this session, excluding
+# forks. The last-resort source — see session_pid.
+argv_resume_pid() {
+  local sid="$1" p
+  for p in $(pgrep -f "(-resume|-session-id) $sid" 2>/dev/null); do
+    # A fork's argv names the session it forked FROM, not the one it is.
+    case "$(ps -p "$p" -o command= 2>/dev/null)" in
+      *--fork-session*) continue ;;
+    esac
+    printf '%s\n' "$p"; return 0
+  done
+  return 0
+}
+
 session_pid() { # sid [agent] [name]
   local pid
   case "${2:-claude}" in
     codex) pgrep -f "codex.* resume $1( |\$)" 2>/dev/null | head -1 ;;
     *)
-      pid=$(pgrep -f "(-resume|-session-id) $1" 2>/dev/null | head -1)
+      pid=$(claude_registry_pid "$1")
       [ -n "$pid" ] || [ -z "${3:-}" ] || pid=$(registered_pid "$3" claude)
+      [ -n "$pid" ] || pid=$(argv_resume_pid "$1")
       printf '%s\n' "$pid"
       ;;
   esac
