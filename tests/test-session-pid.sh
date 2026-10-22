@@ -12,9 +12,9 @@
 # and reporting it stopped. The fork itself was invisible, since its own id
 # appears in no argv, so it was neither saved nor restored.
 #
-# The fix: ask Claude Code's own registry (~/.claude/sessions/<pid>.json) first,
-# proven by start time; then cl's launch record; then argv, never counting a
-# fork. These tests drive real processes whose argv is shaped exactly like the
+# The fix: ask cl's own launch record first, bound to this name AND sid; then
+# Claude Code's registry (~/.claude/sessions/<pid>.json), proven by start time;
+# then argv, never counting a fork. These tests drive real processes whose argv is shaped exactly like the
 # incident, so the fork genuinely matches the parent's id in a pgrep.
 set -u
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -76,6 +76,13 @@ register() { # pid sid [procStart-override]
 spid() { # sid [name] — with the fixture registry
   ( . "$LIB"; PID_DIR="$FIX/pids"; CL_CLAUDE_SESSIONS_DIR="$FIX/reg"; session_pid "$1" claude "${2:-}" )
 }
+# Write cl's launch record exactly as the launcher does: pid, start token,
+# agent, name, and the sid it is bound to ("-" when unbound, as `cl new` writes).
+launch_record() { # pid name sid
+  ( . "$LIB"; PID_DIR="$FIX/pids"
+    printf '%s\t%s\t%s\t%s\t%s\n' "$1" "$(start_token "$1")" claude "$2" "$3" \
+      > "$(reg_file "$2" claude)" )
+}
 spid_noreg() { # sid [name] — as on a Claude Code too old to keep a registry
   ( . "$LIB"; PID_DIR="$FIX/pids"; CL_CLAUDE_SESSIONS_DIR="$FIX/no-such-dir"; session_pid "$1" claude "${2:-}" )
 }
@@ -133,15 +140,56 @@ check "an unreadable entry is ignored, not trusted" "$LIVE" "$(spid "$P")"
 rm -f "$FIX/reg/garbage.json"
 reap "$LIVE"; rm -f "$FIX/reg"/*.json; sleep 0.3
 
-# ── cl's own launch record still covers argv-less launches ──────────────────
+# ── cl's own launch record outranks the registry ────────────────────────────
+echo "a session running twice: cl's record says which copy is cl's"
+# Two live processes on the SAME session id — a manual duplicate resume, or a
+# race outside cl. Both have valid registry entries, so the registry alone
+# would answer with whichever file its glob visits first; `cl stop` would then
+# kill the stranger and leave cl's own process running, reported stopped.
+spawn --resume "$P"; DUP_A=$SPAWNED
+spawn --resume "$P"; DUP_B=$SPAWNED
+sleep 0.5
+register "$DUP_A" "$P"
+register "$DUP_B" "$P"
+# The pid the registry glob visits first, and the other one. Owning each in
+# turn proves the record wins in BOTH orders, not just the lucky one.
+FIRST=$( . "$LIB"; CL_CLAUDE_SESSIONS_DIR="$FIX/reg"; claude_registry_pid "$P")
+if [ "$FIRST" = "$DUP_A" ]; then SECOND=$DUP_B; else SECOND=$DUP_A; fi
+check "premise: the registry alone answers with one of the two copies" "1" \
+  "$([ "$FIRST" = "$DUP_A" ] || [ "$FIRST" = "$DUP_B" ] && echo 1 || echo 0)"
+launch_record "$SECOND" Dup "$P"
+check "cl owns the copy the registry visits SECOND: that copy is returned" "$SECOND" "$(spid "$P" Dup)"
+launch_record "$FIRST" Dup "$P"
+check "cl owns the copy the registry visits FIRST: that copy is returned" "$FIRST" "$(spid "$P" Dup)"
+# A record bound to a different generation of this name proves nothing about
+# this id, so the registry answers instead.
+launch_record "$SECOND" Dup "$F"
+check "a record bound to another sid is passed over for the registry" "$FIRST" "$(spid "$P" Dup)"
+reap "$DUP_A" "$DUP_B"; rm -f "$FIX/reg"/*.json "$FIX/pids"/*; sleep 0.3
+
+echo "without a registry, a same-name record for another sid is not a stop handle"
+# `--name` keeps the id out of argv, so the launch record is the only source
+# left and nothing else can mask what it decides.
+spawn --name Gen; GEN=$SPAWNED; sleep 0.5
+launch_record "$GEN" Gen "$P"
+check "control: a record bound to this sid resolves it" "$GEN" "$(spid_noreg "$P" Gen)"
+launch_record "$GEN" Gen "$F"
+check "a record bound to another sid is rejected" "" "$(spid_noreg "$P" Gen)"
+reap "$GEN"; rm -f "$FIX/pids"/*; sleep 0.3
+
+# ── a `cl new` launch: unbound record, so the registry answers ──────────────
 echo "a session launched by name, with no id in its argv, is still found"
-# `cl new` runs `claude --name X`: no id in argv. With no Claude registry entry,
-# cl's own record is what finds it — the fallback that existed before.
+# `cl new` runs `claude --name X`: no id in argv, and its launch record is
+# written before the id exists, so it is unbound ("-"). Claude Code's registry
+# is what finds it now.
+N="33333333-3333-4333-8333-333333333333"
 spawn --name Named; NAMED=$SPAWNED; sleep 0.5
-( . "$LIB"; PID_DIR="$FIX/pids"
-  tok=$(start_token "$NAMED")
-  printf '%s\t%s\t%s\t%s\t%s\n' "$NAMED" "$tok" claude Named - > "$(reg_file Named claude)" )
-check "cl's launch record resolves it" "$NAMED" "$(spid "33333333-3333-4333-8333-333333333333" Named)"
+launch_record "$NAMED" Named -
+register "$NAMED" "$N"
+check "the registry resolves it despite the unbound record" "$NAMED" "$(spid "$N" Named)"
+# Without a registry it is honestly unknown: an unbound record cannot prove
+# which id it runs, and may be a different generation of the name.
+check "…and without one, the unbound record is not taken as this id" "" "$(spid_noreg "$N" Named)"
 reap "$NAMED"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"

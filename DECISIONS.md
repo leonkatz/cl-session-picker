@@ -4,12 +4,13 @@ Form-factor choices that could have gone another way. Each entry records what
 was chosen, what it forecloses, and what would reverse it — so a later change
 is a deliberate reversal, not an accident.
 
-## 2026-10-21 — which process runs a Claude session: Claude Code's registry first, argv last
+## 2026-10-21 — which process runs a Claude session: cl's own record, then Claude Code's registry, argv last
 
-**Chose:** `session_pid` answers from three sources in order. First Claude Code's
-own `~/.claude/sessions/<pid>.json`, accepted only when its `procStart` equals
-the process's start time from `ps` in UTC; then `cl`'s launch record; then argv
-matching as a last resort, which never counts a `--fork-session` process.
+**Chose:** `session_pid` answers from three sources in order. First `cl`'s launch
+record, only when it is bound to this name and this session id; then Claude
+Code's own `~/.claude/sessions/<pid>.json`, accepted only when its `procStart`
+equals the process's start time from `ps` in UTC; then argv matching as a last
+resort, which never counts a `--fork-session` process.
 
 **Forecloses:** treating "some process mentions this id" as "this process is this
 session".
@@ -32,7 +33,15 @@ The registry is an internal Claude Code file, not a documented interface. It was
 chosen anyway because it is the only source that knows a fork's real id, and its
 start-time field makes a hit proof rather than a hint: on the night it was
 introduced, all fourteen live processes resolved to exactly the pid the registry
-recorded. Codex was already argv-free for stop — only `cl`'s launch record is a
+recorded. It still ranks below `cl`'s own record: both prove a pid is live, but
+only the launch record proves `cl` owns it, and when a session is running twice
+the registry cannot say which copy that is.
+
+A launch record not bound to a session id (`cl new`, which learns the id only
+after launch) no longer answers for a given id. Claude Code's registry answers
+instead, so this only narrows a Claude Code too old to keep one.
+
+Codex was already argv-free for stop — only `cl`'s launch record is a
 kill target there — and this brings Claude to the same standard.
 
 ## 2026-10-20 — cmux support is removed

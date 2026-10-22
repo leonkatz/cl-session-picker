@@ -375,7 +375,9 @@ mk_thread "$SID_SHARED" Shared
 /bin/sh -c 'exec -a "codex resume '"$SID_SHARED"'" sleep 600' & XSHARED=$!
 disown "$CSHARED" 2>/dev/null || true; disown "$XSHARED" 2>/dev/null || true
 sleep 0.5
-register Shared claude "$CSHARED"
+# Bound to its thread, as a resumed launch records it: an unbound record no
+# longer answers for a given session id (see session_pid).
+register Shared claude "$CSHARED" c-shared
 register Shared codex  "$XSHARED" "$SID_SHARED"
 cl stop --keep-tabs >/dev/null 2>&1
 sleep 1

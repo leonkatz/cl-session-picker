@@ -1668,10 +1668,15 @@ fresh_cmd() {
 #
 # ── FOR CLAUDE, THREE SOURCES, IN ORDER OF HOW MUCH THEY CAN BE TRUSTED ─────
 #
-# 1. Claude Code's OWN registry, ~/.claude/sessions/<pid>.json, which records
+# 1. cl's own launch record (registered_pid), bound to this name AND this sid.
+#    Only it proves cl launched and owns the process. Both it and the registry
+#    prove a pid is live; when a session is running twice (a manual duplicate
+#    resume), only the launch record says which copy is cl's — the registry
+#    would hand back whichever file the glob visits first.
+# 2. Claude Code's OWN registry, ~/.claude/sessions/<pid>.json, which records
 #    the real sessionId for every running session — proven by start time, so a
-#    reused pid cannot pass. See claude_registry_pid.
-# 2. cl's own launch record, for sessions cl started (registered_pid).
+#    reused pid cannot pass. See claude_registry_pid. It answers for forks and
+#    for `cl new` launches, whose launch records are not bound to a sid.
 # 3. argv matching, `--resume <sid>`, as a fallback for a Claude Code too old
 #    to keep a registry — and NEVER counting a `--fork-session` process.
 #
@@ -2087,7 +2092,7 @@ claude_registry_pid() {
     grep -qF "\"$sid\"" "$f" 2>/dev/null || continue
     pid=$(jq -r --arg s "$sid" 'select(.sessionId == $s) | .pid // empty' "$f" 2>/dev/null)
     case "$pid" in ''|*[!0-9]*) continue ;; esac
-    want=$(jq -r '.procStart // empty' "$f" 2>/dev/null | tr -s ' ')
+    want=$(jq -r '.procStart // empty' "$f" 2>/dev/null | tr -s ' ' | sed 's/^ //; s/ $//')
     [ -n "$want" ] || continue
     now=$(TZ=UTC ps -p "$pid" -o lstart= 2>/dev/null | tr -s ' ' | sed 's/^ //; s/ $//')
     [ -n "$now" ] && [ "$now" = "$want" ] && { printf '%s\n' "$pid"; return 0; }
@@ -2114,8 +2119,9 @@ session_pid() { # sid [agent] [name]
   case "${2:-claude}" in
     codex) pgrep -f "codex.* resume $1( |\$)" 2>/dev/null | head -1 ;;
     *)
-      pid=$(claude_registry_pid "$1")
-      [ -n "$pid" ] || [ -z "${3:-}" ] || pid=$(registered_pid "$3" claude)
+      pid=""
+      [ -z "${3:-}" ] || pid=$(registered_pid "$3" claude "$1")
+      [ -n "$pid" ] || pid=$(claude_registry_pid "$1")
       [ -n "$pid" ] || pid=$(argv_resume_pid "$1")
       printf '%s\n' "$pid"
       ;;
