@@ -38,8 +38,12 @@ only the launch record proves `cl` owns it, and when a session is running twice
 the registry cannot say which copy that is.
 
 A launch record not bound to a session id (`cl new`, which learns the id only
-after launch) no longer answers for a given id. Claude Code's registry answers
-instead, so this only narrows a Claude Code too old to keep one.
+after launch) no longer answers for a given id; Claude Code's registry answers
+instead. When nothing places such a process (an older Claude Code, or a registry
+entry not written yet), it is neither killed nor taken for absent: `cl stop`
+leaves it running, names it, keeps its row, and exits non-zero, and `cl start`
+skips the row as live. Silent success would have been the very failure this
+entry exists for, a visible session outliving a stop that said it worked.
 
 Codex was already argv-free for stop — only `cl`'s launch record is a
 kill target there — and this brings Claude to the same standard.

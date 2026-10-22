@@ -32,10 +32,10 @@ check() { if [ "$2" = "$3" ]; then pass=$((pass+1)); printf '  ok   %s\n' "$1"; 
 setup_failed() { printf 'FIXTURE SETUP FAILED: %s\n' "$1" >&2; exit 2; }
 
 LIB="$FIX/lib.sh"
-awk '!inf && /^(session_pid|claude_registry_pid|argv_resume_pid|registered_pid|reg_file|start_token)\(\)/ {
+awk '!inf && /^(session_pid|claude_registry_pid|argv_resume_pid|registered_pid|reg_file|start_token|unbound_owner_pid)\(\)/ {
        print; if ($0 ~ /}[[:space:]]*$/) next; inf=1; next }
      inf { print; if ($0 ~ /^}$/) inf=0 }' "$CL" > "$LIB"
-for fn in session_pid claude_registry_pid argv_resume_pid registered_pid reg_file start_token; do
+for fn in session_pid claude_registry_pid argv_resume_pid registered_pid reg_file start_token unbound_owner_pid; do
   grep -q "^${fn}()" "$LIB" || setup_failed "could not extract ${fn}"
 done
 
@@ -191,6 +191,23 @@ check "the registry resolves it despite the unbound record" "$NAMED" "$(spid "$N
 # which id it runs, and may be a different generation of the name.
 check "…and without one, the unbound record is not taken as this id" "" "$(spid_noreg "$N" Named)"
 reap "$NAMED"
+
+echo "an unbound owner is surfaced only when nothing can place it"
+# unbound_owner_pid is what stops a `cl new` process from reading as "nothing
+# live". It must not fire for a process Claude's registry already places on
+# some session, or for a record that is bound — those have real answers.
+uop() { ( . "$LIB"; PID_DIR="$FIX/pids"; CL_CLAUDE_SESSIONS_DIR="$1"; unbound_owner_pid "$2" ) }
+spawn --name Loose; LOOSE=$SPAWNED; sleep 0.5
+launch_record "$LOOSE" Loose -
+check "unbound, no registry: reported" "$LOOSE" "$(uop "$FIX/no-such-dir" Loose)"
+register "$LOOSE" "$F"
+check "unbound, but the registry places it: not reported" "" "$(uop "$FIX/reg" Loose)"
+register "$LOOSE" "$F" "Mon Jan 1 00:00:00 2001"
+check "…a stale registry entry places nothing: reported" "$LOOSE" "$(uop "$FIX/reg" Loose)"
+launch_record "$LOOSE" Loose "$P"
+check "a bound record is session_pid's to answer: not reported" "" "$(uop "$FIX/no-such-dir" Loose)"
+reap "$LOOSE"; sleep 0.3
+rm -f "$FIX/reg"/*.json "$FIX/pids"/*
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

@@ -2114,6 +2114,32 @@ argv_resume_pid() {
   return 0
 }
 
+# unbound_owner_pid <name>: a live claude process cl launched under this name
+# that cannot be tied to any session id — or nothing.
+#
+# `cl new` writes its launch record before Claude has chosen an id, so the
+# record is unbound ("-"), and session_pid rightly refuses it as proof of a
+# given id. Without Claude's registry entry (an older Claude Code, or one not
+# written yet) nothing else knows which id that process runs. It must then be
+# reported as unresolved, not taken for "nothing live": treated as absent, stop
+# skipped it, left it running, and still reported the fleet stopped. A process
+# the registry DOES place is excluded — it is provably some other session.
+unbound_owner_pid() {
+  local f rsid pid dir="${CL_CLAUDE_SESSIONS_DIR:-$HOME/.claude/sessions}" want now
+  f=$(reg_file "$1" claude)
+  [ -r "$f" ] || return 0
+  rsid=$(cut -f5 "$f" 2>/dev/null)
+  case "$rsid" in ''|-) ;; *) return 0 ;; esac
+  pid=$(registered_pid "$1" claude)
+  [ -n "$pid" ] || return 0
+  if [ -f "$dir/$pid.json" ] && command -v jq >/dev/null 2>&1; then
+    want=$(jq -r '.procStart // empty' "$dir/$pid.json" 2>/dev/null | tr -s ' ' | sed 's/^ //; s/ $//')
+    now=$(TZ=UTC ps -p "$pid" -o lstart= 2>/dev/null | tr -s ' ' | sed 's/^ //; s/ $//')
+    [ -n "$want" ] && [ "$want" = "$now" ] && return 0
+  fi
+  printf '%s\n' "$pid"
+}
+
 session_pid() { # sid [agent] [name]
   local pid
   case "${2:-claude}" in
@@ -2250,6 +2276,8 @@ agent_live() {
     return 0
   fi
   [ -n "$(session_pid "$sid" "$agent" "$name")" ] && return 0
+  # Not proof of THIS session, but start's bias is to skip on any sign of life.
+  [ "$agent" = "claude" ] && [ -n "$(unbound_owner_pid "$name")" ] && return 0
   # Qualified by sid like every other registry question: a live process for an
   # OLDER same-named thread must not suppress the restart of the saved one.
   [ "$agent" = "codex" ] && [ -n "$(registered_pid "$name" codex "$sid")" ] && return 0
@@ -2717,6 +2745,8 @@ handoff_target_busy() {
 #   2  signalled but still shutting down, the kill itself failed, or the
 #      session was not cl's to kill — ownership must NOT be treated as free
 #      (a caller must not launch a replacement under this name)
+#   3  left running — cl owns a live process under this name but cannot prove
+#      which session it runs (see unbound_owner_pid); never killed as this one
 retire_session() {
   local name="$1" sid="$2" t="$3" close_tabs="$4" agent="${5:-claude}"
   local ans pid ptok rrc _ppid _pcomm hint kids surv
@@ -2771,7 +2801,12 @@ retire_session() {
     fi
   else
     pid=$(session_pid "$sid" claude "$name")
-    [ -n "$pid" ] || return 0   # nothing live — already retired
+    if [ -z "$pid" ]; then
+      pid=$(unbound_owner_pid "$name")
+      [ -n "$pid" ] || return 0   # nothing live — already retired
+      printf '⚠ leaving %s — cl launched a process under this name (pid %s) but cannot prove it runs this session, so it is not killed. Close it in its own tab, or `kill %s` once you have checked.\n' "$name" "$pid" "$pid" >&2
+      return 3
+    fi
   fi
 
   # Captured now: a dead process has no start time to read back, and without
@@ -3377,7 +3412,8 @@ save_state() {
       # PARSE time, so the whole state write dies rather than one row.
       if [ "$agent" = "claude" ]; then
         tmux has-session -t "$(tmux_name "$name" claude)" 2>/dev/null \
-          || [ -n "$(session_pid "$sid" claude "$name")" ] || continue
+          || [ -n "$(session_pid "$sid" claude "$name")" ] \
+          || [ -n "$(unbound_owner_pid "$name")" ] || continue
       elif [ "$agent" = "codex" ]; then
         # The tmux arm has to demand the SAME proof the kill path does. Accepting
         # a session by name alone saved an unstamped collision as if cl had
@@ -3463,7 +3499,7 @@ do_stop() {
     printf 'saved %s session(s) to %s\n\n' "$count" "$STATE"
   fi
 
-  local name t hrc kept=0 nohandoff=0 kept_names="" resume_only=""
+  local name t hrc rrc kept=0 nohandoff=0 kept_names="" resume_only="" unresolved_names=""
   # Rotation accounting for the log. `sess_rotate` is decided PER SESSION, since
   # the stored policy can carry per-session overrides, so the mode recorded for
   # the whole stop is "mixed" when they disagreed — a week containing a mixed
@@ -3800,10 +3836,13 @@ do_stop() {
     # retire_session covers both branches (tmux-hosted and bare process)
     # with the busy-check-and-prompt, tab/surface cleanup, the hidden-tmux
     # ownership guard, and the Codex ownership rules — do_stop just runs it and
-    # moves on; its return value changes nothing here (a lost race, a decline,
-    # a slow shutdown, or a session that was not cl's to kill are all just
-    # "didn't get killed this time, re-run stop").
-    retire_session "$name" "$sid_i" "$t" "$close_tabs" "$agent"
+    # moves on; its return value mostly changes nothing here (a lost race, a
+    # decline, a slow shutdown, or a session that was not cl's to kill are all
+    # just "didn't get killed this time, re-run stop"). The exception is a live
+    # process cl owns but cannot tie to this session: re-running stop will not
+    # resolve that, so it must fail the stop rather than read as stopped.
+    rrc=0; retire_session "$name" "$sid_i" "$t" "$close_tabs" "$agent" || rrc=$?
+    [ "$rrc" = 3 ] && unresolved_names="${unresolved_names}${name}"$'\n'
   done
 
   [ -n "$dry_run" ] && return 0
@@ -3824,6 +3863,11 @@ do_stop() {
     printf '\n%s session(s) stopped WITHOUT a handoff — `cl start` will resume those as they were\n' "$nohandoff" >&2
     printf 'rather than rotating them. Use `cl stop --require-handoff` if rotation is the point.\n' >&2
   fi
+  if [ -n "$unresolved_names" ]; then
+    printf '\nleft running — cl owns these but cannot prove which session each runs:\n' >&2
+    printf '%s' "$unresolved_names" | sed '/^$/d; s/^/  · /' >&2
+    printf 'They are in the saved state; close them by hand before `cl start`.\n' >&2
+  fi
   if [ "$kept" -gt 0 ]; then
     printf '\n%s session(s) left running for want of a handoff:\n' "$kept" >&2
     printf '%s' "$kept_names" | sed '/^$/d; s/^/  · /' >&2
@@ -3832,7 +3876,7 @@ do_stop() {
     # a script, a shutdown hook, or a glance at the exit status.
     return 1
   fi
-  return 0
+  [ -z "$unresolved_names" ]
 }
 
 # open_iterm_tabs <shell-command>...: open one real iTerm tab per command.

@@ -387,6 +387,52 @@ check "…and both processes were stopped" "dead|dead" \
   "$(kill -0 "$CSHARED" 2>/dev/null && printf alive || printf dead)|$(kill -0 "$XSHARED" 2>/dev/null && printf alive || printf dead)"
 kill "$CSHARED" "$XSHARED" 2>/dev/null
 
+printf 'a cl new process that cannot be tied to its session is reported, not passed over\n'
+# `cl new` records its owner before Claude has chosen an id, so the record is
+# unbound. With no Claude registry entry and no id in argv, nothing proves which
+# session that process runs. Stop must not kill it as this one — but treating
+# it as absent left it running while stop reported success.
+rm -f "$PIDDIR"/* "$STATE"
+printf '{"cwd":"%s"}\n{"customTitle":"Loose"}\n' "$FIX/work" > "$HOME/.claude/projects/p1/c-loose.jsonl"
+/bin/sh -c 'exec -a "claude --name Loose" sleep 600' & LOOSE=$!
+disown "$LOOSE" 2>/dev/null || true
+sleep 0.5
+register Loose claude "$LOOSE"
+check "premise: no Claude registry to place it" "" "$(ls "$HOME/.claude/sessions" 2>/dev/null)"
+out=$(cl stop --keep-tabs 2>&1); rc=$?
+sleep 0.5
+check "the process is left running" "alive" "$(kill -0 "$LOOSE" 2>/dev/null && printf alive || printf dead)"
+check "…stop does not report success" "1" "$rc"
+check "…it says why" "1" "$(printf '%s' "$out" | grep -c 'cannot prove it runs this session')"
+check "…and the row is kept for restart" "Loose" \
+  "$(jq -r '.[] | select(.name=="Loose") | .name' "$STATE" 2>/dev/null)"
+# Control: once Claude's registry places the process on this session, it is
+# proven and stopped normally — so the cases above are about the missing proof.
+rm -f "$STATE"
+mkdir -p "$HOME/.claude/sessions"
+printf '{"pid":%s,"sessionId":"c-loose","procStart":"%s"}\n' "$LOOSE" \
+  "$(TZ=UTC ps -p "$LOOSE" -o lstart= | tr -s ' ' | sed 's/^ //; s/ $//')" > "$HOME/.claude/sessions/$LOOSE.json"
+out=$(cl stop --keep-tabs 2>&1); rc=$?
+sleep 1
+check "control: placed by the registry, it is stopped" "dead" "$(kill -0 "$LOOSE" 2>/dev/null && printf alive || printf dead)"
+check "…and stop succeeds" "0" "$rc"
+kill "$LOOSE" 2>/dev/null
+rm -rf "$HOME/.claude/sessions"
+# And start must not open a second client beside it: it cannot prove the
+# process runs the saved session, but start's bias is to skip on any sign of life.
+/bin/sh -c 'exec -a "claude --name Loose" sleep 600' & LOOSE=$!
+disown "$LOOSE" 2>/dev/null || true
+sleep 0.5
+register Loose claude "$LOOSE"
+printf '[{"name":"Loose","sid":"c-loose","cwd":"%s","agent":"claude"}]\n' "$FIX/work" > "$STATE"
+rm -f "$FIX/osa.txt"
+out=$(cl start 2>&1)
+case "$out" in *"Loose already live"*) pass=$((pass+1)); printf '  ok   %s\n' "start skips the unproven owner as already live" ;;
+  *) fail=$((fail+1)); printf '  FAIL %s\n       got: %s\n' "start skips the unproven owner as already live" "$out" ;; esac
+check "…and opens no tab for it" "0" "$([ -s "$FIX/osa.txt" ] && echo 1 || echo 0)"
+kill "$LOOSE" 2>/dev/null
+rm -rf "$HOME/.claude/sessions" "$HOME/.claude/projects/p1/c-loose.jsonl"
+
 printf 'start keeps the rows it skipped instead of consuming them\n'
 # agent_live is deliberately optimistic, so a stale signal can drop a session
 # from the restart set. Deleting the whole file treated "skipped" as "handled",
