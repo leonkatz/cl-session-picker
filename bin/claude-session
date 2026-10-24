@@ -2132,8 +2132,13 @@ unbound_owner_pid() {
   case "$rsid" in ''|-) ;; *) return 0 ;; esac
   pid=$(registered_pid "$1" claude)
   [ -n "$pid" ] || return 0
+  # Placed means a fresh entry that ALSO names a session: a file with only a
+  # start time (a reshaped registry, or one caught mid-write) places nothing,
+  # since claude_registry_pid could not resolve any id from it either. Both
+  # fields come from one read so they cannot straddle a rewrite.
   if [ -f "$dir/$pid.json" ] && command -v jq >/dev/null 2>&1; then
-    want=$(jq -r '.procStart // empty' "$dir/$pid.json" 2>/dev/null | tr -s ' ' | sed 's/^ //; s/ $//')
+    want=$(jq -r 'select((.sessionId | type) == "string" and .sessionId != "") | .procStart // empty' \
+      "$dir/$pid.json" 2>/dev/null | tr -s ' ' | sed 's/^ //; s/ $//')
     now=$(TZ=UTC ps -p "$pid" -o lstart= 2>/dev/null | tr -s ' ' | sed 's/^ //; s/ $//')
     [ -n "$want" ] && [ "$want" = "$now" ] && return 0
   fi

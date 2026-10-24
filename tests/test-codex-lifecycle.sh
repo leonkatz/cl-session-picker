@@ -406,6 +406,17 @@ check "…stop does not report success" "1" "$rc"
 check "…it says why" "1" "$(printf '%s' "$out" | grep -c 'cannot prove it runs this session')"
 check "…and the row is kept for restart" "Loose" \
   "$(jq -r '.[] | select(.name=="Loose") | .name' "$STATE" 2>/dev/null)"
+# A registry file with the right start time but no session id is a shape no
+# lookup can use; it must not quietly turn the owner back into "nothing live".
+mkdir -p "$HOME/.claude/sessions"; rm -f "$STATE"
+printf '{"pid":%s,"procStart":"%s"}\n' "$LOOSE" \
+  "$(TZ=UTC ps -p "$LOOSE" -o lstart= | tr -s ' ' | sed 's/^ //; s/ $//')" > "$HOME/.claude/sessions/$LOOSE.json"
+out=$(cl stop --keep-tabs 2>&1); rc=$?
+sleep 0.5
+check "an id-less registry entry: still left running" "alive" "$(kill -0 "$LOOSE" 2>/dev/null && printf alive || printf dead)"
+check "…and stop still does not report success" "1" "$rc"
+check "…and still says why" "1" "$(printf '%s' "$out" | grep -c 'cannot prove it runs this session')"
+rm -rf "$HOME/.claude/sessions"
 # Control: once Claude's registry places the process on this session, it is
 # proven and stopped normally — so the cases above are about the missing proof.
 rm -f "$STATE"

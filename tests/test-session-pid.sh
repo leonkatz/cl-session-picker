@@ -204,6 +204,13 @@ register "$LOOSE" "$F"
 check "unbound, but the registry places it: not reported" "" "$(uop "$FIX/reg" Loose)"
 register "$LOOSE" "$F" "Mon Jan 1 00:00:00 2001"
 check "…a stale registry entry places nothing: reported" "$LOOSE" "$(uop "$FIX/reg" Loose)"
+# A fresh start time without a usable session id places nothing either: no
+# lookup by id could use that file, so suppressing on it would hide the owner.
+LSTART=$(TZ=UTC ps -p "$LOOSE" -o lstart= | tr -s ' ' | sed 's/^ //; s/ $//')
+printf '{"pid":%s,"procStart":"%s"}\n' "$LOOSE" "$LSTART" > "$FIX/reg/$LOOSE.json"
+check "…a fresh entry with no sessionId places nothing: reported" "$LOOSE" "$(uop "$FIX/reg" Loose)"
+printf '{"pid":%s,"sessionId":"","procStart":"%s"}\n' "$LOOSE" "$LSTART" > "$FIX/reg/$LOOSE.json"
+check "…nor one with an empty sessionId: reported" "$LOOSE" "$(uop "$FIX/reg" Loose)"
 launch_record "$LOOSE" Loose "$P"
 check "a bound record is session_pid's to answer: not reported" "" "$(uop "$FIX/no-such-dir" Loose)"
 reap "$LOOSE"; sleep 0.3
