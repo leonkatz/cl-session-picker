@@ -32,10 +32,10 @@ check() { if [ "$2" = "$3" ]; then pass=$((pass+1)); printf '  ok   %s\n' "$1"; 
 setup_failed() { printf 'FIXTURE SETUP FAILED: %s\n' "$1" >&2; exit 2; }
 
 LIB="$FIX/lib.sh"
-awk '!inf && /^(session_pid|claude_registry_pid|argv_resume_pid|registered_pid|reg_file|start_token|unbound_owner_pid)\(\)/ {
+awk '!inf && /^(session_pid|claude_registry_pid|argv_resume_pid|registered_pid|reg_file|start_token|unbound_owner_pid|sid_shape_ok)\(\)/ {
        print; if ($0 ~ /}[[:space:]]*$/) next; inf=1; next }
      inf { print; if ($0 ~ /^}$/) inf=0 }' "$CL" > "$LIB"
-for fn in session_pid claude_registry_pid argv_resume_pid registered_pid reg_file start_token unbound_owner_pid; do
+for fn in session_pid claude_registry_pid argv_resume_pid registered_pid reg_file start_token unbound_owner_pid sid_shape_ok; do
   grep -q "^${fn}()" "$LIB" || setup_failed "could not extract ${fn}"
 done
 
@@ -211,6 +211,13 @@ printf '{"pid":%s,"procStart":"%s"}\n' "$LOOSE" "$LSTART" > "$FIX/reg/$LOOSE.jso
 check "…a fresh entry with no sessionId places nothing: reported" "$LOOSE" "$(uop "$FIX/reg" Loose)"
 printf '{"pid":%s,"sessionId":"","procStart":"%s"}\n' "$LOOSE" "$LSTART" > "$FIX/reg/$LOOSE.json"
 check "…nor one with an empty sessionId: reported" "$LOOSE" "$(uop "$FIX/reg" Loose)"
+# Nor an id no lookup would accept: placement and lookup share one predicate.
+for bad in "bad/id" " " "a b"; do
+  printf '{"pid":%s,"sessionId":"%s","procStart":"%s"}\n' "$LOOSE" "$bad" "$LSTART" > "$FIX/reg/$LOOSE.json"
+  check "…nor one whose sessionId is [$bad]: reported" "$LOOSE" "$(uop "$FIX/reg" Loose)"
+done
+printf '{"pid":%s,"sessionId":"%s","procStart":"%s"}\n' "$LOOSE" "$F" "$LSTART" > "$FIX/reg/$LOOSE.json"
+check "control: a fresh entry with a valid sessionId places it" "" "$(uop "$FIX/reg" Loose)"
 launch_record "$LOOSE" Loose "$P"
 check "a bound record is session_pid's to answer: not reported" "" "$(uop "$FIX/no-such-dir" Loose)"
 reap "$LOOSE"; sleep 0.3

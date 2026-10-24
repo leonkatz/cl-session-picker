@@ -2082,11 +2082,19 @@ ack_state_row() {
 # This is an internal Claude Code file, not a documented interface — which is
 # exactly why it is first in a chain rather than the only source, and why any
 # shape it does not recognise yields nothing rather than a guess.
+# sid_shape_ok <sid>: the one definition of a session id cl will look up. Shared
+# by the lookup and by the placement test in unbound_owner_pid, so an id the
+# lookup would refuse can never count as having placed a process.
+sid_shape_ok() {
+  case "$1" in ''|*[!0-9A-Za-z-]*) return 1 ;; esac
+  return 0
+}
+
 claude_registry_pid() {
   local sid="$1" dir="${CL_CLAUDE_SESSIONS_DIR:-$HOME/.claude/sessions}" f pid want now
   [ -d "$dir" ] || return 0
   command -v jq >/dev/null 2>&1 || return 0
-  case "$sid" in ''|*[!0-9A-Za-z-]*) return 0 ;; esac
+  sid_shape_ok "$sid" || return 0
   for f in "$dir"/*.json; do
     [ -f "$f" ] || continue
     grep -qF "\"$sid\"" "$f" 2>/dev/null || continue
@@ -2125,22 +2133,24 @@ argv_resume_pid() {
 # skipped it, left it running, and still reported the fleet stopped. A process
 # the registry DOES place is excluded — it is provably some other session.
 unbound_owner_pid() {
-  local f rsid pid dir="${CL_CLAUDE_SESSIONS_DIR:-$HOME/.claude/sessions}" want now
+  local f rsid pid dir="${CL_CLAUDE_SESSIONS_DIR:-$HOME/.claude/sessions}" want now rid
   f=$(reg_file "$1" claude)
   [ -r "$f" ] || return 0
   rsid=$(cut -f5 "$f" 2>/dev/null)
   case "$rsid" in ''|-) ;; *) return 0 ;; esac
   pid=$(registered_pid "$1" claude)
   [ -n "$pid" ] || return 0
-  # Placed means a fresh entry that ALSO names a session: a file with only a
-  # start time (a reshaped registry, or one caught mid-write) places nothing,
-  # since claude_registry_pid could not resolve any id from it either. Both
+  # Placed means a fresh entry that ALSO names a session claude_registry_pid
+  # could look up: a file with only a start time, or an id of a shape the lookup
+  # refuses (a reshaped registry, or one caught mid-write), places nothing. Both
   # fields come from one read so they cannot straddle a rewrite.
   if [ -f "$dir/$pid.json" ] && command -v jq >/dev/null 2>&1; then
-    want=$(jq -r 'select((.sessionId | type) == "string" and .sessionId != "") | .procStart // empty' \
-      "$dir/$pid.json" 2>/dev/null | tr -s ' ' | sed 's/^ //; s/ $//')
+    IFS=$(printf '\t') read -r rid want <<EOF_REG
+$(jq -r 'if (.sessionId | type) == "string" then [.sessionId, (.procStart // "")] | @tsv else empty end' "$dir/$pid.json" 2>/dev/null)
+EOF_REG
+    want=$(printf '%s' "$want" | tr -s ' ' | sed 's/^ //; s/ $//')
     now=$(TZ=UTC ps -p "$pid" -o lstart= 2>/dev/null | tr -s ' ' | sed 's/^ //; s/ $//')
-    [ -n "$want" ] && [ "$want" = "$now" ] && return 0
+    sid_shape_ok "$rid" && [ -n "$want" ] && [ "$want" = "$now" ] && return 0
   fi
   printf '%s\n' "$pid"
 }
