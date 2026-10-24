@@ -4,6 +4,50 @@ Form-factor choices that could have gone another way. Each entry records what
 was chosen, what it forecloses, and what would reverse it — so a later change
 is a deliberate reversal, not an accident.
 
+## 2026-10-21 — which process runs a Claude session: cl's own record, then Claude Code's registry, argv last
+
+**Chose:** `session_pid` answers from three sources in order. First `cl`'s launch
+record, only when it is bound to this name and this session id; then Claude
+Code's own `~/.claude/sessions/<pid>.json`, accepted only when its `procStart`
+equals the process's start time from `ps` in UTC; then argv matching as a last
+resort, which never counts a `--fork-session` process.
+
+**Forecloses:** treating "some process mentions this id" as "this process is this
+session".
+
+**Reverses by:** Claude Code dropping or reshaping that file. The chain degrades
+rather than breaks: an unrecognised or absent registry yields nothing, and the
+older sources answer exactly as before — minus the fork bug, which the argv
+fallback now excludes on its own.
+
+**Why:** argv lies about forks. `claude --resume P --fork-session` runs a new
+session with its own id but still names P in its arguments, so `pgrep … | head -1`
+matched the fork to its parent, and pgrep's ascending order put the fork first.
+On 2026-10-21 that would have made `cl stop` kill a fork (pid 595) as if it were
+its parent session, never asking it for a handoff, and leave the real parent
+(42453) running while reporting it stopped. The fork was also invisible, since
+its own id appears in no argv. It surfaced only because the operator could see a
+session open that `cl --list` called not running.
+
+The registry is an internal Claude Code file, not a documented interface. It was
+chosen anyway because it is the only source that knows a fork's real id, and its
+start-time field makes a hit proof rather than a hint: on the night it was
+introduced, all fourteen live processes resolved to exactly the pid the registry
+recorded. It still ranks below `cl`'s own record: both prove a pid is live, but
+only the launch record proves `cl` owns it, and when a session is running twice
+the registry cannot say which copy that is.
+
+A launch record not bound to a session id (`cl new`, which learns the id only
+after launch) no longer answers for a given id; Claude Code's registry answers
+instead. When nothing places such a process (an older Claude Code, or a registry
+entry not written yet), it is neither killed nor taken for absent: `cl stop`
+leaves it running, names it, keeps its row, and exits non-zero, and `cl start`
+skips the row as live. Silent success would have been the very failure this
+entry exists for, a visible session outliving a stop that said it worked.
+
+Codex was already argv-free for stop — only `cl`'s launch record is a
+kill target there — and this brings Claude to the same standard.
+
 ## 2026-10-20 — cmux support is removed
 
 **Chose:** delete every cmux path — native cmux launches (`cmux claude-teams` /

@@ -1660,10 +1660,36 @@ fresh_cmd() {
     "$(claude_cmd)" "$(printf '%q' "$1")" "$(printf '%q' "$2")"
 }
 
-# session_pid <sid> [agent]: pid of a local process that resumed this session,
-# if any. Guards the bare (non-tmux) path against double --resume of one
-# session — two processes on the same transcript — the hazard tmux's
-# attach-don't-duplicate prevents on the tmux path.
+# session_pid <sid> [agent] [name]: pid of the local process running this
+# session, if any. Guards the bare (non-tmux) path against double --resume of
+# one session — two processes on the same transcript — the hazard tmux's
+# attach-don't-duplicate prevents on the tmux path. `cl stop` also KILLS the
+# pid this returns, so being wrong here is not a cosmetic error.
+#
+# ── FOR CLAUDE, THREE SOURCES, IN ORDER OF HOW MUCH THEY CAN BE TRUSTED ─────
+#
+# 1. cl's own launch record (registered_pid), bound to this name AND this sid.
+#    Only it proves cl launched and owns the process. Both it and the registry
+#    prove a pid is live; when a session is running twice (a manual duplicate
+#    resume), only the launch record says which copy is cl's — the registry
+#    would hand back whichever file the glob visits first.
+# 2. Claude Code's OWN registry, ~/.claude/sessions/<pid>.json, which records
+#    the real sessionId for every running session — proven by start time, so a
+#    reused pid cannot pass. See claude_registry_pid. It answers for forks and
+#    for `cl new` launches, whose launch records are not bound to a sid.
+# 3. argv matching, `--resume <sid>`, as a fallback for a Claude Code too old
+#    to keep a registry — and NEVER counting a `--fork-session` process.
+#
+# This used to be argv first, `pgrep … | head -1`, and that was wrong in a way
+# that killed the wrong session. `claude --resume P --fork-session` runs a NEW
+# session with its own id, but its argv still names the PARENT's id P. So the
+# fork matched the parent; pgrep lists in ascending pid order; and on
+# 2026-10-21 the fork (pid 595) sorted before the real parent (pid 42453).
+# `cl stop` would have signalled the fork as if it were the parent — killing a
+# session that was never asked for a handoff — and left the parent running,
+# reported as stopped. The fork itself was invisible (its own id appears in no
+# argv), so it was neither saved nor restored. Found by asking why a session
+# the operator could see open was listed as not running.
 #
 # For codex this is a "matching local resume process" marker, NOT proof the
 # thread is live or idle: Codex also runs threads through a shared app-server
@@ -2042,13 +2068,102 @@ ack_state_row() {
   return 0
 }
 
+# claude_registry_pid <sid>: the live pid Claude Code itself recorded as
+# running this session, or nothing.
+#
+# Claude Code writes ~/.claude/sessions/<pid>.json for every running session,
+# carrying `sessionId` and `procStart` — the process's own start time, which
+# equals `ps -o lstart` in UTC exactly (verified 2026-10-21 against every live
+# session). Requiring that match is what makes a hit PROOF: a file left behind
+# by a dead session whose pid has since been reused by something else names a
+# different start time and is rejected. Absence of the directory or of jq
+# returns nothing, and session_pid falls back.
+#
+# This is an internal Claude Code file, not a documented interface — which is
+# exactly why it is first in a chain rather than the only source, and why any
+# shape it does not recognise yields nothing rather than a guess.
+# sid_shape_ok <sid>: the one definition of a session id cl will look up. Shared
+# by the lookup and by the placement test in unbound_owner_pid, so an id the
+# lookup would refuse can never count as having placed a process.
+sid_shape_ok() {
+  case "$1" in ''|*[!0-9A-Za-z-]*) return 1 ;; esac
+  return 0
+}
+
+claude_registry_pid() {
+  local sid="$1" dir="${CL_CLAUDE_SESSIONS_DIR:-$HOME/.claude/sessions}" f pid want now
+  [ -d "$dir" ] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  sid_shape_ok "$sid" || return 0
+  for f in "$dir"/*.json; do
+    [ -f "$f" ] || continue
+    grep -qF "\"$sid\"" "$f" 2>/dev/null || continue
+    pid=$(jq -r --arg s "$sid" 'select(.sessionId == $s) | .pid // empty' "$f" 2>/dev/null)
+    case "$pid" in ''|*[!0-9]*) continue ;; esac
+    want=$(jq -r '.procStart // empty' "$f" 2>/dev/null | tr -s ' ' | sed 's/^ //; s/ $//')
+    [ -n "$want" ] || continue
+    now=$(TZ=UTC ps -p "$pid" -o lstart= 2>/dev/null | tr -s ' ' | sed 's/^ //; s/ $//')
+    [ -n "$now" ] && [ "$now" = "$want" ] && { printf '%s\n' "$pid"; return 0; }
+  done
+  return 0
+}
+
+# argv_resume_pid <sid>: a pid whose ARGUMENTS resume this session, excluding
+# forks. The last-resort source — see session_pid.
+argv_resume_pid() {
+  local sid="$1" p
+  for p in $(pgrep -f "(-resume|-session-id) $sid" 2>/dev/null); do
+    # A fork's argv names the session it forked FROM, not the one it is.
+    case "$(ps -p "$p" -o command= 2>/dev/null)" in
+      *--fork-session*) continue ;;
+    esac
+    printf '%s\n' "$p"; return 0
+  done
+  return 0
+}
+
+# unbound_owner_pid <name>: a live claude process cl launched under this name
+# that cannot be tied to any session id — or nothing.
+#
+# `cl new` writes its launch record before Claude has chosen an id, so the
+# record is unbound ("-"), and session_pid rightly refuses it as proof of a
+# given id. Without Claude's registry entry (an older Claude Code, or one not
+# written yet) nothing else knows which id that process runs. It must then be
+# reported as unresolved, not taken for "nothing live": treated as absent, stop
+# skipped it, left it running, and still reported the fleet stopped. A process
+# the registry DOES place is excluded — it is provably some other session.
+unbound_owner_pid() {
+  local f rsid pid dir="${CL_CLAUDE_SESSIONS_DIR:-$HOME/.claude/sessions}" want now rid
+  f=$(reg_file "$1" claude)
+  [ -r "$f" ] || return 0
+  rsid=$(cut -f5 "$f" 2>/dev/null)
+  case "$rsid" in ''|-) ;; *) return 0 ;; esac
+  pid=$(registered_pid "$1" claude)
+  [ -n "$pid" ] || return 0
+  # Placed means a fresh entry that ALSO names a session claude_registry_pid
+  # could look up: a file with only a start time, or an id of a shape the lookup
+  # refuses (a reshaped registry, or one caught mid-write), places nothing. Both
+  # fields come from one read so they cannot straddle a rewrite.
+  if [ -f "$dir/$pid.json" ] && command -v jq >/dev/null 2>&1; then
+    IFS=$(printf '\t') read -r rid want <<EOF_REG
+$(jq -r 'if (.sessionId | type) == "string" then [.sessionId, (.procStart // "")] | @tsv else empty end' "$dir/$pid.json" 2>/dev/null)
+EOF_REG
+    want=$(printf '%s' "$want" | tr -s ' ' | sed 's/^ //; s/ $//')
+    now=$(TZ=UTC ps -p "$pid" -o lstart= 2>/dev/null | tr -s ' ' | sed 's/^ //; s/ $//')
+    sid_shape_ok "$rid" && [ -n "$want" ] && [ "$want" = "$now" ] && return 0
+  fi
+  printf '%s\n' "$pid"
+}
+
 session_pid() { # sid [agent] [name]
   local pid
   case "${2:-claude}" in
     codex) pgrep -f "codex.* resume $1( |\$)" 2>/dev/null | head -1 ;;
     *)
-      pid=$(pgrep -f "(-resume|-session-id) $1" 2>/dev/null | head -1)
-      [ -n "$pid" ] || [ -z "${3:-}" ] || pid=$(registered_pid "$3" claude)
+      pid=""
+      [ -z "${3:-}" ] || pid=$(registered_pid "$3" claude "$1")
+      [ -n "$pid" ] || pid=$(claude_registry_pid "$1")
+      [ -n "$pid" ] || pid=$(argv_resume_pid "$1")
       printf '%s\n' "$pid"
       ;;
   esac
@@ -2176,6 +2291,8 @@ agent_live() {
     return 0
   fi
   [ -n "$(session_pid "$sid" "$agent" "$name")" ] && return 0
+  # Not proof of THIS session, but start's bias is to skip on any sign of life.
+  [ "$agent" = "claude" ] && [ -n "$(unbound_owner_pid "$name")" ] && return 0
   # Qualified by sid like every other registry question: a live process for an
   # OLDER same-named thread must not suppress the restart of the saved one.
   [ "$agent" = "codex" ] && [ -n "$(registered_pid "$name" codex "$sid")" ] && return 0
@@ -2643,6 +2760,8 @@ handoff_target_busy() {
 #   2  signalled but still shutting down, the kill itself failed, or the
 #      session was not cl's to kill — ownership must NOT be treated as free
 #      (a caller must not launch a replacement under this name)
+#   3  left running — cl owns a live process under this name but cannot prove
+#      which session it runs (see unbound_owner_pid); never killed as this one
 retire_session() {
   local name="$1" sid="$2" t="$3" close_tabs="$4" agent="${5:-claude}"
   local ans pid ptok rrc _ppid _pcomm hint kids surv
@@ -2697,7 +2816,12 @@ retire_session() {
     fi
   else
     pid=$(session_pid "$sid" claude "$name")
-    [ -n "$pid" ] || return 0   # nothing live — already retired
+    if [ -z "$pid" ]; then
+      pid=$(unbound_owner_pid "$name")
+      [ -n "$pid" ] || return 0   # nothing live — already retired
+      printf '⚠ leaving %s — cl launched a process under this name (pid %s) but cannot prove it runs this session, so it is not killed. Close it in its own tab, or `kill %s` once you have checked.\n' "$name" "$pid" "$pid" >&2
+      return 3
+    fi
   fi
 
   # Captured now: a dead process has no start time to read back, and without
@@ -3303,7 +3427,8 @@ save_state() {
       # PARSE time, so the whole state write dies rather than one row.
       if [ "$agent" = "claude" ]; then
         tmux has-session -t "$(tmux_name "$name" claude)" 2>/dev/null \
-          || [ -n "$(session_pid "$sid" claude "$name")" ] || continue
+          || [ -n "$(session_pid "$sid" claude "$name")" ] \
+          || [ -n "$(unbound_owner_pid "$name")" ] || continue
       elif [ "$agent" = "codex" ]; then
         # The tmux arm has to demand the SAME proof the kill path does. Accepting
         # a session by name alone saved an unstamped collision as if cl had
@@ -3389,7 +3514,7 @@ do_stop() {
     printf 'saved %s session(s) to %s\n\n' "$count" "$STATE"
   fi
 
-  local name t hrc kept=0 nohandoff=0 kept_names="" resume_only=""
+  local name t hrc rrc kept=0 nohandoff=0 kept_names="" resume_only="" unresolved_names=""
   # Rotation accounting for the log. `sess_rotate` is decided PER SESSION, since
   # the stored policy can carry per-session overrides, so the mode recorded for
   # the whole stop is "mixed" when they disagreed — a week containing a mixed
@@ -3726,10 +3851,13 @@ do_stop() {
     # retire_session covers both branches (tmux-hosted and bare process)
     # with the busy-check-and-prompt, tab/surface cleanup, the hidden-tmux
     # ownership guard, and the Codex ownership rules — do_stop just runs it and
-    # moves on; its return value changes nothing here (a lost race, a decline,
-    # a slow shutdown, or a session that was not cl's to kill are all just
-    # "didn't get killed this time, re-run stop").
-    retire_session "$name" "$sid_i" "$t" "$close_tabs" "$agent"
+    # moves on; its return value mostly changes nothing here (a lost race, a
+    # decline, a slow shutdown, or a session that was not cl's to kill are all
+    # just "didn't get killed this time, re-run stop"). The exception is a live
+    # process cl owns but cannot tie to this session: re-running stop will not
+    # resolve that, so it must fail the stop rather than read as stopped.
+    rrc=0; retire_session "$name" "$sid_i" "$t" "$close_tabs" "$agent" || rrc=$?
+    [ "$rrc" = 3 ] && unresolved_names="${unresolved_names}${name}"$'\n'
   done
 
   [ -n "$dry_run" ] && return 0
@@ -3750,6 +3878,11 @@ do_stop() {
     printf '\n%s session(s) stopped WITHOUT a handoff — `cl start` will resume those as they were\n' "$nohandoff" >&2
     printf 'rather than rotating them. Use `cl stop --require-handoff` if rotation is the point.\n' >&2
   fi
+  if [ -n "$unresolved_names" ]; then
+    printf '\nleft running — cl owns these but cannot prove which session each runs:\n' >&2
+    printf '%s' "$unresolved_names" | sed '/^$/d; s/^/  · /' >&2
+    printf 'They are in the saved state; close them by hand before `cl start`.\n' >&2
+  fi
   if [ "$kept" -gt 0 ]; then
     printf '\n%s session(s) left running for want of a handoff:\n' "$kept" >&2
     printf '%s' "$kept_names" | sed '/^$/d; s/^/  · /' >&2
@@ -3758,7 +3891,7 @@ do_stop() {
     # a script, a shutdown hook, or a glance at the exit status.
     return 1
   fi
-  return 0
+  [ -z "$unresolved_names" ]
 }
 
 # open_iterm_tabs <shell-command>...: open one real iTerm tab per command.
