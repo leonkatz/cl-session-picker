@@ -10,7 +10,7 @@
 set -u
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 CL="$HERE/../bin/claude-session"
-FIX="$(mktemp -d "${TMPDIR:-/tmp}/cl-handoff.XXXXXX")"; trap 'rm -rf "$FIX"' EXIT
+FIX="$(mktemp -d "${TMPDIR:-/tmp}/cl-handoff.XXXXXX")"; trap 'live_down; rm -rf "$FIX"' EXIT
 
 # extract_fns <file> <name>... : the named shell functions, verbatim.
 #
@@ -64,6 +64,27 @@ touch -t "$(date -v-1H +%Y%m%d%H%M 2>/dev/null || date -d '-1 hour' +%Y%m%d%H%M)
   usage_line 5000 3000 1000
 } > "$HOME/.claude/projects/p1/sid-small.jsonl"
 
+# ── live sessions ───────────────────────────────────────────────────────────
+# `cl stop` plans only for sessions that are RUNNING (session_is_live), so a
+# fixture of bare transcripts is a fleet of closed sessions with nothing to ask.
+# These stand-ins make each fixture session live the way a real one is found
+# here — argv `claude --resume <sid>`, with no Claude registry under this HOME.
+# A real stop kills them, so live_up runs before every stop and respawns what is
+# gone. Detached stdio, because a child holding a $( ) pipe hangs the caller;
+# pids go to a file because $! set inside $( ) is lost with the subshell.
+LIVE_PIDS="$FIX/live.pids"
+live_up() {
+  local argv
+  for argv in "${LIVE_ARGV[@]}"; do
+    pgrep -f "^${argv} 600\$" >/dev/null 2>&1 && continue
+    /bin/sh -c "exec -a \"$argv\" sleep 600" </dev/null >/dev/null 2>&1 &
+    echo $! >> "$LIVE_PIDS"
+  done
+  sleep 0.3
+}
+live_down() { [ -f "$LIVE_PIDS" ] && xargs kill < "$LIVE_PIDS" 2>/dev/null; return 0; }
+LIVE_ARGV=("claude --resume sid-big" "claude --resume sid-small")
+
 run_list() {
   env -i HOME="$HOME" PATH="$BASEPATH" bash "$CL" --list 2>/dev/null
 }
@@ -98,6 +119,7 @@ rm -f "$CODEX_HOME/session_index.jsonl"; rm -rf "$HOME/.codex/sessions/2020"
 echo "handoff fallback (unreachable dir)"
 RO="$FIX/ro-parent"; mkdir -p "$RO"; chmod 000 "$RO"
 FALLBACK="$FIX/fallback-state"
+live_up
 stop_out=$(env -i HOME="$HOME" PATH="$BASEPATH" \
   CL_HANDOFF_DIR="$RO/hdir" CL_HANDOFF_FALLBACK_BASE="$FALLBACK" \
   bash "$CL" stop --dry-run 2>&1)
@@ -111,6 +133,7 @@ echo "handoff dir success (writable dir)"
 # as-yet-nonexistent base previews as unreachable even when a real run
 # would create it fine. See handoff_root_preview's comment for that tradeoff.
 HDIR="$FIX/dir-ok"; mkdir -p "$HDIR"
+live_up
 stop_out2=$(env -i HOME="$HOME" PATH="$BASEPATH" \
   CL_HANDOFF_DIR="$HDIR" \
   bash "$CL" stop --dry-run 2>&1)
@@ -122,6 +145,7 @@ state_exists=0; [ -e "$HOME/.config/claude-session/state.json" ] && state_exists
 check "no state.json written by a dry-run stop" "0" "$state_exists"
 
 echo "cl stop --no-handoff skips the handoff step entirely"
+live_up
 noh_out=$(env -i HOME="$HOME" PATH="$BASEPATH" CL_HANDOFF_DIR="$FIX/dir-noh" \
   bash "$CL" stop --no-handoff --keep-tabs 2>&1)
 not_contains "--no-handoff never asks for a handoff" "$noh_out" "asked"
@@ -197,6 +221,7 @@ BLOCKED_DIR="$FIX/blocked-dir"
 : > "$BLOCKED_DIR"                         # a FILE where the directory belongs
 BLOCKED_FALLBACK="$FIX/blocked-fallback"   # the fallback base itself is a FILE
 : > "$BLOCKED_FALLBACK"
+live_up
 blocked_out=$(env -i HOME="$HOME" PATH="$BASEPATH" \
   CL_HANDOFF_DIR="$BLOCKED_DIR" CL_HANDOFF_FALLBACK_BASE="$BLOCKED_FALLBACK" \
   CL_HANDOFF_TIMEOUT=1 bash "$CL" stop --keep-tabs 2>&1)
@@ -219,10 +244,11 @@ check "unknown name exits non-zero" "1" "$unk_rc"
 contains "…and says so" "$unk_out" "no claude session named"
 
 echo "plain 'cl start' (no --fresh) is unaffected"
-# The earlier --no-handoff run above was a REAL (non-dry-run) stop, so it
-# legitimately saved an empty state.json (no live sessions in this fixture) —
-# that's the one real write in this whole test file, and it makes "cl start"
-# report an empty saved state rather than crash.
+# An empty saved state, written explicitly. This used to rely on an earlier
+# real stop having saved one because nothing in the fixture was running; the
+# fixture's sessions are live now (see live_up), so that side effect is gone and
+# the case is stated instead of inherited.
+live_down; printf '[]\n' > "$HOME/.config/claude-session/state.json"
 plain_out=$(env -i HOME="$HOME" PATH="$BASEPATH" bash "$CL" start 2>&1); plain_rc=$?
 check "plain start exits non-zero on an empty saved state" "1" "$plain_rc"
 contains "…and says so rather than crashing" "$plain_out" "saved state is empty"
@@ -236,7 +262,7 @@ contains "…and says so rather than crashing" "$plain_out" "saved state is empt
 TMUX_TMPDIR="$FIX/tmux-tmp"; mkdir -p "$TMUX_TMPDIR"
 rtmux() { TMUX_TMPDIR="$TMUX_TMPDIR" tmux "$@"; }
 cleanup_rtmux() { rtmux kill-server >/dev/null 2>&1 || true; }
-trap 'cleanup_rtmux; rm -rf "$FIX"' EXIT
+trap 'cleanup_rtmux; live_down; rm -rf "$FIX"' EXIT
 
 echo "send_text_tmux really reaches the pane (real tmux, not a fake)"
 # Regression for the Codex-review finding: `send-keys -t "=name"` (no
@@ -278,6 +304,7 @@ rtmux new-session -d -s TmuxSendTarget -c "$FIX" "python3 $RECEIVER"
 # via a real (non-dry-run, non-handoff) `cl stop` against a discover fixture
 # that names OUR live tmux session.
 printf '{"cwd":"%s"}\n{"customTitle":"TmuxSendTarget"}\n' "$FIX" > "$HOME/.claude/projects/p1/sid-tmuxsend.jsonl"
+live_up
 env -i HOME="$HOME" PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
   CL_HANDOFF_DIR="$FIX/dir-send" CL_HANDOFF_TIMEOUT=2 \
   bash "$CL" stop --keep-tabs >/dev/null 2>&1
@@ -305,6 +332,7 @@ echo "cl stop --dry-run --no-handoff never kills (flag order/combination bug)"
 # `--dry-run --no-handoff` fell straight through to a real kill-session.
 rtmux new-session -d -s DryRunProbe -c "$FIX" 'sleep 30'
 printf '{"cwd":"%s"}\n{"customTitle":"DryRunProbe"}\n' "$FIX" > "$HOME/.claude/projects/p1/sid-dryrunprobe.jsonl"
+live_up
 env -i HOME="$HOME" PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
   bash "$CL" stop --dry-run --no-handoff >/dev/null 2>&1
 still_alive=0; rtmux has-session -t DryRunProbe 2>/dev/null && still_alive=1
@@ -403,8 +431,10 @@ echo "the dry run previews the same path a real run would write"
 # can disagree — and did, when the store layout changed under a rename: the
 # preview still advertised a Sessions/ level the real resolver had dropped.
 PV="$FIX/preview-agree"; mkdir -p "$PV"
+live_up
 prev=$(env -i HOME="$HOME" PATH="$BASEPATH" CL_HANDOFF_DIR="$PV" \
   bash "$CL" stop --dry-run 2>&1 | grep -o "$PV[^ ]*T-Big.md" | head -1)
+live_up
 env -i HOME="$HOME" PATH="$BASEPATH" CL_HANDOFF_DIR="$PV" CL_HANDOFF_TIMEOUT=1 \
   bash "$CL" stop --keep-tabs >/dev/null 2>&1
 real_dir_ok=0; [ -d "$PV" ] && real_dir_ok=1
@@ -478,6 +508,7 @@ echo "the fallback is write-probed, not just stat'd"
 RO2="$FIX/ro-fallback"; mkdir -p "$RO2/primary" "$RO2/fb"
 chmod 555 "$RO2/primary"      # primary exists but rejects writes -> fall back
 chmod 555 "$RO2/fb"           # fallback exists, is a dir, and ALSO rejects writes
+live_up
 fb_out=$(env -i HOME="$HOME" PATH="$BASEPATH" \
   CL_HANDOFF_DIR="$RO2/primary" CL_HANDOFF_FALLBACK_BASE="$RO2/fb" \
   CL_HANDOFF_TIMEOUT=1 bash "$CL" stop --keep-tabs 2>&1)
@@ -490,6 +521,7 @@ echo "dry run and a real run agree on a first install"
 # configured default — the divergence that matters most, on first use.
 NEW="$FIX/never-used/handoff"          # does not exist; its parent is writable
 NUFB="$FIX/nu-fallback"
+live_up
 new_out=$(env -i HOME="$HOME" PATH="$BASEPATH" CL_HANDOFF_DIR="$NEW" \
   CL_HANDOFF_FALLBACK_BASE="$NUFB" bash "$CL" stop --dry-run 2>&1)
 contains "the previewed path is under the configured dir" "$new_out" "$NEW/T-Big.md"
@@ -497,6 +529,7 @@ not_contains "…a creatable dir is not announced as unusable" "$new_out" "hando
 not_contains "…and the fallback is not named"               "$new_out" "nu-fallback"
 check "…while the dry run still creates nothing" "0" "$([ -e "$NEW" ] && echo 1 || echo 0)"
 # And prove the preview told the truth: a real run uses that same path.
+live_up
 env -i HOME="$HOME" PATH="$BASEPATH" CL_HANDOFF_DIR="$NEW" \
   CL_HANDOFF_FALLBACK_BASE="$NUFB" CL_HANDOFF_TIMEOUT=1 \
   bash "$CL" stop --keep-tabs >/dev/null 2>&1
@@ -614,6 +647,7 @@ echo "cl stop retries before giving up, then stops anyway"
 # the session rather than wedging the command.
 rtmux new-session -d -s KeepAlive -c "$FIX" 'sleep 30'
 printf '{"cwd":"%s"}\n{"customTitle":"KeepAlive"}\n' "$FIX" > "$HOME/.claude/projects/p1/sid-keepalive.jsonl"
+live_up
 keep_out=$(env -i HOME="$HOME" PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
   CL_HANDOFF_DIR="$FIX/keep-store" CL_HANDOFF_TIMEOUT=1 CL_HANDOFF_ATTEMPTS=2 \
   bash "$CL" stop --keep-tabs 2>&1)
@@ -660,6 +694,7 @@ rtmux new-session -d -s ManualTarget -c "$FIX" 'sleep 30'
 printf '{"cwd":"%s"}\n{"customTitle":"ManualTarget"}\n' "$FIX" > "$HOME/.claude/projects/p1/sid-manual.jsonl"
 MSTORE="$FIX/manual-honour"; mkdir -p "$MSTORE"
 printf 'written by hand\n<!-- cl:manual:2026-09-24T00:00:00Z -->\n' > "$MSTORE/ManualTarget.md"
+live_up
 man_out=$(env -i HOME="$HOME" PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
   CL_HANDOFF_DIR="$MSTORE" CL_HANDOFF_TIMEOUT=1 bash "$CL" stop --keep-tabs 2>&1)
 contains "the hand-written handoff is used"        "$man_out" "handoff you wrote by hand"
@@ -736,6 +771,7 @@ check "three rotations in the same second keep three files" "3" "$(ls "$CC/consu
 echo "cl stop stops a session even when no handoff arrives"
 rtmux new-session -d -s PlainStop -c "$FIX" 'sleep 30'
 printf '{"cwd":"%s"}\n{"customTitle":"PlainStop"}\n' "$FIX" > "$HOME/.claude/projects/p1/sid-plainstop.jsonl"
+live_up
 ps_out=$(env -i HOME="$HOME" PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
   CL_HANDOFF_DIR="$FIX/ps-store" CL_HANDOFF_TIMEOUT=1 CL_HANDOFF_ATTEMPTS=1 \
   bash "$CL" stop --keep-tabs 2>&1); ps_rc=$?
@@ -749,6 +785,7 @@ rm -f "$HOME/.claude/projects/p1/sid-plainstop.jsonl"
 echo "--require-handoff opts back in to failing closed"
 rtmux new-session -d -s StrictStop -c "$FIX" 'sleep 30'
 printf '{"cwd":"%s"}\n{"customTitle":"StrictStop"}\n' "$FIX" > "$HOME/.claude/projects/p1/sid-strict.jsonl"
+live_up
 st_out=$(env -i HOME="$HOME" PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
   CL_HANDOFF_DIR="$FIX/st-store" CL_HANDOFF_TIMEOUT=1 CL_HANDOFF_ATTEMPTS=1 \
   bash "$CL" stop --keep-tabs --require-handoff 2>&1); st_rc=$?
@@ -766,6 +803,7 @@ rtmux new-session -d -s KeepPrior -c "$FIX" 'sleep 30'
 printf '{"cwd":"%s"}\n{"customTitle":"KeepPrior"}\n' "$FIX" > "$HOME/.claude/projects/p1/sid-keepprior.jsonl"
 KP="$FIX/keep-prior"; mkdir -p "$KP"
 printf 'good work from the previous cycle\n\n<!-- cl:clho:9:9:9:9 -->\n' > "$KP/KeepPrior.md"
+live_up
 env -i HOME="$HOME" PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
   CL_HANDOFF_DIR="$KP" CL_HANDOFF_TIMEOUT=1 CL_HANDOFF_ATTEMPTS=1 \
   bash "$CL" stop --keep-tabs >/dev/null 2>&1
@@ -781,6 +819,7 @@ rtmux new-session -d -s SkipRot -c "$FIX" 'sleep 30'
 printf '{"cwd":"%s"}\n{"customTitle":"SkipRot"}\n' "$FIX" > "$HOME/.claude/projects/p1/sid-skiprot.jsonl"
 SK="$FIX/skip-store"; mkdir -p "$SK"
 printf 'from an earlier cycle\n\n<!-- cl:clho:5:5:5:5 -->\n' > "$SK/SkipRot.md"
+live_up
 env -i HOME="$HOME" PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
   CL_HANDOFF_DIR="$SK" bash "$CL" stop --keep-tabs --no-handoff >/dev/null 2>&1
 check "--no-handoff clears the pending handoff" "0" "$([ -e "$SK/SkipRot.md" ] && echo 1 || echo 0)"
@@ -996,6 +1035,7 @@ rtmux new-session -d -s RoOnly -c "$FIX" 'sleep 30'
 printf '{"cwd":"%s"}\n{"customTitle":"RoOnly"}\n' "$FIX" > "$HOME/.claude/projects/p1/sid-roonly.jsonl"
 RO="$FIX/resume-only"; mkdir -p "$RO"
 printf 'OLD notes from an earlier cycle\n\n<!-- cl:clho:1:1:1:1 -->\n' > "$RO/RoOnly.md"
+live_up
 env -i HOME="$HOME" PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
   CL_HANDOFF_DIR="$RO" CL_HANDOFF_TIMEOUT=1 CL_HANDOFF_ATTEMPTS=1 \
   bash "$CL" stop --keep-tabs >/dev/null 2>&1
@@ -1016,6 +1056,7 @@ printf '{"cwd":"%s"}\n{"customTitle":"SkipHard"}\n' "$FIX" > "$HOME/.claude/proj
 SH="$FIX/skip-hard"; mkdir -p "$SH"
 printf 'pending\n\n<!-- cl:clho:2:2:2:2 -->\n' > "$SH/SkipHard.md"
 : > "$SH/consumed"     # the clear cannot succeed
+live_up
 env -i HOME="$HOME" PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
   CL_HANDOFF_DIR="$SH" bash "$CL" stop --keep-tabs --no-handoff >/dev/null 2>&1
 check "the row still records resume-only" "1" \

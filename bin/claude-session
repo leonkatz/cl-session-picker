@@ -3397,6 +3397,37 @@ archive_state() {
 # the second run those killed earlier are no longer live, and an overwrite
 # would drop them from the saved set. `cl start` clears STATE once consumed,
 # so a clean stop→start cycle never accumulates stale entries.
+# session_is_live <name> <sid> <agent>: 0 if this session is running now, by the
+# rule that decides whether `cl stop` SAVES it. One definition, because two
+# places need it — save_state (what comes back on `cl start`) and do_stop (who is
+# asked for a handoff, counted, and retired) — and if they ever disagreed, a stop
+# could ask for a handoff from a session it was not going to save, or fail to
+# ask one it was.
+#
+#   claude: its tmux session exists, session_pid finds its process, or cl owns
+#           a live process under this name that it cannot tie to any session
+#           (unbound_owner_pid) — that one is kept and reported, never dropped.
+#   codex:  a tmux session cl provably owns, or cl's own launch record. Never a
+#           name match alone — that saved an unstamped collision as if cl had
+#           launched it, which stop then (correctly) refused to kill.
+session_is_live() {
+  local name="$1" sid="$2" agent="$3"
+  if [ "$agent" = "claude" ]; then
+    tmux has-session -t "$(tmux_name "$name" claude)" 2>/dev/null && return 0
+    [ -n "$(session_pid "$sid" claude "$name")" ] && return 0
+    [ -n "$(unbound_owner_pid "$name")" ]
+    return $?
+  elif [ "$agent" = "codex" ]; then
+    if tmux has-session -t "$(tmux_name "$name" codex)" 2>/dev/null \
+       && tmux_owned "$(tmux_name "$name" codex)" codex "$sid"; then
+      return 0
+    fi
+    [ -n "$(registered_pid "$name" codex "$sid")" ]
+    return $?
+  fi
+  return 1
+}
+
 save_state() {
   mkdir -p "$(dirname "$STATE")" || { echo "claude-session: cannot create state dir" >&2; return 1; }
 
@@ -3425,26 +3456,10 @@ save_state() {
       # if/elif, not case: this runs inside a command substitution, and bash
       # mis-parses a `case` whose arms carry nested $( ) there — it fails at
       # PARSE time, so the whole state write dies rather than one row.
-      if [ "$agent" = "claude" ]; then
-        tmux has-session -t "$(tmux_name "$name" claude)" 2>/dev/null \
-          || [ -n "$(session_pid "$sid" claude "$name")" ] \
-          || [ -n "$(unbound_owner_pid "$name")" ] || continue
-      elif [ "$agent" = "codex" ]; then
-        # The tmux arm has to demand the SAME proof the kill path does. Accepting
-        # a session by name alone saved an unstamped collision as if cl had
-        # launched it; stop then (correctly) refused to kill it, leaving a
-        # restart row that would later resume a second client on that thread.
-        if tmux has-session -t "$(tmux_name "$name" codex)" 2>/dev/null \
-           && tmux_owned "$(tmux_name "$name" codex)" codex "$sid"; then
-          :
-        elif [ -n "$(registered_pid "$name" codex "$sid")" ]; then
-          :
-        else
-          continue
-        fi
-      else
-        continue
-      fi
+      # The rule lives in session_is_live, shared with the planning pass of
+      # do_stop. (No apostrophes in here: this is inside $( ), where bash 3.2
+      # tries to pair quotes even in comments.)
+      session_is_live "$name" "$sid" "$agent" || continue
       [ "$first" -eq 1 ] && first=0 || printf ','
       jq -nc --arg name "$name" --arg sid "$sid" --arg cwd "$cwd" --arg agent "$agent" \
         '{name:$name, sid:$sid, cwd:$cwd, agent:$agent}'
@@ -3584,8 +3599,35 @@ do_stop() {
   # session, _manual those already answered by hand, _to_ask what will actually
   # be dispatched, _sent what was, and _done what landed during THIS run.
   local _n=0 i _eligible=0 _manual=0 _to_ask=0 _sent=0 sid cwd epoch agent
+  local _notlive=""
   while IFS=$'\t' read -r name sid cwd epoch agent; do
     case "$agent" in claude|codex) ;; *) continue ;; esac
+    # ONLY SESSIONS THAT ARE RUNNING. Discovery lists every transcript, live or
+    # not, and this used to plan for all of them: a session closed weeks ago was
+    # "asked" for a handoff it could not write, counted in "asking N", retired
+    # as a no-op and logged as stopped in the rotation stats — while
+    # save_state, by the same rule, never saved it, so it would not have come
+    # back anyway. One rule decides both now (session_is_live), so a stop asks
+    # exactly the sessions it is going to save.
+    #
+    # Except a Codex thread with any TRACE of a client — a tmux session at its
+    # name, or a process matching its id. That is not proof cl owns it (so it is
+    # not saved), but retire_session must still see it, because that is what says
+    # "left it — not cl's to kill" instead of letting a running thread pass
+    # unremarked. Codex rows are never asked for a handoff, so planning one asks
+    # nothing.
+    if ! session_is_live "$name" "$sid" "$agent"; then
+      if [ "$agent" = "codex" ] && { tmux has-session -t "=$(tmux_name "$name" codex)" 2>/dev/null \
+           || [ -n "$(session_pid "$sid" codex "$name")" ]; }; then
+        :
+      else
+        # Named for Claude only. Discovery lists EVERY stored Codex thread, and
+        # naming dozens of dormant ones on each stop is the noise retire_session
+        # was written to avoid.
+        [ "$agent" = "claude" ] && _notlive="${_notlive}${_notlive:+, }${name}"
+        continue
+      fi
+    fi
     # Resolve the policy for THIS session. A flag on the command outranks
     # everything, because it is the most explicit thing the operator can say;
     # below that, CL_ROTATE for a one-off, then the stored setting.
@@ -3625,6 +3667,8 @@ do_stop() {
     fi
     _n=$((_n+1))
   done <<< "$_rows"
+  # Said once, so a session the operator expected back is not a silent surprise.
+  [ -n "$_notlive" ] && printf 'not running, so left as they are (reopen with `cl "<name>"`): %s\n\n' "$_notlive" >&2
   _to_ask=$(( _eligible - _manual ))
 
   # ── PASS 2: BROADCAST ───────────────────────────────────────────────────────

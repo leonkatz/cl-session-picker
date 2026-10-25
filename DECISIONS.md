@@ -4,6 +4,29 @@ Form-factor choices that could have gone another way. Each entry records what
 was chosen, what it forecloses, and what would reverse it — so a later change
 is a deliberate reversal, not an accident.
 
+## 2026-10-25 — `cl stop` plans only for sessions that are running
+
+**Chose:** one rule, `session_is_live`, decides both who `cl stop` asks for a
+handoff and who `save_state` saves. A Claude session that is not running is named
+once ("not running, so left as they are") and neither asked, counted nor retired.
+An unprovable `cl new` owner counts as live, so it is still saved and reported.
+
+**Forecloses:** "asking 13" when two of the thirteen were closed weeks ago, and the
+rotation log counting closed sessions as stopped.
+
+**Kept on purpose:** a Codex thread with any trace of a client (a tmux session at
+its name, or a process matching its id) is still planned, though not saved, so
+`retire_session` keeps saying "left it, not cl's to kill" instead of the thread
+passing unremarked. Codex threads are never asked for a handoff, so planning one
+asks nothing. Dormant Codex threads are not named: discovery lists every stored
+thread, and naming dozens each stop is noise.
+
+**Tests:** fixtures that were bare transcripts now run stand-in processes, so a
+stop has live sessions to plan for, the way a real machine does.
+
+**Reverses by:** planning from discovery again, which brings back asking sessions
+that cannot answer.
+
 ## 2026-10-21 — which process runs a Claude session: cl's own record, then Claude Code's registry, argv last
 
 **Chose:** `session_pid` answers from three sources in order. First `cl`'s launch
