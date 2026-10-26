@@ -20,7 +20,7 @@ set -u
 
 CL="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/bin/claude-session"
 [ -x "$CL" ] || { printf 'FIXTURE SETUP FAILED: %s not executable\n' "$CL" >&2; exit 2; }
-FIX="$(mktemp -d "${TMPDIR:-/tmp}/cl-rotate.XXXXXX")"; trap 'rm -rf "$FIX"' EXIT
+FIX="$(mktemp -d "${TMPDIR:-/tmp}/cl-rotate.XXXXXX")"; trap 'live_down; rm -rf "$FIX"' EXIT
 pass=0; fail=0
 check() { if [ "$2" = "$3" ]; then pass=$((pass+1)); printf '  ok   %s\n' "$1"; else fail=$((fail+1)); printf '  FAIL %s\n       expected [%s] got [%s]\n' "$1" "$2" "$3"; fi; }
 has()  { case "$2" in *"$3"*) pass=$((pass+1)); printf '  ok   %s\n' "$1" ;; *) fail=$((fail+1)); printf '  FAIL %s\n       wanted [%s] in: %s\n' "$1" "$3" "$2" ;; esac; }
@@ -65,7 +65,28 @@ BASEPATH="$FIX/bin:/usr/bin:/bin"
 # CL_HANDOFF_BUDGET=1 throughout: these cases are about WHETHER a handoff is asked
 # for, never about waiting for one. On the 300s default each stop would block for
 # five minutes and the suite would look hung instead of failing.
-cl() { ( cd "$FIX" && env -i HOME="$HOME" CODEX_HOME="$CODEX_HOME" PATH="$BASEPATH" CL_HANDOFF_BUDGET=1 \
+# ── live sessions ───────────────────────────────────────────────────────────
+# `cl stop` plans only for sessions that are RUNNING (session_is_live), so a
+# fixture of bare transcripts is a fleet of closed sessions with nothing to ask.
+# These stand-ins make each fixture session live the way a real one is found
+# here — argv `claude --resume <sid>`, with no Claude registry under this HOME.
+# A real stop kills them, so live_up runs before every stop and respawns what is
+# gone. Detached stdio, because a child holding a $( ) pipe hangs the caller;
+# pids go to a file because $! set inside $( ) is lost with the subshell.
+LIVE_PIDS="$FIX/live.pids"
+live_up() {
+  local argv
+  for argv in "${LIVE_ARGV[@]}"; do
+    pgrep -f "^${argv} 600\$" >/dev/null 2>&1 && continue
+    /bin/sh -c "exec -a \"$argv\" sleep 600" </dev/null >/dev/null 2>&1 &
+    echo $! >> "$LIVE_PIDS"
+  done
+  sleep 0.3
+}
+live_down() { [ -f "$LIVE_PIDS" ] && xargs kill < "$LIVE_PIDS" 2>/dev/null; return 0; }
+LIVE_ARGV=("claude --resume $SID_A" "claude --resume $SID_B" "codex resume $SID_G")
+
+cl() { [ "${1:-}" = stop ] && live_up; ( cd "$FIX" && env -i HOME="$HOME" CODEX_HOME="$CODEX_HOME" PATH="$BASEPATH" CL_HANDOFF_BUDGET=1 \
          ${CL_ROTATE+CL_ROTATE="$CL_ROTATE"} ${CL_SESSION_NAME+CL_SESSION_NAME="$CL_SESSION_NAME"} \
          bash "$CL" "$@" ) ; }
 # cl_nosession — the same, with CL_SESSION_NAME deliberately NOT forwarded.
@@ -77,7 +98,7 @@ cl() { ( cd "$FIX" && env -i HOME="$HOME" CODEX_HOME="$CODEX_HOME" PATH="$BASEPA
 # `this session ("<the real session name>"): rotation on` for anyone running
 # normal way, and passed only in a bare shell. Verified pre-existing on
 # untouched main, 2026-10-09.
-cl_nosession() { ( cd "$FIX" && env -i HOME="$HOME" CODEX_HOME="$CODEX_HOME" PATH="$BASEPATH" \
+cl_nosession() { [ "${1:-}" = stop ] && live_up; ( cd "$FIX" && env -i HOME="$HOME" CODEX_HOME="$CODEX_HOME" PATH="$BASEPATH" \
          CL_HANDOFF_BUDGET=1 ${CL_ROTATE+CL_ROTATE="$CL_ROTATE"} \
          bash "$CL" "$@" ) ; }
 
