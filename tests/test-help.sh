@@ -28,15 +28,29 @@ out=$(cl stop --help); rc=$?
 check "exits 0" "0" "$rc"
 # Every flag the parser accepts, read from the parser itself, must be listed —
 # and every flag listed must be one the parser accepts.
-accepted=$(awk '/^do_stop\(\)/,/^}/' "$CL" | grep -oE '^ +--[a-z-]+(\|--[a-z-]+)*\)' | tr -d ' )' | tr '|' '\n' | sort -u)
+# Short flags too (-h): a long-only pattern silently skipped them.
+accepted=$(awk '/^do_stop\(\)/,/^}/' "$CL" | grep -oE '^ +-{1,2}[a-z][a-z-]*(\|-{1,2}[a-z][a-z-]*)*\)' | tr -d ' )' | tr '|' '\n' | sort -u)
 [ -n "$accepted" ] || { echo "FIXTURE: could not read the stop flags from the parser" >&2; exit 2; }
 for f in $accepted; do has "lists $f" "$out" "$f"; done
-listed=$(printf '%s\n' "$out" | grep -oE '(^|[ (])--[a-z][a-z-]+' | tr -d ' (' | sort -u)
+listed=$(printf '%s\n' "$out" | grep -oE '(^|[ (,])-{1,2}[a-z][a-z-]*' | tr -d ' (,' | sort -u)
 for f in $listed; do
   printf '%s\n' "$accepted" | grep -qxF -- "$f" && { pass=$((pass+1)); printf '  ok   %s\n' "$f is a real stop flag"; } \
     || { fail=$((fail+1)); printf '  FAIL %s\n' "$f is listed but cl stop does not accept it"; }
 done
 check "asking for help stopped nothing and saved nothing" "0" "$(find "$FIX/home" -type f | wc -l | tr -d ' ')"
+
+printf 'help needs no runtime prerequisite\n'
+# stop needs jq to work, but not to explain itself: a machine missing jq is
+# exactly where someone reaches for --help.
+mkdir -p "$FIX/nojq"
+for t in bash sh env cat awk sed grep tr sort head tail wc date mkdir dirname basename uname id ps pgrep; do
+  p=$(command -v "$t") && ln -sf "$p" "$FIX/nojq/$t"
+done
+out=$(env -i HOME="$FIX/home" PATH="$FIX/nojq" TERM_PROGRAM= "$FIX/nojq/bash" "$CL" stop --help 2>&1); rc=$?
+check "cl stop --help works with no jq on PATH" "0" "$rc"
+has "…and prints the help" "$out" "--no-handoff"
+out=$(env -i HOME="$FIX/home" PATH="$FIX/nojq" TERM_PROGRAM= "$FIX/nojq/bash" "$CL" stop --dry-run 2>&1); rc=$?
+check "control: an actual stop without jq still refuses" "1" "$rc"
 
 printf 'an unknown stop flag points at the help\n'
 out=$(cl stop --bogus); rc=$?

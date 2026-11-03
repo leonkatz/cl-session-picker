@@ -3490,7 +3490,6 @@ save_state() {
 # that look mid-task, and leave those running. Re-run `cl stop` to catch them
 # once they go idle.
 do_stop() {
-  command -v jq >/dev/null 2>&1 || { echo "claude-session: stop needs jq (brew install jq)" >&2; exit 1; }
   local keep_tabs=0 no_handoff=0 dry_run="" require_handoff=0
   # Flags are order-independent — `cl stop --no-handoff --keep-tabs` and
   # `cl stop --keep-tabs --no-handoff` must do the same thing.
@@ -3509,6 +3508,8 @@ do_stop() {
       *) echo "claude-session: stop: unrecognised flag '$arg' (cl stop --help)" >&2; exit 1 ;;
     esac
   done
+  # AFTER the flags: help must answer before any runtime prerequisite does.
+  command -v jq >/dev/null 2>&1 || { echo "claude-session: stop needs jq (brew install jq)" >&2; exit 1; }
   # No precondition here. "No tmux server" stopped meaning "nothing to stop"
   # the moment sessions began running without tmux, and every cheap substitute
   # (is any process named claude alive?) fails the same way: it cannot know
@@ -4641,7 +4642,9 @@ rows() {
 # short and one flag per line; the reasoning lives in the header comment above.
 print_stop_help() {
   cat <<'EOF'
-cl stop [flags]   ask each running session for a handoff, save them, stop them
+cl stop [flags]   request handoffs from eligible Claude sessions (rotation on),
+                  then save and stop every running session. Codex sessions are
+                  never asked; they resume as they were.
 
   --no-handoff        stop without asking for handoffs; `cl start` resumes
                       each session as it was (and clears any pending handoff)
@@ -4649,6 +4652,7 @@ cl stop [flags]   ask each running session for a handoff, save them, stop them
                       without a handoff (alias: --rotate)
   --keep-tabs         leave the iTerm tabs open
   --dry-run           show what would happen; change nothing
+  -h, --help          this help
 
   Handoff wait: CL_HANDOFF_TIMEOUT per round (180s), CL_HANDOFF_BUDGET in
   total (300s). Asks before killing a session that is still mid-task.
@@ -4667,7 +4671,8 @@ cl — pick, launch and resume named Claude Code and Codex sessions
                               start a new named session (dir defaults to here;
                               -d uses $CL_DEFAULT_DIR)
 
-  cl stop [flags]             handoff, save and stop every running session
+  cl stop [flags]             request handoffs where configured, then save and
+                              stop every running session
                               (`cl stop --help` for the flags, e.g. --no-handoff)
   cl start                    bring back the sessions from the last stop
   cl start --fresh "Name" [--dry-run]
