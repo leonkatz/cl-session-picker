@@ -63,7 +63,7 @@ check "…and both were stopped" "deaddead" \
   "$(for p in $PIDS; do kill -0 "$p" 2>/dev/null && printf alive || printf dead; done)"
 
 printf 'a session cl could not stop fails the stop\n'
-# Exit 0 must mean everything cl manages is stopped (Leon, 2026-11-03). A
+# Exit 0 must mean everything cl manages is stopped (owner decision, 2026-11-03). A
 # stand-in that ignores SIGTERM is still running when the shutdown wait ends.
 S4=01a00000-0000-7000-8000-000000000004
 mk "$S4" Stubborn

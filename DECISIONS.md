@@ -17,7 +17,7 @@ reported and left alone, but it is not this stop's failure; counting it would
 fail every `cl stop` while the Codex app has a thread open.
 
 **Why:** a shutdown script or hook reads the exit status. Before this, a
-declined or failed retirement was reported on stderr but returned 0 (Leon,
+declined or failed retirement was reported on stderr but returned 0 (owner decision,
 2026-11-03).
 
 **Reverses by:** treating "re-run stop" cases as success again, which brings back

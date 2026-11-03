@@ -3904,7 +3904,7 @@ do_stop() {
     # collects what it left. Anything cl manages that is still running when
     # stop returns — a declined busy session, a slow or failed shutdown, an
     # owner cl cannot tie to a session — fails the stop, so a script can trust
-    # exit 0 to mean "everything cl manages is stopped" (Leon, 2026-11-03).
+    # exit 0 to mean "everything cl manages is stopped" (owner decision, 2026-11-03).
     # Code 4 is the one exception: not cl's to stop, so not this stop's failure.
     rrc=0; retire_session "$name" "$sid_i" "$t" "$close_tabs" "$agent" || rrc=$?
     case "$rrc" in
