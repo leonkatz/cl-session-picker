@@ -4643,8 +4643,9 @@ rows() {
 print_stop_help() {
   cat <<'EOF'
 cl stop [flags]   request handoffs from eligible Claude sessions (rotation on),
-                  then save and stop every running session. Codex sessions are
-                  never asked; they resume as they were.
+                  then save running sessions and stop each one it can safely
+                  retire. Codex sessions are never asked; they resume as they
+                  were. Anything left running is named, and the exit is non-zero.
 
   --no-handoff        stop without asking for handoffs; `cl start` resumes
                       each session as it was (and clears any pending handoff)
@@ -4671,8 +4672,8 @@ cl — pick, launch and resume named Claude Code and Codex sessions
                               start a new named session (dir defaults to here;
                               -d uses $CL_DEFAULT_DIR)
 
-  cl stop [flags]             request handoffs where configured, then save and
-                              stop every running session
+  cl stop [flags]             request configured handoffs, save running sessions,
+                              and stop those it can safely retire
                               (`cl stop --help` for the flags, e.g. --no-handoff)
   cl start                    bring back the sessions from the last stop
   cl start --fresh "Name" [--dry-run]
