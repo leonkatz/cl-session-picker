@@ -2777,6 +2777,14 @@ retire_session() {
     # exact promise this path advertises.
     if [ "$agent" = "codex" ] && ! tmux_owned "$t" codex "$sid"; then
       printf '⚠ leaving %s — a tmux session sits at %s but carries no cl ownership stamp for this thread; not cl'"'"'s to kill.\n' "$name" "$t" >&2
+      # The foreign container is not cl's, but that does not prove nothing of
+      # cl's is running for this thread: an exact launch record can name a bare
+      # Codex process cl DID launch, colliding on the derived tmux name. Then
+      # this is a stop that left cl's own process running, not a foreign one.
+      if [ -n "$(registered_pid "$name" codex "$sid")" ]; then
+        printf '⚠ …and cl'"'"'s own Codex process for %s is still running beside it — left for a retry; close the foreign tmux session first\n' "$name" >&2
+        return 2
+      fi
       return 4
     fi
     if session_busy "$t"; then
