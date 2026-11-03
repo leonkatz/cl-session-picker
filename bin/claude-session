@@ -110,8 +110,8 @@
 #   claude-session restore    # restore state.json from the newest history
 #                             #   snapshot (add --list to pick; then run start)
 #
-# cmux is NOT supported (removed 2026-10-20; see DECISIONS.md). Run cl from
-# iTerm or a plain terminal.
+# `cl --help` prints the curated text in print_help, not this header: the header
+# is for maintainers and explains WHY; help says what to type.
 
 PROJECTS="$HOME/.claude/projects"
 # Codex CLI storage. Both files are private implementation details of the Codex
@@ -3505,7 +3505,8 @@ do_stop() {
       # you most need stopped.
       --require-handoff|--rotate) require_handoff=1 ;;
       --dry-run)    dry_run="--dry-run" ;;
-      *) echo "claude-session: stop: unrecognised flag '$arg'" >&2; exit 1 ;;
+      -h|--help)    print_stop_help; exit 0 ;;
+      *) echo "claude-session: stop: unrecognised flag '$arg' (cl stop --help)" >&2; exit 1 ;;
     esac
   done
   # No precondition here. "No tmux server" stopped meaning "nothing to stop"
@@ -4636,6 +4637,54 @@ rows() {
   done
 }
 
+# print_stop_help / print_help: what `cl --help` and `cl stop --help` show. Kept
+# short and one flag per line; the reasoning lives in the header comment above.
+print_stop_help() {
+  cat <<'EOF'
+cl stop [flags]   ask each running session for a handoff, save them, stop them
+
+  --no-handoff        stop without asking for handoffs; `cl start` resumes
+                      each session as it was (and clears any pending handoff)
+  --require-handoff   fail closed: exit non-zero if a session is left running
+                      without a handoff (alias: --rotate)
+  --keep-tabs         leave the iTerm tabs open
+  --dry-run           show what would happen; change nothing
+
+  Handoff wait: CL_HANDOFF_TIMEOUT per round (180s), CL_HANDOFF_BUDGET in
+  total (300s). Asks before killing a session that is still mid-task.
+EOF
+}
+
+print_help() {
+  cat <<'EOF'
+cl — pick, launch and resume named Claude Code and Codex sessions
+
+  cl                          picker
+  cl <name>                   launch or resume that session
+  cl --codex|--claude <name>  same, when a name exists for both agents
+  cl --list                   list sessions (--codex / --claude to filter)
+  cl new [--codex] [--model <id>] "Name" [dir|-d]
+                              start a new named session (dir defaults to here;
+                              -d uses $CL_DEFAULT_DIR)
+
+  cl stop [flags]             handoff, save and stop every running session
+                              (`cl stop --help` for the flags, e.g. --no-handoff)
+  cl start                    bring back the sessions from the last stop
+  cl start --fresh "Name" [--dry-run]
+                              rotate ONE session onto a fresh one via its handoff
+  cl restore [--list]         restore the saved set from an earlier snapshot
+
+  cl handoff [--path]         write THIS session's handoff by hand
+  cl rotate [status|on|off|clear|stats] ["Name"]
+                              whether `cl stop` asks for handoffs
+  cl model [--codex|--claude] [<name> <model-id>|<name> -]
+                              the model remembered per session
+
+  In iTerm the agent runs as the tab's own process; elsewhere inside tmux when
+  available. Details and reasoning: the header of this script.
+EOF
+}
+
 # Optional agent filter for direct launch: `cl --codex <name>` / `cl --claude <name>`.
 AGENT_FILTER=""
 case "${1:-}" in
@@ -4671,7 +4720,7 @@ case "${1:-}" in
       printf '%-2s %-22s %s %-8s %-6s %-6s %-6s %s\n' "$(live_dot "$name" "$sid" "$agent")" "$name" "$(agent_tag "$agent")" "$(reltime "$epoch")" "$(fmt_ctx "$ctx")" "$(rotate_cell "$name" "$agent" "$_lroot")" "$(rotate_hint "$ctx" "$epoch" "$agent")" "$cwd"
     done
     exit 0 ;;
-  -h|--help) awk 'NR>1 && !/^#/{exit} NR>1{print}' "$0"; exit 0 ;;
+  -h|--help) print_help; exit 0 ;;
   '') : ;;  # fall through to picker
   *)
     # `cl <name> --rotate-from <path>`: internal, emitted by `cl start` for a
