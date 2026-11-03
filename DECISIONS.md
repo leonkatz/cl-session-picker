@@ -4,6 +4,25 @@ Form-factor choices that could have gone another way. Each entry records what
 was chosen, what it forecloses, and what would reverse it — so a later change
 is a deliberate reversal, not an accident.
 
+## 2026-11-03 — `cl stop` exits non-zero whenever it leaves a session of its own running
+
+**Chose:** any session cl manages that is still running when `cl stop` returns
+fails the stop: a declined busy prompt, a slow or failed shutdown, a session
+owned by a tmux server cl cannot see, an owner it cannot tie to a session, a
+missing required handoff. Exit 0 means everything cl manages is stopped.
+
+**Kept out, with its own code (`retire_session` 4):** a Codex thread cl did not
+launch — an unstamped tmux session, the Desktop app, a `--remote` client. It is
+reported and left alone, but it is not this stop's failure; counting it would
+fail every `cl stop` while the Codex app has a thread open.
+
+**Why:** a shutdown script or hook reads the exit status. Before this, a
+declined or failed retirement was reported on stderr but returned 0 (Leon,
+2026-11-03).
+
+**Reverses by:** treating "re-run stop" cases as success again, which brings back
+a 0 that does not mean stopped.
+
 ## 2026-10-25 — `cl stop` plans only for sessions that are running
 
 **Chose:** one rule, `session_is_live`, decides both who `cl stop` asks for a
