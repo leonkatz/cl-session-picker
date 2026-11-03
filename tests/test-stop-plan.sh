@@ -62,5 +62,21 @@ check "saved: the two running sessions, and only those" "Open-One Open-Two" \
 check "…and both were stopped" "deaddead" \
   "$(for p in $PIDS; do kill -0 "$p" 2>/dev/null && printf alive || printf dead; done)"
 
+printf 'a session cl could not stop fails the stop\n'
+# Exit 0 must mean everything cl manages is stopped (owner decision, 2026-11-03). A
+# stand-in that ignores SIGTERM is still running when the shutdown wait ends.
+S4=01a00000-0000-7000-8000-000000000004
+mk "$S4" Stubborn
+/bin/sh -c "trap '' TERM; exec -a \"claude --resume $S4\" sleep 600" </dev/null >/dev/null 2>&1 &
+STUB=$!; PIDS="$PIDS $STUB"; disown "$STUB" 2>/dev/null || true
+sleep 0.5
+out=$(cl stop --no-handoff --keep-tabs); rc=$?
+check "premise: it survived the stop" "alive" "$(kill -0 "$STUB" 2>/dev/null && echo alive || echo dead)"
+check "the stop exits non-zero" "1" "$rc"
+check "…naming it as left running" "1" "$(printf '%s\n' "$out" | grep -A3 '^left running — declined' | grep -c 'Stubborn')"
+kill -9 "$STUB" 2>/dev/null; sleep 0.3
+out=$(cl stop --no-handoff --keep-tabs); rc=$?
+check "control: once nothing is left running, the stop exits 0" "0" "$rc"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

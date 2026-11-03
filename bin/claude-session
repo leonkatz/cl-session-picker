@@ -2757,11 +2757,15 @@ handoff_target_busy() {
 # Returns:
 #   0  retired — confirmed gone, or nothing was live to begin with
 #   1  left running — the operator declined a "kill/retire anyway?" prompt
-#   2  signalled but still shutting down, the kill itself failed, or the
-#      session was not cl's to kill — ownership must NOT be treated as free
+#   2  signalled but still shutting down, the kill itself failed, or a tmux
+#      server cl cannot see owns it — ownership must NOT be treated as free
 #      (a caller must not launch a replacement under this name)
 #   3  left running — cl owns a live process under this name but cannot prove
 #      which session it runs (see unbound_owner_pid); never killed as this one
+#   4  not cl's to stop — a Codex thread run somewhere cl did not launch (an
+#      unstamped tmux session, the Desktop app, a --remote client). Reported
+#      and left alone; it is not a failure of THIS stop, which is why it has
+#      its own code (counting it would fail every stop while the app is open)
 retire_session() {
   local name="$1" sid="$2" t="$3" close_tabs="$4" agent="${5:-claude}"
   local ans pid ptok rrc _ppid _pcomm hint kids surv
@@ -2773,7 +2777,15 @@ retire_session() {
     # exact promise this path advertises.
     if [ "$agent" = "codex" ] && ! tmux_owned "$t" codex "$sid"; then
       printf '⚠ leaving %s — a tmux session sits at %s but carries no cl ownership stamp for this thread; not cl'"'"'s to kill.\n' "$name" "$t" >&2
-      return 2
+      # The foreign container is not cl's, but that does not prove nothing of
+      # cl's is running for this thread: an exact launch record can name a bare
+      # Codex process cl DID launch, colliding on the derived tmux name. Then
+      # this is a stop that left cl's own process running, not a foreign one.
+      if [ -n "$(registered_pid "$name" codex "$sid")" ]; then
+        printf '⚠ …and cl'"'"'s own Codex process for %s is still running beside it — left for a retry; close the foreign tmux session first\n' "$name" >&2
+        return 2
+      fi
+      return 4
     fi
     if session_busy "$t"; then
       printf '⏳ "%s" looks mid-task. Kill it anyway? [y/N] ' "$name" >&2
@@ -2810,7 +2822,7 @@ retire_session() {
       # warning, though never a kill.
       if [ -n "$(session_pid "$sid" codex "$name")" ]; then
         printf '⚠ leaving %s — something looks like it is running this Codex thread, but cl has no launch record for it and cannot identify the process safely. Close it in its own tab.\n' "$name" >&2
-        return 2
+        return 4
       fi
       return 0   # nothing live — already retired
     fi
@@ -3531,7 +3543,7 @@ do_stop() {
     printf 'saved %s session(s) to %s\n\n' "$count" "$STATE"
   fi
 
-  local name t hrc rrc kept=0 nohandoff=0 kept_names="" resume_only="" unresolved_names=""
+  local name t hrc rrc kept=0 nohandoff=0 kept_names="" resume_only="" unresolved_names="" left_names=""
   # Rotation accounting for the log. `sess_rotate` is decided PER SESSION, since
   # the stored policy can carry per-session overrides, so the mode recorded for
   # the whole stop is "mixed" when they disagreed — a week containing a mixed
@@ -3897,13 +3909,16 @@ do_stop() {
     # retire_session covers both branches (tmux-hosted and bare process)
     # with the busy-check-and-prompt, tab/surface cleanup, the hidden-tmux
     # ownership guard, and the Codex ownership rules — do_stop just runs it and
-    # moves on; its return value mostly changes nothing here (a lost race, a
-    # decline, a slow shutdown, or a session that was not cl's to kill are all
-    # just "didn't get killed this time, re-run stop"). The exception is a live
-    # process cl owns but cannot tie to this session: re-running stop will not
-    # resolve that, so it must fail the stop rather than read as stopped.
+    # collects what it left. Anything cl manages that is still running when
+    # stop returns — a declined busy session, a slow or failed shutdown, an
+    # owner cl cannot tie to a session — fails the stop, so a script can trust
+    # exit 0 to mean "everything cl manages is stopped" (owner decision, 2026-11-03).
+    # Code 4 is the one exception: not cl's to stop, so not this stop's failure.
     rrc=0; retire_session "$name" "$sid_i" "$t" "$close_tabs" "$agent" || rrc=$?
-    [ "$rrc" = 3 ] && unresolved_names="${unresolved_names}${name}"$'\n'
+    case "$rrc" in
+      3)   unresolved_names="${unresolved_names}${name}"$'\n' ;;
+      1|2) left_names="${left_names}${name}"$'\n' ;;
+    esac
   done
 
   [ -n "$dry_run" ] && return 0
@@ -3924,6 +3939,11 @@ do_stop() {
     printf '\n%s session(s) stopped WITHOUT a handoff — `cl start` will resume those as they were\n' "$nohandoff" >&2
     printf 'rather than rotating them. Use `cl stop --require-handoff` if rotation is the point.\n' >&2
   fi
+  if [ -n "$left_names" ]; then
+    printf '\nleft running — declined, still shutting down, or could not be stopped:\n' >&2
+    printf '%s' "$left_names" | sed '/^$/d; s/^/  · /' >&2
+    printf 'They are in the saved state; re-run `cl stop` to retire them.\n' >&2
+  fi
   if [ -n "$unresolved_names" ]; then
     printf '\nleft running — cl owns these but cannot prove which session each runs:\n' >&2
     printf '%s' "$unresolved_names" | sed '/^$/d; s/^/  · /' >&2
@@ -3937,7 +3957,7 @@ do_stop() {
     # a script, a shutdown hook, or a glance at the exit status.
     return 1
   fi
-  [ -z "$unresolved_names" ]
+  [ -z "$unresolved_names" ] && [ -z "$left_names" ]
 }
 
 # open_iterm_tabs <shell-command>...: open one real iTerm tab per command.
@@ -4645,7 +4665,9 @@ print_stop_help() {
 cl stop [flags]   request handoffs from eligible Claude sessions (rotation on),
                   then save running sessions and stop each one it can safely
                   retire. Codex sessions are never asked; they resume as they
-                  were. Anything left running is reported.
+                  were. Anything cl manages that is left running is named and
+                  the exit is non-zero; a Codex thread cl did not launch is
+                  reported and left alone.
 
   --no-handoff        stop without asking for handoffs; `cl start` resumes
                       each session as it was (and clears any pending handoff)

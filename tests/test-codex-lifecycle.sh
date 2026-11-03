@@ -153,7 +153,7 @@ check "fixture: the launch record names the victim" "$VICTIM" \
   "$(cut -f1 "$PIDDIR/$(reg_key Mine codex)")"
 
 printf 'stop: saves and kills the Codex session cl launched\n'
-out=$(cl stop --keep-tabs 2>&1)
+out=$(cl stop --keep-tabs 2>&1); STOP_RC=$?
 sleep 1
 check "the process cl launched is gone" "dead" \
   "$(kill -0 "$VICTIM" 2>/dev/null && echo alive || echo dead)"
@@ -176,6 +176,9 @@ check "…but it is untouched, because there is no launch record" "alive" \
 case "$out" in *"no launch record"*) pass=$((pass+1)); printf '  ok   %s\n' "…and stop explains why it left it" ;;
   *) fail=$((fail+1)); printf '  FAIL %s\n       got: %s\n' "…and stop explains why it left it" "$out" ;; esac
 check "…and it is NOT saved to state" "" "$(jq -r '.[] | select(.name=="Theirs") | .name' "$STATE")"
+# Not cl's to stop, so not a failure of this stop: counting it would fail every
+# `cl stop` while the Codex app has a thread open (retire_session code 4).
+check "…and leaving it does not fail the stop" "0" "$STOP_RC"
 # Saving it would be worse than useless: `cl start` would later resume a thread
 # already open somewhere cl cannot see — two clients on one transcript.
 
@@ -341,6 +344,23 @@ case "$out" in *"no cl ownership stamp"*) pass=$((pass+1)); printf '  ok   %s\n'
 # whatever is already serving it.
 check "…and it is not saved either" "" \
   "$(jq -r '.[] | select(.name=="Mine") | .name' "$STATE" 2>/dev/null)"
+# …and the stop itself succeeds: that session is not cl's to stop.
+rm -f "$FIX/tmux.calls" "$STATE"
+cl_tmux stop --keep-tabs >/dev/null 2>&1; rc=$?
+check "…and leaving a foreign tmux session does not fail the stop" "0" "$rc"
+# BUT a foreign container at the name does not prove nothing of cl's runs: an
+# exact launch record for this thread can name a bare process cl launched.
+/bin/sh -c 'exec -a "codex resume '"$SID_MINE"'" sleep 600' </dev/null >/dev/null 2>&1 & OWNED=$!
+disown "$OWNED" 2>/dev/null || true; sleep 0.5
+register Mine codex "$OWNED" "$SID_MINE"
+rm -f "$FIX/tmux.calls" "$STATE"
+out=$(cl_tmux stop --keep-tabs 2>&1); rc=$?
+check "with cl's own process beside it, the foreign tmux is still not killed" "0" \
+  "$(grep -c 'kill-session' "$FIX/tmux.calls" 2>/dev/null)"
+check "…cl's own process is left registered, not lost" "alive" "$(kill -0 "$OWNED" 2>/dev/null && echo alive || echo dead)"
+check "…and the stop fails instead of exiting 0" "1" "$rc"
+contains "…saying cl's own process is still running" "$out" "own Codex process for Mine is still running"
+kill "$OWNED" 2>/dev/null; rm -f "$PIDDIR"/*
 # …and one cl did stamp, for this thread, is killed as before.
 rm -f "$FIX/tmux.calls" "$STATE"; touch "$FIX/stamped"
 out=$(cl_tmux stop --keep-tabs 2>&1)
