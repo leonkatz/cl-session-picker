@@ -4645,7 +4645,7 @@ print_stop_help() {
 cl stop [flags]   request handoffs from eligible Claude sessions (rotation on),
                   then save running sessions and stop each one it can safely
                   retire. Codex sessions are never asked; they resume as they
-                  were. Anything left running is named, and the exit is non-zero.
+                  were. Anything left running is reported.
 
   --no-handoff        stop without asking for handoffs; `cl start` resumes
                       each session as it was (and clears any pending handoff)
