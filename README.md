@@ -283,7 +283,10 @@ it launched with; only a fresh launch upgrades).
   bounds the **waiting** across every round — not the asking, which is never cut
   short because asking everyone is the point; each individual send is bounded
   separately by `CL_HANDOFF_SEND_TIMEOUT` (default 20s) so one wedged terminal
-  cannot hang a stop. The cost of a stop is one window rather than one per
+  cannot hang a stop. Only a short pointer is typed into each session; the
+  instruction itself is in a request file, and `cl` checks the transcript and
+  re-types the pointer once if it did not arrive whole (see `docs/handoff.md`).
+  The cost of a stop is one window rather than one per
   session, and nineteen sessions each get the full 180s instead of a nineteenth
   of the budget. It then writes the live sessions to
   `~/.config/claude-session/state.json` (one record per session: name, session

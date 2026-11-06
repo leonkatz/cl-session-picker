@@ -388,8 +388,22 @@ Placeholders are substituted literally and never evaluated:
 | `{{name}}` | the session's display name |
 | `{{store}}` | the resolved handoff directory |
 
-Newlines are flattened to spaces: the text is typed into a live TUI, where a
-newline submits.
+The handoff instruction is **not typed** into the session. It is written to
+`<store>/<name>.request`, and the only line typed is a short pointer with the
+path at the end:
+
+    cl stop: read and follow the handoff request in "<store>/<name>.request"
+
+Typing the whole instruction lost its start in real iTerm-hosted sessions, so
+the path and nonce never arrived and every handoff timed out. After typing,
+`cl` checks the session's transcript for the whole line; an idle session that
+did not record it is sent the line once more. A busy one is left alone, because
+it queues what was typed. `CL_HANDOFF_VERIFY` (default 5s) is how long that check
+waits; `0` turns it off. The request file is removed once its handoff is
+confirmed.
+
+Newlines are still flattened to spaces, so the request reads the same as it
+always did.
 
 If a custom prompt asks for work *in addition* to the handoff, that work must
 happen **before** the handoff is written. The handoff landing is the only

@@ -3010,6 +3010,80 @@ build_handoff_prompt() { # root name nonce
     "$hp" "$nonce" | _prompt_flatten
 }
 
+# ── THE INSTRUCTION GOES IN A FILE; ONLY A POINTER IS TYPED ─────────────────
+#
+# Typing the whole request lost its START in most iTerm-hosted sessions: on
+# 2026-11-02..06 about fifteen of twenty-two sessions received only the tail —
+# " is done. Once the rename completes, stop." — so the handoff path and the
+# nonce, which come early, never arrived, and no handoff could be confirmed.
+# iTerm is not the one dropping it: the same 550 characters written into a raw
+# reader arrive whole. Into a Claude TUI they also arrived whole on every probe
+# (fresh, large transcript, covered window, background tab), so the condition
+# that truncates is not established; the two cases in one session's own
+# transcript both followed a long idle (2.5 days and 21 hours).
+#
+# So the request no longer depends on a long line surviving. The full text is
+# written to <store>/<Name>.request, and the line typed is short, with the path
+# LAST, because what survives a lost start is the end. handoff_ask_seen then
+# checks the transcript and the callers re-type once when it did not land.
+handoff_request_path() { printf '%s/%s.request' "$1" "$(name_component "$2")"; }
+
+# build_handoff_ask <root> <name> <nonce>: write the full request and print the
+# line to type. If the file cannot be written the full request is typed as
+# before, because a handoff problem must never prevent a stop.
+build_handoff_ask() {
+  local root="$1" name="$2" nonce="$3" full rp tmp
+  full=$(build_handoff_prompt "$root" "$name" "$nonce")
+  rp=$(handoff_request_path "$root" "$name")
+  tmp="$rp.tmp.$$"
+  if printf '%s\n' "$full" > "$tmp" 2>/dev/null && mv -f "$tmp" "$rp" 2>/dev/null; then
+    printf 'cl stop: read and follow the handoff request in "%s"' "$rp" | _prompt_flatten
+    return 0
+  fi
+  rm -f "$tmp" 2>/dev/null
+  printf 'claude-session: could not write %s — typing the full request instead\n' "$rp" >&2
+  printf '%s' "$full"
+}
+
+# handoff_ask_mark <sid>: "<transcript>\t<size>" before a send, or nothing when
+# there is no transcript to check (an unknown sid, or no jq).
+handoff_ask_mark() {
+  local f sz
+  [ "${CL_HANDOFF_VERIFY:-5}" -gt 0 ] 2>/dev/null || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  f=$(find "$PROJECTS" -mindepth 2 -maxdepth 2 -name "${1}.jsonl" 2>/dev/null | head -1)
+  [ -n "$f" ] && [ -r "$f" ] || return 0
+  sz=$(wc -c < "$f" 2>/dev/null | tr -d ' ')
+  printf '%s\t%s' "$f" "${sz:-0}"
+}
+
+# handoff_ask_seen <mark> <line>: 0 once the transcript, past the mark, holds a
+# user turn or a queued message containing the WHOLE line. A truncated arrival
+# contains only its tail, so it does not count. An empty mark means "cannot
+# tell" and also returns 0: unverifiable is not the same as lost.
+handoff_ask_seen() {
+  local f="${1%%$'\t'*}" off="${1##*$'\t'}"
+  [ -n "$1" ] || return 0
+  tail -c +"$((off + 1))" "$f" 2>/dev/null \
+    | jq -R -r 'fromjson? | select(.type == "user" or .type == "queue-operation")
+        | (.message.content? // .content? // empty)
+        | if type == "string" then . elif type == "array" then (map(.text? // empty) | join(" ")) else empty end' 2>/dev/null \
+    | grep -qF -- "$2"
+}
+
+# handoff_ask_wait <seconds> <mark> <line>: poll handoff_ask_seen.
+handoff_ask_wait() {
+  local ticks=$(( $1 * 4 )) i=0
+  while [ "$i" -le "$ticks" ]; do
+    handoff_ask_seen "$2" "$3" && return 0
+    sleep 0.25; i=$((i+1))
+  done
+  return 1
+}
+# Seconds to wait for a typed ask to show up in the transcript. An idle session
+# records the turn in well under a second. 0 turns the check off.
+CL_HANDOFF_VERIFY="${CL_HANDOFF_VERIFY:-5}"
+
 # send_text_tmux <tmux_session> <text>: type literal text into a live tmux pane
 # and press Enter, exactly as a person would. -l sends the text with no key
 # translation, so it is safe for arbitrary punctuation (quotes, backslashes).
@@ -3201,6 +3275,32 @@ handoff_send_once() {
   return 1
 }
 
+# handoff_ask_retype <name> <sid> <tmux_name> <line>: the ask did not show up
+# in the transcript, so type it once more. Not into a session that is working:
+# it queues typed input, so its ask may simply be waiting (see the re-ask rule in
+# request_handoff). 1 only if the pane became unreachable.
+handoff_ask_retype() {
+  local mark
+  handoff_target_busy "$3" "$2" "$1" && return 0
+  printf '⚠ the handoff ask to "%s" did not arrive whole — typing it again\n' "$1" >&2
+  mark=$(handoff_ask_mark "$2")
+  handoff_send_once "$1" "$2" "$3" "$4" || return 1
+  handoff_ask_wait "$CL_HANDOFF_VERIFY" "$mark" "$4" && return 0
+  printf '⚠ could not confirm that "%s" received the handoff ask — waiting for its handoff anyway\n' "$1" >&2
+  return 0
+}
+
+# handoff_send_checked <name> <sid> <tmux_name> <line>: handoff_send_once, then
+# confirm the line arrived whole and re-type it once if it did not.
+handoff_send_checked() {
+  local mark
+  mark=$(handoff_ask_mark "$2")
+  handoff_send_once "$1" "$2" "$3" "$4" || return 1
+  [ -n "$mark" ] || return 0
+  handoff_ask_wait "$CL_HANDOFF_VERIFY" "$mark" "$4" && return 0
+  handoff_ask_retype "$1" "$2" "$3" "$4"
+}
+
 # request_handoff <name> <sid> <cwd> <tmux_name> [--dry-run]: try to get the
 # live session to write its own handoff before it dies. Returns:
 #   0  a handoff is on disk for this session and is THIS run's — either its
@@ -3306,10 +3406,10 @@ request_handoff() {
       # no-resend path below deliberately keeps the nonce it is already
       # waiting on, because that is the request still in flight.
       nonce=$(handoff_nonce)
-      prompt=$(build_handoff_prompt "$root" "$name" "$nonce")
+      prompt=$(build_handoff_ask "$root" "$name" "$nonce")
       sent=0
 
-      handoff_send_once "$name" "$sid" "$t" "$prompt" && sent=1
+      handoff_send_checked "$name" "$sid" "$t" "$prompt" && sent=1
 
       # Unreachable is not a timing problem, so retrying cannot fix it — report
       # it as "could not even ask" on the first attempt rather than burning the
@@ -3360,6 +3460,7 @@ request_handoff() {
           [ "$_CL_BUDGET_LEFT" -lt 0 ] && _CL_BUDGET_LEFT=0
         fi
         printf '✓ handoff written for "%s"\n' "$name" >&2
+        rm -f "$(handoff_request_path "$root" "$name")" 2>/dev/null
         return 0
       fi
     done
@@ -3607,7 +3708,7 @@ do_stop() {
   # One slot per session, carrying everything the later passes need. Parallel
   # indexed arrays rather than one associative array because macOS ships bash
   # 3.2, which has no `declare -A`.
-  local -a _h_name _h_sid _h_cwd _h_tmux _h_agent _h_rot _h_state _h_path _h_nonce
+  local -a _h_name _h_sid _h_cwd _h_tmux _h_agent _h_rot _h_state _h_path _h_nonce _h_mark _h_line
   # SEPARATE COUNTERS, because one number cannot answer three questions and the
   # transcript was mixing them (Codex, PR #19): _eligible is every rotation-on
   # session, _manual those already answered by hand, _to_ask what will actually
@@ -3735,7 +3836,8 @@ do_stop() {
     # atomically only when the new handoff is complete — so if every attempt
     # fails, the last known-good answer is still there.
     nonce="$(handoff_nonce)"
-    prompt="$(build_handoff_prompt "$_CL_STOP_ROOT" "${_h_name[$i]}" "$nonce")"
+    prompt="$(build_handoff_ask "$_CL_STOP_ROOT" "${_h_name[$i]}" "$nonce")"
+    _h_mark[$i]="$(handoff_ask_mark "${_h_sid[$i]}")"; _h_line[$i]="$prompt"
     if handoff_send_once "${_h_name[$i]}" "${_h_sid[$i]}" "${_h_tmux[$i]}" "$prompt"; then
       _h_nonce[$i]="$nonce"; _h_state[$i]="pending"; _pending=$((_pending+1)); _sent=$((_sent+1))
       printf '  → asked "%s" for %s\n' "${_h_name[$i]}" "${_h_path[$i]}" >&2
@@ -3747,6 +3849,28 @@ do_stop() {
       _h_state[$i]="unreachable"
     fi
   done
+
+  # ── PASS 2b: DID EACH ASK ARRIVE WHOLE? ─────────────────────────────────────
+  # Checked after the whole dispatch rather than per send, so the check costs
+  # one short shared window instead of one per session. See build_handoff_ask.
+  if [ -z "$dry_run" ] && [ "$_pending" -gt 0 ]; then
+    local _vt=0 _unseen=1
+    while [ "$_unseen" -gt 0 ] && [ "$_vt" -le $(( CL_HANDOFF_VERIFY * 4 )) ]; do
+      _unseen=0
+      for (( i=0; i<_n; i++ )); do
+        [ "${_h_state[$i]}" = "pending" ] && [ -n "${_h_mark[$i]:-}" ] || continue
+        if handoff_ask_seen "${_h_mark[$i]}" "${_h_line[$i]}"; then _h_mark[$i]=""; else _unseen=$((_unseen+1)); fi
+      done
+      [ "$_unseen" -gt 0 ] && { sleep 0.25; _vt=$((_vt+1)); }
+    done
+    for (( i=0; i<_n; i++ )); do
+      [ "${_h_state[$i]}" = "pending" ] && [ -n "${_h_mark[$i]:-}" ] || continue
+      if ! handoff_ask_retype "${_h_name[$i]}" "${_h_sid[$i]}" "${_h_tmux[$i]}" "${_h_line[$i]}"; then
+        printf 'ℹ "%s" became unreachable before its handoff landed\n' "${_h_name[$i]}" >&2
+        _h_state[$i]="unreachable"; _pending=$((_pending-1))
+      fi
+    done
+  fi
 
   # ── PASS 3: ONE SHARED WAIT ─────────────────────────────────────────────────
   # The budget is now wall clock for the whole handoff phase rather than a pool
@@ -3774,6 +3898,7 @@ do_stop() {
         # after the agent happened to mention the token.
         if [ -e "${_h_path[$i]}" ] && [ "$(handoff_marker "${_h_path[$i]}" 2>/dev/null)" = "${_h_nonce[$i]}" ]; then
           _h_state[$i]="done"; _done=$((_done+1)); _pending=$((_pending-1))
+          rm -f "$(handoff_request_path "$_CL_STOP_ROOT" "${_h_name[$i]}")" 2>/dev/null
           printf '✓ handoff written for "%s" (%s of %s, %ss in)\n' \
             "${_h_name[$i]}" "$_done" "$_sent" "$elapsed" >&2
         fi
@@ -3813,8 +3938,8 @@ do_stop() {
         # no-resend path above deliberately keeps the nonce it is already
         # waiting on, because that is the request still in flight.
         nonce="$(handoff_nonce)"
-        prompt="$(build_handoff_prompt "$_CL_STOP_ROOT" "${_h_name[$i]}" "$nonce")"
-        if handoff_send_once "${_h_name[$i]}" "${_h_sid[$i]}" "${_h_tmux[$i]}" "$prompt"; then
+        prompt="$(build_handoff_ask "$_CL_STOP_ROOT" "${_h_name[$i]}" "$nonce")"
+        if handoff_send_checked "${_h_name[$i]}" "${_h_sid[$i]}" "${_h_tmux[$i]}" "$prompt"; then
           _h_nonce[$i]="$nonce"
           printf '  → re-asked "%s" (round %s)\n' "${_h_name[$i]}" "$round" >&2
         else
