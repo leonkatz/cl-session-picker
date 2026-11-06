@@ -1,6 +1,7 @@
 # Restart modes — design (not yet built)
 
-Status: proposal for review. Nothing here is implemented yet.
+Status: proposal, revised after design review (2026-11-06). Nothing here is
+implemented yet. The review's findings are folded in and marked **(R)**.
 
 ## What it is for
 
@@ -52,71 +53,109 @@ Every typed line is short and goes through the existing delivery check
 second sender is written.
 
 1. **Plan (PASS 1).** For each `compact-resume` session, record its transcript
-   and the number of `compact_boundary` records in it now.
-2. **Pre-compact prompt (PASS 2).** Optional, from
-   `~/.config/claude-session/precompact-prompt.txt`; nothing by default, because
-   what a session should write down is a workflow and belongs to the user (for
-   example "update your session board"). Like the handoff request, the full
-   text goes into `<store>/<name>.precompact`, a short pointer is typed, and the
-   request ends by asking for an exact reply token, `cl-done:<nonce>`, as the
-   last thing the session writes.
-3. **Wait for the token**, in parallel across sessions: an assistant record
-   after the mark containing `cl-done:<nonce>`.
-4. **Type `/compact`**, only once the token has arrived, and only if the session
-   is not busy. It is never typed twice: a queued second `/compact` would
-   compact the summary again.
-5. **Wait for the compaction**, in parallel: the boundary count going above its
-   baseline. This is the confirmation for the `/compact` line; the delivery
-   check cannot see a slash command, and does not need to.
-6. **Stop it.** A session confirmed compacted is retired without the
-   "looks mid-task, kill it anyway?" prompt. Its leftover helper process
-   otherwise makes every compacted session look busy.
+   and its byte size: the baseline.
+2. **Pre-compact request (PASS 2).** Always sent. The full text goes into
+   `<store>/<name>.precompact` and a short pointer is typed. It always ends by
+   asking for an exact reply token, `cl-done:<nonce>`, as the last thing the
+   session writes **(R)**: that token is the only proof that the turn finished,
+   so it cannot depend on there being a workflow. The optional workflow text
+   comes from `~/.config/claude-session/precompact-prompt.txt` (for example
+   "update your session board"); by default there is none.
+3. **Wait for the token**, in parallel. It counts only in an **assistant text
+   block** after the baseline, in the last record, with no later `tool_use`,
+   and with the file size stable across two polls **(R)**. Reading the request
+   file puts the nonce in a `tool_result`, which is a `user` record, so the
+   delivery check's matcher must not be reused for this.
+4. **Type `/compact`**, once, as soon as the token arrives. There is no busy
+   check **(R)**: `claude_busy` stays true for minutes after a turn (the
+   lingering helper child), so a gate would starve every session. The token is
+   the proof the turn ended, and typed input queues safely. The one hazard is
+   typing it twice, which never happens. A byte mark is taken just before
+   typing.
+5. **Confirm the compaction**: a `compact_boundary` record after that mark with
+   `compactMetadata.trigger == "manual"`, or the `Compacted` command-output
+   record **(R)**. A plain count would be fooled both ways. A pre-compact turn
+   at ~1M tokens can trigger an AUTO compaction, which would pass the check
+   instantly, kill mid-compaction, or lead to compacting a 20k summary again.
+   So if any boundary appears after the baseline before step 4, `/compact` is
+   skipped: the goal is already met.
+6. **Stop it**, without the "looks mid-task, kill it anyway?" prompt, but only
+   once it is idle since the compaction: the last record is the `Compacted`
+   output or the compact SessionStart hook record, and the size is stable
+   **(R)**. That is passed to `retire_session` as an argument.
+
+The log records `preTokens` and `postTokens` from the boundary record itself;
+`context_size` still reads the pre-compaction figure afterwards **(R)**.
 
 On `cl start` the row's `mode` is `compact-resume`: resume with a first prompt
 passed as an argument, never typed (from `resume-after-compact-prompt.txt`; a
-one-line built-in default says it was restarted and should carry on). If the
-agent exits within a few seconds of launch, which is how a failed resume looks,
-and a handoff exists, fall back to a fresh session from it.
+one-line built-in default says it was restarted and should carry on). The mode
+also travels in the tab command for the bare-iTerm path, as `--rotate-from`
+does.
+
+**A failed resume never rotates from a handoff (R).** In this mode no handoff
+was requested, so any handoff present predates the cycle: exactly the stale
+case `mark_resume_only` guards against. Before resuming, a preflight checks
+that the transcript exists and that its last boundary is the one the stop
+recorded on the row. On tmux, `has-session` is polled about 5s after launch. A
+failure resumes plainly and is reported.
 
 ### Timing
 
-A compaction takes minutes, not seconds, so it does not share the handoff
-window. `CL_COMPACT_TIMEOUT` (default 300s) covers steps 3-5 for all sessions at
-once. A session that misses it falls back to `handoff` within the remaining
-`CL_HANDOFF_BUDGET`; if that is spent too, it resumes as-is and the log says so.
+Measured: 88-137s for ~1M → 20k, plus a pre-compact turn at ~1M context. So
+`CL_COMPACT_TIMEOUT` defaults to **600s**, for all sessions at once, kept apart
+from the handoff budget **(R)**. Worst-case wall clock for a stop is therefore
+`CL_COMPACT_TIMEOUT + CL_HANDOFF_BUDGET` plus dispatch.
 
 ### Fallbacks
 
 | what went wrong | what happens |
 |---|---|
 | no `cl-done` token in time | skip `/compact`; fall back to `handoff` |
-| no boundary in time | fall back to `handoff` |
-| session busy throughout | queue nothing further; fall back to `handoff` |
-| resume fails at start | fresh session from a handoff if one exists; otherwise report |
-| `--no-handoff` | no fallback handoff; resume as-is |
+| a boundary appears before `/compact` | `/compact` skipped; treated as compacted |
+| no manual boundary in time after `/compact` | **resume as-is**, not a handoff: an ask would queue behind the compaction and be written from the 20k summary **(R)** |
+| resume fails at start | resume plainly, report; never rotate from an unrequested handoff |
+| `--no-handoff` | **skips compaction too**: stop now, resume as-is (the fast stop) |
+| `--require-handoff` | forces `handoff` for this stop |
 
 Each stop logs one line per session: the mode asked, the path taken, why, and
-the context size before and after. It goes in the existing rotation log, with
-new columns.
+`preTokens` / `postTokens`. It goes in the rotation log under a new versioned
+header (`_ROTATION_LOG_HEADER_V2`), with a migration arm like the existing ones.
+
+### Migration: every reader of on / off / n/a (R)
+
+`_rotate_valid`, `rotate_default`, `rotate_for`, `rotate_source`,
+`stop_rotate_resolve`, `rotate_env_value`, `do_rotate`; `do_stop`'s `= "on"`
+gates in PASS 1 and 2, and its `n/a|off|else` case in PASS 4, where an unmapped
+value would fall into the handoff branch; the dry-run text; `log_mode`;
+`rotate_cell` and the `--list` column widths (`compact-resume` is 14 characters,
+so the cell shows a short form: `compact`, `handoff`, `fresh`, `resume`);
+`rotate_stats` and its "mixed" logic, which would otherwise call every week
+mixed and lose the comparison. `mark_resume_only` matches rows by name only, so
+the new `mode` field is written by name AND agent. The tests that assert literal
+`on/off/mixed` are updated alongside.
 
 ## fresh, for Codex
 
-The hard part is the lane watcher. `discover_codex` and `coord-rearm` only see
-NAMED threads, and the election picks the newest named thread in the repo, so
-an unnamed new thread is invisible and the old one keeps the lane. So `fresh`
-for Codex must:
+The lane watcher is the hard part, and so is ownership: launching an unnamed
+thread gives cl no id, so `registered_pid` and `tmux_owned` reject it, the next
+`cl stop` reports it stopped while it runs, and the election keeps the old
+thread **(R)**. So `fresh` creates the thread first and then takes the ordinary
+resume path:
 
-1. archive the old thread, so discovery no longer lists it;
-2. start the new thread with a short first prompt passed as an argument, so a
-   turn fires the repo's SessionStart hook;
-3. name it with the old name through `codex app-server` (`thread/name/set`),
-   check the name took, and report if it did not;
-4. re-arm the lane, which then elects the new, named thread;
-5. stamp the new tmux session with the new thread id, so the next `cl stop` owns
-   it.
+1. `codex app-server`: `thread/start` returns the new `thread.id`;
+   `thread/name/set` gives it the session's name; read the name back.
+2. Archive the old thread (`codex archive <old-id>`) **before** anything re-arms,
+   so the election cannot pick it.
+3. Rewrite the state row's sid to the new id.
+4. Let the ordinary path run `codex resume <new-id> "<first prompt>"`. Every
+   existing ownership mechanism then works unchanged, and the first turn fires
+   the repo's SessionStart hook, which elects the new thread by `session_id`.
+   `coord-rearm` is a backstop only.
 
-The lane's unanswered notes are re-offered to the new thread by the watcher's
-own re-send.
+To verify while building: that `thread/start` writes a rollout `discover_codex`
+sees, and that the first turn fires SessionStart. The lane's unanswered notes
+are re-offered to the new thread by the watcher's own re-send.
 
 ## Out of scope here
 
