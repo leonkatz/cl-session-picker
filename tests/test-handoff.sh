@@ -86,7 +86,7 @@ live_down() { [ -f "$LIVE_PIDS" ] && xargs kill < "$LIVE_PIDS" 2>/dev/null; retu
 LIVE_ARGV=("claude --resume sid-big" "claude --resume sid-small")
 
 run_list() {
-  env -i HOME="$HOME" PATH="$BASEPATH" bash "$CL" --list 2>/dev/null
+  env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$BASEPATH" bash "$CL" --list 2>/dev/null
 }
 
 echo "context_size + rotate_hint (via --list)"
@@ -97,7 +97,7 @@ contains "T-Small shows its small total, rendered as 9k" "$out" "9k"
 not_contains "T-Small is not flagged rotate" "$(printf '%s\n' "$out" | grep 'T-Small')" "rotate"
 
 echo "rotate on age alone"
-old_out=$(env -i HOME="$HOME" PATH="$BASEPATH" CL_ROTATE_AGE_DAYS=0 bash "$CL" --list 2>/dev/null | grep 'T-Small')
+old_out=$(env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$BASEPATH" CL_ROTATE_AGE_DAYS=0 bash "$CL" --list 2>/dev/null | grep 'T-Small')
 contains "age-based rotate fires even with a small context, once the threshold is 0 days" "$old_out" "rotate"
 
 echo "rotate never fires for Codex (start --fresh is Claude-only)"
@@ -112,7 +112,7 @@ printf '{"id":"%s","thread_name":"OldCodex","updated_at":"2020-01-01T00:00:00Z"}
 printf '{"type":"session_meta","payload":{"id":"%s","cwd":"%s"}}\n' "$ID_OLDCODEX" "$FIX/work1" \
   > "$HOME/.codex/sessions/2020/01/01/rollout-2020-01-01T00-00-00-$ID_OLDCODEX.jsonl"
 touch -t 202001010000 "$HOME/.codex/sessions/2020/01/01/rollout-2020-01-01T00-00-00-$ID_OLDCODEX.jsonl"
-codex_rotate_out=$(env -i HOME="$HOME" PATH="$BASEPATH" CODEX_HOME="$CODEX_HOME" bash "$CL" --list 2>/dev/null | grep OldCodex)
+codex_rotate_out=$(env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$BASEPATH" CODEX_HOME="$CODEX_HOME" bash "$CL" --list 2>/dev/null | grep OldCodex)
 not_contains "an old Codex row is never flagged rotate" "$codex_rotate_out" "rotate"
 rm -f "$CODEX_HOME/session_index.jsonl"; rm -rf "$HOME/.codex/sessions/2020"
 
@@ -120,7 +120,7 @@ echo "handoff fallback (unreachable dir)"
 RO="$FIX/ro-parent"; mkdir -p "$RO"; chmod 000 "$RO"
 FALLBACK="$FIX/fallback-state"
 live_up
-stop_out=$(env -i HOME="$HOME" PATH="$BASEPATH" \
+stop_out=$(env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$BASEPATH" \
   CL_HANDOFF_DIR="$RO/hdir" CL_HANDOFF_FALLBACK_BASE="$FALLBACK" \
   bash "$CL" stop --dry-run 2>&1)
 chmod 755 "$RO"
@@ -134,7 +134,7 @@ echo "handoff dir success (writable dir)"
 # would create it fine. See handoff_root_preview's comment for that tradeoff.
 HDIR="$FIX/dir-ok"; mkdir -p "$HDIR"
 live_up
-stop_out2=$(env -i HOME="$HOME" PATH="$BASEPATH" \
+stop_out2=$(env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$BASEPATH" \
   CL_HANDOFF_DIR="$HDIR" \
   bash "$CL" stop --dry-run 2>&1)
 not_contains "a writable handoff base never logs a fallback notice" "$stop_out2" "handoff dir unusable"
@@ -146,13 +146,13 @@ check "no state.json written by a dry-run stop" "0" "$state_exists"
 
 echo "cl stop --no-handoff skips the handoff step entirely"
 live_up
-noh_out=$(env -i HOME="$HOME" PATH="$BASEPATH" CL_HANDOFF_DIR="$FIX/dir-noh" \
+noh_out=$(env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$BASEPATH" CL_HANDOFF_DIR="$FIX/dir-noh" \
   bash "$CL" stop --no-handoff --keep-tabs 2>&1)
 not_contains "--no-handoff never asks for a handoff" "$noh_out" "asked"
 not_contains "--no-handoff never mentions the handoff dir" "$noh_out" "handoff dir unusable"
 
 echo "cl stop rejects an unrecognised flag rather than silently ignoring it"
-bad_out=$(env -i HOME="$HOME" PATH="$BASEPATH" bash "$CL" stop --bogus-flag 2>&1); bad_rc=$?
+bad_out=$(env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$BASEPATH" bash "$CL" stop --bogus-flag 2>&1); bad_rc=$?
 check "unrecognised stop flag exits non-zero" "1" "$bad_rc"
 contains "…and says which flag" "$bad_out" "--bogus-flag"
 
@@ -222,7 +222,7 @@ BLOCKED_DIR="$FIX/blocked-dir"
 BLOCKED_FALLBACK="$FIX/blocked-fallback"   # the fallback base itself is a FILE
 : > "$BLOCKED_FALLBACK"
 live_up
-blocked_out=$(env -i HOME="$HOME" PATH="$BASEPATH" \
+blocked_out=$(env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$BASEPATH" \
   CL_HANDOFF_DIR="$BLOCKED_DIR" CL_HANDOFF_FALLBACK_BASE="$BLOCKED_FALLBACK" \
   CL_HANDOFF_TIMEOUT=1 bash "$CL" stop --keep-tabs 2>&1)
 contains "a blocked dir falls back, and a blocked fallback is reported as unusable, not silently accepted" \
@@ -230,7 +230,7 @@ contains "a blocked dir falls back, and a blocked fallback is reported as unusab
 rm -rf "$BLOCKED_DIR" "$BLOCKED_FALLBACK"
 
 echo "cl start --fresh (dry-run)"
-fresh_out=$(env -i HOME="$HOME" PATH="$BASEPATH" CL_HANDOFF_DIR="$FIX/dir-fresh" \
+fresh_out=$(env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$BASEPATH" CL_HANDOFF_DIR="$FIX/dir-fresh" \
   bash "$CL" start --fresh "T-Big" --dry-run 2>&1)
 contains "dry-run fresh-start reports what it would do, not silence" "$fresh_out" "would launch fresh"
 contains "the fresh-start prompt points at the handoff path" "$fresh_out" "T-Big.md"
@@ -239,7 +239,7 @@ fh_exists=0; [ -e "$HOME/.config/claude-session/fresh-history.json" ] && fh_exis
 check "dry-run never writes the fresh-history recovery log" "0" "$fh_exists"
 
 echo "cl start --fresh refuses an unknown name"
-unk_out=$(env -i HOME="$HOME" PATH="$BASEPATH" bash "$CL" start --fresh "Does Not Exist" --dry-run 2>&1); unk_rc=$?
+unk_out=$(env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$BASEPATH" bash "$CL" start --fresh "Does Not Exist" --dry-run 2>&1); unk_rc=$?
 check "unknown name exits non-zero" "1" "$unk_rc"
 contains "…and says so" "$unk_out" "no claude session named"
 
@@ -249,7 +249,7 @@ echo "plain 'cl start' (no --fresh) is unaffected"
 # fixture's sessions are live now (see live_up), so that side effect is gone and
 # the case is stated instead of inherited.
 live_down; printf '[]\n' > "$HOME/.config/claude-session/state.json"
-plain_out=$(env -i HOME="$HOME" PATH="$BASEPATH" bash "$CL" start 2>&1); plain_rc=$?
+plain_out=$(env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$BASEPATH" bash "$CL" start 2>&1); plain_rc=$?
 check "plain start exits non-zero on an empty saved state" "1" "$plain_rc"
 contains "…and says so rather than crashing" "$plain_out" "saved state is empty"
 
@@ -305,12 +305,17 @@ rtmux new-session -d -s TmuxSendTarget -c "$FIX" "python3 $RECEIVER"
 # that names OUR live tmux session.
 printf '{"cwd":"%s"}\n{"customTitle":"TmuxSendTarget"}\n' "$FIX" > "$HOME/.claude/projects/p1/sid-tmuxsend.jsonl"
 live_up
-env -i HOME="$HOME" PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
+env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
   CL_HANDOFF_DIR="$FIX/dir-send" CL_HANDOFF_TIMEOUT=2 \
   bash "$CL" stop --keep-tabs >/dev/null 2>&1
 recv=$(cat "$RECV" 2>/dev/null || echo '')
-contains "the literal prompt text really reached the pane's stdin" "$recv" "write a handoff to"
-contains "…carrying THIS request's nonce, which is the completion signal" "$recv" "clho:"
+# What is TYPED is only a pointer, path last; the request itself is in a file,
+# because a long typed line lost its start in real iTerm sessions (2026-11-06).
+contains "the typed line reached the pane's stdin" "$recv" "cl stop: read and follow the handoff request in"
+req=$(printf '%s' "$recv" | sed -n 's/.*request in "\(.*\)"$/\1/p')
+check "…and names a request file that exists" "1" "$([ -n "$req" ] && [ -f "$req" ] && echo 1 || echo 0)"
+contains "…which carries the instruction" "$(cat "$req" 2>/dev/null)" "write a handoff to"
+contains "…and THIS request's nonce, which is the completion signal" "$(cat "$req" 2>/dev/null)" "clho:"
 # handoff_root must create handoff/ as well as the root itself — a freshly
 # selected root (configured dir OR fallback) can pass the write-probe and still
 # have no subdirectory, so the prompt's very first real write (to
@@ -333,7 +338,7 @@ echo "cl stop --dry-run --no-handoff never kills (flag order/combination bug)"
 rtmux new-session -d -s DryRunProbe -c "$FIX" 'sleep 30'
 printf '{"cwd":"%s"}\n{"customTitle":"DryRunProbe"}\n' "$FIX" > "$HOME/.claude/projects/p1/sid-dryrunprobe.jsonl"
 live_up
-env -i HOME="$HOME" PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
+env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
   bash "$CL" stop --dry-run --no-handoff >/dev/null 2>&1
 still_alive=0; rtmux has-session -t DryRunProbe 2>/dev/null && still_alive=1
 check "DryRunProbe is still alive after --dry-run --no-handoff" "1" "$still_alive"
@@ -356,7 +361,7 @@ echo "cl start --fresh fails closed when retirement is declined (real tmux, no t
 rtmux new-session -d -s FreshFailClosed -c "$FIX" 'i=0; while :; do i=$((i+1)); done'
 sleep 1   # let CPU% ramp up before cl samples it
 printf '{"cwd":"%s"}\n{"customTitle":"FreshFailClosed"}\n' "$FIX" > "$HOME/.claude/projects/p1/sid-freshfail.jsonl"
-fresh_fail_out=$(env -i HOME="$HOME" PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
+fresh_fail_out=$(env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
   CL_HANDOFF_DIR="$FIX/dir-freshfail" CL_HANDOFF_TIMEOUT=1 \
   bash "$CL" start --fresh FreshFailClosed </dev/null 2>&1)
 fresh_fail_rc=$?
@@ -380,7 +385,7 @@ echo "cl start --fresh fails closed on a handoff timeout ALONE, even when retire
 # check.
 rtmux new-session -d -s HandoffOnlyFail -c "$FIX" 'sleep 30'
 printf '{"cwd":"%s"}\n{"customTitle":"HandoffOnlyFail"}\n' "$FIX" > "$HOME/.claude/projects/p1/sid-handoffonly.jsonl"
-handoff_only_out=$(env -i HOME="$HOME" PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
+handoff_only_out=$(env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
   CL_HANDOFF_DIR="$FIX/dir-handoffonly" CL_HANDOFF_TIMEOUT=1 \
   bash "$CL" start --fresh HandoffOnlyFail </dev/null 2>&1)
 handoff_only_rc=$?
@@ -403,7 +408,7 @@ echo "the instruction is replaceable — the tool supplies mechanism, you supply
 PROMPTS="$HOME/.config/claude-session"; mkdir -p "$PROMPTS"
 PDIR="$FIX/prompt-dir"; mkdir -p "$PDIR"
 
-default_out=$(env -i HOME="$HOME" PATH="$BASEPATH" CL_HANDOFF_DIR="$PDIR" \
+default_out=$(env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$BASEPATH" CL_HANDOFF_DIR="$PDIR" \
   CL_HANDOFF_PROMPT_FILE="$PROMPTS/does-not-exist.txt" \
   bash "$CL" start --fresh "T-Big" --dry-run 2>&1)
 contains "with no custom file, the default instruction is used" "$default_out" "Read your handoff at"
@@ -411,7 +416,7 @@ contains "with no custom file, the default instruction is used" "$default_out" "
 printf 'CUSTOM-MARKER tidy {{name}} then write {{handoff}} with {{nonce}} under {{store}}\n' \
   > "$PROMPTS/handoff-prompt.txt"
 printf 'CUSTOM-RESUME read {{handoff}} and carry on\n' > "$PROMPTS/resume-prompt.txt"
-custom_out=$(env -i HOME="$HOME" PATH="$BASEPATH" CL_HANDOFF_DIR="$PDIR" \
+custom_out=$(env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$BASEPATH" CL_HANDOFF_DIR="$PDIR" \
   bash "$CL" start --fresh "T-Big" --dry-run 2>&1)
 contains "a custom resume prompt replaces the default outright" "$custom_out" "CUSTOM-RESUME"
 not_contains "…so the default text is gone, not appended to" "$custom_out" "Read your handoff at"
@@ -421,7 +426,7 @@ contains "…with {{handoff}} substituted for the real path" "$custom_out" "$PDI
 # into a pane asks for nothing, and the stop would then wait out its whole
 # timeout for a handoff no one was asked to write.
 : > "$PROMPTS/resume-prompt.txt"
-empty_out=$(env -i HOME="$HOME" PATH="$BASEPATH" CL_HANDOFF_DIR="$PDIR" \
+empty_out=$(env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$BASEPATH" CL_HANDOFF_DIR="$PDIR" \
   bash "$CL" start --fresh "T-Big" --dry-run 2>&1)
 contains "an empty custom prompt falls back to the default, never to silence" "$empty_out" "Read your handoff at"
 rm -f "$PROMPTS/handoff-prompt.txt" "$PROMPTS/resume-prompt.txt"
@@ -432,10 +437,10 @@ echo "the dry run previews the same path a real run would write"
 # preview still advertised a Sessions/ level the real resolver had dropped.
 PV="$FIX/preview-agree"; mkdir -p "$PV"
 live_up
-prev=$(env -i HOME="$HOME" PATH="$BASEPATH" CL_HANDOFF_DIR="$PV" \
+prev=$(env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$BASEPATH" CL_HANDOFF_DIR="$PV" \
   bash "$CL" stop --dry-run 2>&1 | grep -o "$PV[^ ]*T-Big.md" | head -1)
 live_up
-env -i HOME="$HOME" PATH="$BASEPATH" CL_HANDOFF_DIR="$PV" CL_HANDOFF_TIMEOUT=1 \
+env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$BASEPATH" CL_HANDOFF_DIR="$PV" CL_HANDOFF_TIMEOUT=1 \
   bash "$CL" stop --keep-tabs >/dev/null 2>&1
 real_dir_ok=0; [ -d "$PV" ] && real_dir_ok=1
 check "a real run creates the directory the preview named" "1" "$real_dir_ok"
@@ -509,7 +514,7 @@ RO2="$FIX/ro-fallback"; mkdir -p "$RO2/primary" "$RO2/fb"
 chmod 555 "$RO2/primary"      # primary exists but rejects writes -> fall back
 chmod 555 "$RO2/fb"           # fallback exists, is a dir, and ALSO rejects writes
 live_up
-fb_out=$(env -i HOME="$HOME" PATH="$BASEPATH" \
+fb_out=$(env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$BASEPATH" \
   CL_HANDOFF_DIR="$RO2/primary" CL_HANDOFF_FALLBACK_BASE="$RO2/fb" \
   CL_HANDOFF_TIMEOUT=1 bash "$CL" stop --keep-tabs 2>&1)
 chmod 755 "$RO2/primary" "$RO2/fb"
@@ -522,7 +527,7 @@ echo "dry run and a real run agree on a first install"
 NEW="$FIX/never-used/handoff"          # does not exist; its parent is writable
 NUFB="$FIX/nu-fallback"
 live_up
-new_out=$(env -i HOME="$HOME" PATH="$BASEPATH" CL_HANDOFF_DIR="$NEW" \
+new_out=$(env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$BASEPATH" CL_HANDOFF_DIR="$NEW" \
   CL_HANDOFF_FALLBACK_BASE="$NUFB" bash "$CL" stop --dry-run 2>&1)
 contains "the previewed path is under the configured dir" "$new_out" "$NEW/T-Big.md"
 not_contains "…a creatable dir is not announced as unusable" "$new_out" "handoff dir unusable"
@@ -530,7 +535,7 @@ not_contains "…and the fallback is not named"               "$new_out" "nu-fal
 check "…while the dry run still creates nothing" "0" "$([ -e "$NEW" ] && echo 1 || echo 0)"
 # And prove the preview told the truth: a real run uses that same path.
 live_up
-env -i HOME="$HOME" PATH="$BASEPATH" CL_HANDOFF_DIR="$NEW" \
+env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$BASEPATH" CL_HANDOFF_DIR="$NEW" \
   CL_HANDOFF_FALLBACK_BASE="$NUFB" CL_HANDOFF_TIMEOUT=1 \
   bash "$CL" stop --keep-tabs >/dev/null 2>&1
 check "a real first run creates and uses exactly that dir" "1" "$([ -d "$NEW" ] && echo 1 || echo 0)"
@@ -564,12 +569,12 @@ RDIR="$FIX/rot-store"
 write_state() { # name sid cwd
   printf '[{"name":"%s","sid":"%s","cwd":"%s"}]\n' "$1" "$2" "$3" > "$STATEDIR/state.json"
 }
-run_start() { env -i HOME="$HOME" PATH="$NOTMUX_PATH" CL_HANDOFF_DIR="$RDIR" \
+run_start() { env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$NOTMUX_PATH" CL_HANDOFF_DIR="$RDIR" \
   CL_HANDOFF_FALLBACK_BASE="$FIX/rot-fb" bash "$CL" start 2>&1; }
 # The tab `cl start` would have opened. The agent exec fails here (no claude on
 # the fixture PATH) — deliberately: what matters is that the claim is committed
 # at the point launch ownership is granted, which happens first.
-run_tab() { env -i HOME="$HOME" PATH="$NOTMUX_PATH" CL_HANDOFF_DIR="${2:-$RDIR}" \
+run_tab() { env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$NOTMUX_PATH" CL_HANDOFF_DIR="${2:-$RDIR}" \
   CL_HANDOFF_FALLBACK_BASE="$FIX/rot-fb" CL_AGENT_REC="${4:-$FIX/agent-argv}" \
   bash "$CL" "$1" --rotate-from "${3:-$RDIR/$1.md}" 2>&1; }
 consumed_count() { ls "$RDIR/consumed" 2>/dev/null | grep -c . ; }
@@ -648,7 +653,7 @@ echo "cl stop retries before giving up, then stops anyway"
 rtmux new-session -d -s KeepAlive -c "$FIX" 'sleep 30'
 printf '{"cwd":"%s"}\n{"customTitle":"KeepAlive"}\n' "$FIX" > "$HOME/.claude/projects/p1/sid-keepalive.jsonl"
 live_up
-keep_out=$(env -i HOME="$HOME" PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
+keep_out=$(env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
   CL_HANDOFF_DIR="$FIX/keep-store" CL_HANDOFF_TIMEOUT=1 CL_HANDOFF_ATTEMPTS=2 \
   bash "$CL" stop --keep-tabs 2>&1)
 alive=0; rtmux has-session -t KeepAlive 2>/dev/null && alive=1
@@ -664,10 +669,10 @@ rm -f "$HOME/.claude/projects/p1/sid-keepalive.jsonl"
 # ===========================================================================
 echo "cl handoff writes a handoff from inside a session"
 HDIR2="$FIX/manual-store"; mkdir -p "$HDIR2"
-man_path=$(env -i HOME="$HOME" PATH="$BASEPATH" CL_HANDOFF_DIR="$HDIR2" \
+man_path=$(env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$BASEPATH" CL_HANDOFF_DIR="$HDIR2" \
   CL_SESSION_NAME="T-Big" bash "$CL" handoff --path 2>/dev/null)
 check "--path prints the path it would write" "$HDIR2/T-Big.md" "$man_path"
-printf 'hand written state\n' | env -i HOME="$HOME" PATH="$BASEPATH" \
+printf 'hand written state\n' | env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$BASEPATH" \
   CL_HANDOFF_DIR="$HDIR2" CL_SESSION_NAME="T-Big" bash "$CL" handoff >/dev/null 2>&1
 check "piping content in writes the file" "1" "$([ -f "$HDIR2/T-Big.md" ] && echo 1 || echo 0)"
 contains "…keeping what was piped in" "$(cat "$HDIR2/T-Big.md" 2>/dev/null)" "hand written state"
@@ -677,13 +682,13 @@ echo "…an empty handoff is refused, not written"
 # An empty file would satisfy every existence check while saying nothing.
 rm -f "$HDIR2/T-Empty.md"
 empty_rc=0
-printf '' | env -i HOME="$HOME" PATH="$BASEPATH" CL_HANDOFF_DIR="$HDIR2" \
+printf '' | env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$BASEPATH" CL_HANDOFF_DIR="$HDIR2" \
   CL_SESSION_NAME="T-Empty" bash "$CL" handoff >/dev/null 2>&1 || empty_rc=$?
 check "an empty pipe is rejected"        "1" "$empty_rc"
 check "…and no file is left behind"      "0" "$([ -e "$HDIR2/T-Empty.md" ] && echo 1 || echo 0)"
 
 echo "…and without a name it says so rather than guessing"
-noname_out=$(env -i HOME="$HOME" PATH="$BASEPATH" CL_HANDOFF_DIR="$HDIR2" \
+noname_out=$(env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$BASEPATH" CL_HANDOFF_DIR="$HDIR2" \
   bash "$CL" handoff --path 2>&1) || true
 contains "no CL_SESSION_NAME is an error, not a guess" "$noname_out" "no session name"
 
@@ -695,7 +700,7 @@ printf '{"cwd":"%s"}\n{"customTitle":"ManualTarget"}\n' "$FIX" > "$HOME/.claude/
 MSTORE="$FIX/manual-honour"; mkdir -p "$MSTORE"
 printf 'written by hand\n<!-- cl:manual:2026-09-24T00:00:00Z -->\n' > "$MSTORE/ManualTarget.md"
 live_up
-man_out=$(env -i HOME="$HOME" PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
+man_out=$(env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
   CL_HANDOFF_DIR="$MSTORE" CL_HANDOFF_TIMEOUT=1 bash "$CL" stop --keep-tabs 2>&1)
 contains "the hand-written handoff is used"        "$man_out" "handoff you wrote by hand"
 contains "…with its age, so an old one is obvious" "$man_out" "ago"
@@ -722,7 +727,7 @@ echo "a truncated handoff is not rotated from"
 TR="$FIX/truncated"; mkdir -p "$TR"
 printf '# Victim handoff\n\nIn flight: the parser refactor, currently ha' > "$TR/T-Big.md"
 write_state "T-Big" "sid-big" "$FIX/work1"
-tr_out=$(env -i HOME="$HOME" PATH="$NOTMUX_PATH" CL_HANDOFF_DIR="$TR" \
+tr_out=$(env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$NOTMUX_PATH" CL_HANDOFF_DIR="$TR" \
   CL_HANDOFF_FALLBACK_BASE="$FIX/tr-fb" bash "$CL" start 2>&1)
 not_contains "a handoff with no terminal marker does not rotate" "$tr_out" "--rotate-from"
 contains     "…it is called out as incomplete"                   "$tr_out" "INCOMPLETE"
@@ -733,7 +738,7 @@ check "…and not into consumed/"                     "0" "$(ls "$TR/consumed" 2
 
 echo "…and a second start does not keep re-rejecting it"
 write_state "T-Big" "sid-big" "$FIX/work1"
-tr2_out=$(env -i HOME="$HOME" PATH="$NOTMUX_PATH" CL_HANDOFF_DIR="$TR" \
+tr2_out=$(env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$NOTMUX_PATH" CL_HANDOFF_DIR="$TR" \
   CL_HANDOFF_FALLBACK_BASE="$FIX/tr-fb" bash "$CL" start 2>&1)
 not_contains "the quarantined file is gone, so nothing is re-reported" "$tr2_out" "INCOMPLETE"
 
@@ -742,7 +747,7 @@ echo "a COMPLETE handoff still rotates"
 CP="$FIX/complete"; mkdir -p "$CP"
 printf 'real work\n\n<!-- cl:clho:1:2:3:4 -->\n' > "$CP/T-Big.md"
 write_state "T-Big" "sid-big" "$FIX/work1"
-cp_out=$(env -i HOME="$HOME" PATH="$NOTMUX_PATH" CL_HANDOFF_DIR="$CP" \
+cp_out=$(env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$NOTMUX_PATH" CL_HANDOFF_DIR="$CP" \
   CL_HANDOFF_FALLBACK_BASE="$FIX/cp-fb" bash "$CL" start 2>&1)
 contains "a file with a valid terminal marker rotates" "$cp_out" "--rotate-from"
 
@@ -752,7 +757,7 @@ echo "the marker must be TERMINAL, not merely present"
 MP="$FIX/midprose"; mkdir -p "$MP"
 printf 'I considered writing <!-- cl:manual:2020-01-01T00:00:00Z --> here.\nThen I was cut off mid-th' > "$MP/T-Big.md"
 write_state "T-Big" "sid-big" "$FIX/work1"
-mp_out=$(env -i HOME="$HOME" PATH="$NOTMUX_PATH" CL_HANDOFF_DIR="$MP" \
+mp_out=$(env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$NOTMUX_PATH" CL_HANDOFF_DIR="$MP" \
   CL_HANDOFF_FALLBACK_BASE="$FIX/mp-fb" bash "$CL" start 2>&1)
 not_contains "a marker quoted mid-prose does not make a file complete" "$mp_out" "--rotate-from"
 contains     "…it is still incomplete"                                "$mp_out" "INCOMPLETE"
@@ -772,7 +777,7 @@ echo "cl stop stops a session even when no handoff arrives"
 rtmux new-session -d -s PlainStop -c "$FIX" 'sleep 30'
 printf '{"cwd":"%s"}\n{"customTitle":"PlainStop"}\n' "$FIX" > "$HOME/.claude/projects/p1/sid-plainstop.jsonl"
 live_up
-ps_out=$(env -i HOME="$HOME" PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
+ps_out=$(env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
   CL_HANDOFF_DIR="$FIX/ps-store" CL_HANDOFF_TIMEOUT=1 CL_HANDOFF_ATTEMPTS=1 \
   bash "$CL" stop --keep-tabs 2>&1); ps_rc=$?
 ps_alive=0; rtmux has-session -t PlainStop 2>/dev/null && ps_alive=1
@@ -786,7 +791,7 @@ echo "--require-handoff opts back in to failing closed"
 rtmux new-session -d -s StrictStop -c "$FIX" 'sleep 30'
 printf '{"cwd":"%s"}\n{"customTitle":"StrictStop"}\n' "$FIX" > "$HOME/.claude/projects/p1/sid-strict.jsonl"
 live_up
-st_out=$(env -i HOME="$HOME" PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
+st_out=$(env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
   CL_HANDOFF_DIR="$FIX/st-store" CL_HANDOFF_TIMEOUT=1 CL_HANDOFF_ATTEMPTS=1 \
   bash "$CL" stop --keep-tabs --require-handoff 2>&1); st_rc=$?
 st_alive=0; rtmux has-session -t StrictStop 2>/dev/null && st_alive=1
@@ -804,7 +809,7 @@ printf '{"cwd":"%s"}\n{"customTitle":"KeepPrior"}\n' "$FIX" > "$HOME/.claude/pro
 KP="$FIX/keep-prior"; mkdir -p "$KP"
 printf 'good work from the previous cycle\n\n<!-- cl:clho:9:9:9:9 -->\n' > "$KP/KeepPrior.md"
 live_up
-env -i HOME="$HOME" PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
+env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
   CL_HANDOFF_DIR="$KP" CL_HANDOFF_TIMEOUT=1 CL_HANDOFF_ATTEMPTS=1 \
   bash "$CL" stop --keep-tabs >/dev/null 2>&1
 check "the prior handoff survives a failed request" "1" "$([ -f "$KP/KeepPrior.md" ] && echo 1 || echo 0)"
@@ -820,7 +825,7 @@ printf '{"cwd":"%s"}\n{"customTitle":"SkipRot"}\n' "$FIX" > "$HOME/.claude/proje
 SK="$FIX/skip-store"; mkdir -p "$SK"
 printf 'from an earlier cycle\n\n<!-- cl:clho:5:5:5:5 -->\n' > "$SK/SkipRot.md"
 live_up
-env -i HOME="$HOME" PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
+env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
   CL_HANDOFF_DIR="$SK" bash "$CL" stop --keep-tabs --no-handoff >/dev/null 2>&1
 check "--no-handoff clears the pending handoff" "0" "$([ -e "$SK/SkipRot.md" ] && echo 1 || echo 0)"
 check "…by filing it, not deleting it"          "1" "$(ls "$SK/consumed" 2>/dev/null | grep -c .)"
@@ -863,7 +868,7 @@ echo "a start whose launch is refused keeps its row for a retry"
 RT="$FIX/retain"; mkdir -p "$RT"
 rtmux new-session -d -s "claude-RetainMe" -c "$FIX" 'sleep 30'
 printf '[{"name":"RetainMe","sid":"sid-retain","cwd":"%s"}]\n' "$FIX/work1" > "$STATEDIR/state.json"
-env -i HOME="$HOME" PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
+env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
   CL_HANDOFF_DIR="$RT" CL_HANDOFF_FALLBACK_BASE="$FIX/rt-fb" \
   bash "$CL" start >/dev/null 2>&1
 # The name is already taken, so cl start reports it live and opens no tab; the
@@ -890,7 +895,7 @@ printf '{"cwd":"%s"}\n{"customTitle":"FreshClaim"}\n' "$FIX" > "$HOME/.claude/pr
 FC="$FIX/fresh-claim"; mkdir -p "$FC"
 printf 'work\n\n<!-- cl:manual:2026-09-25T00:00:00Z -->\n' > "$FC/FreshClaim.md"
 : > "$FC/consumed"     # claiming cannot succeed
-fc_out=$(env -i HOME="$HOME" PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
+fc_out=$(env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
   CL_HANDOFF_DIR="$FC" CL_HANDOFF_TIMEOUT=1 bash "$CL" start --fresh "FreshClaim" 2>&1)
 fc_alive=0; rtmux has-session -t "claude-FreshClaim" 2>/dev/null && fc_alive=1
 contains "it says the handoff could not be claimed" "$fc_out" "could not be claimed"
@@ -910,7 +915,7 @@ SID="$FIX/sid-guard"; mkdir -p "$SID"
 printf 'notes from the previous occupant\n\n<!-- cl:manual:2026-09-25T00:00:00Z@sid-OLD -->\n' \
   > "$SID/T-Big.md"
 write_state "T-Big" "sid-big" "$FIX/work1"
-sid_out=$(env -i HOME="$HOME" PATH="$NOTMUX_PATH" CL_HANDOFF_DIR="$SID" \
+sid_out=$(env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$NOTMUX_PATH" CL_HANDOFF_DIR="$SID" \
   CL_HANDOFF_FALLBACK_BASE="$FIX/sid-fb" bash "$CL" "T-Big" --rotate-from "$SID/T-Big.md" 2>&1)
 contains "a foreign session id is named, not silently accepted" "$sid_out" "DIFFERENT session"
 contains "…and the session resumes instead"                     "$sid_out" "resuming it instead"
@@ -923,20 +928,20 @@ echo "…but a marker with no session id is still honoured"
 # marker and rejected it as a foreign session.
 LEG="$FIX/legacy-marker"; mkdir -p "$LEG"
 printf 'older hand-written handoff\n\n<!-- cl:manual:2026-09-25T00:00:00Z -->\n' > "$LEG/T-Big.md"
-leg_out=$(env -i HOME="$HOME" PATH="$NOTMUX_PATH" CL_HANDOFF_DIR="$LEG" \
+leg_out=$(env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$NOTMUX_PATH" CL_HANDOFF_DIR="$LEG" \
   CL_HANDOFF_FALLBACK_BASE="$FIX/leg-fb" bash "$CL" "T-Big" --rotate-from "$LEG/T-Big.md" 2>&1)
 not_contains "a marker with no sid is not read as a foreign one" "$leg_out" "DIFFERENT session"
 check "…and it is consumed normally" "1" "$(ls "$LEG/consumed" 2>/dev/null | grep -c .)"
 
 echo "cl handoff stamps its own session id"
 ST="$FIX/stamp"; mkdir -p "$ST"
-printf 'by hand\n' | env -i HOME="$HOME" PATH="$BASEPATH" CL_HANDOFF_DIR="$ST" \
+printf 'by hand\n' | env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$BASEPATH" CL_HANDOFF_DIR="$ST" \
   CL_SESSION_NAME="T-Big" CL_SESSION_ID="sid-big" bash "$CL" handoff >/dev/null 2>&1
 contains "the marker carries the launched session id after '@'" "$(tail -1 "$ST/T-Big.md" 2>/dev/null)" "@sid-big"
 # Without an id it must stamp NONE rather than guess one by name: after a
 # rotation the newest row for a name is the replacement, so a guess would stamp
 # the successor's id onto the predecessor's handoff and make it look current.
-printf 'by hand\n' | env -i HOME="$HOME" PATH="$BASEPATH" CL_HANDOFF_DIR="$ST" \
+printf 'by hand\n' | env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$BASEPATH" CL_HANDOFF_DIR="$ST" \
   CL_SESSION_NAME="T-Small" bash "$CL" handoff >/dev/null 2>&1
 not_contains "with no launched id, no id is invented" "$(tail -1 "$ST/T-Small.md" 2>/dev/null)" "@"
 
@@ -970,7 +975,7 @@ echo "archiving never overwrites, even when the chosen name is already taken"
 AR="$FIX/archive-collide"; mkdir -p "$AR/consumed"
 printf 'PRECIOUS existing file\n' > "$AR/src-a.md"
 printf 'SECOND file\n' > "$AR/src-b.md"
-arch=$(env -i HOME="$HOME" PATH="$BASEPATH" bash -c '
+arch=$(env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$BASEPATH" bash -c '
   eval "$(sed -n "/^_link_noclobber/,/^}/p;/^_reserve_and_move/,/^}/p;/^_archive_move/,/^}/p;/^name_component/,/^}/p" "$1")"
   # Force the first candidate to be occupied by seeding a file at every name the
   # generator could pick this second is impossible; instead prove the primitive:
@@ -982,7 +987,7 @@ arch=$(env -i HOME="$HOME" PATH="$BASEPATH" bash -c '
 contains "linking onto an occupied path is refused, not silently overwritten" "$arch" "REFUSED"
 contains "…and the occupant is untouched" "$arch" "one"
 # And the wrapper still succeeds by drawing another name.
-both=$(env -i HOME="$HOME" PATH="$BASEPATH" bash -c '
+both=$(env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$BASEPATH" bash -c '
   eval "$(sed -n "/^_link_noclobber/,/^}/p;/^_reserve_and_move/,/^}/p;/^_archive_move/,/^}/p;/^name_component/,/^}/p" "$1")"
   a=$(_archive_move "$2" consumed "T-Big" "$2/src-a.md")
   b=$(_archive_move "$2" consumed "T-Big" "$2/src-b.md")
@@ -998,7 +1003,7 @@ echo "rollback never overwrites a newer handoff"
 NW="$FIX/newer-wins"; mkdir -p "$NW/consumed"
 printf 'OLDER\n\n<!-- cl:clho:6:6:6:6 -->\n' > "$NW/claimed.md"
 printf 'NEWER\n\n<!-- cl:clho:7:7:7:7 -->\n' > "$NW/T-Big.md"
-rb2=$(env -i HOME="$HOME" PATH="$NOTMUX_PATH" CL_HANDOFF_DIR="$NW" bash -c '
+rb2=$(env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$NOTMUX_PATH" CL_HANDOFF_DIR="$NW" bash -c '
   # _link_noclobber too: rollback_claim delegates the atomic move to it, and an
   # extraction missing it would fail with "command not found" rather than test
   # the guard.
@@ -1016,7 +1021,7 @@ printf 'body\n\n<!-- cl:clho:8:8:8:8 -->\n' > "$NA/T-Big.md"
 # A PATH with jq but NO agent on it: claude_cmd has no override, so absence is
 # how the refusal is reached.
 NOAGENT="$FIX/noagent-bin"; mkdir -p "$NOAGENT"; ln -sf "$(command -v jq)" "$NOAGENT/jq"
-na_out=$(env -i HOME="$HOME" PATH="$NOAGENT:/usr/bin:/bin" CL_HANDOFF_DIR="$NA" \
+na_out=$(env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$NOAGENT:/usr/bin:/bin" CL_HANDOFF_DIR="$NA" \
   CL_HANDOFF_FALLBACK_BASE="$FIX/na-fb" \
   bash "$CL" "T-Big" --rotate-from "$NA/T-Big.md" 2>&1)
 contains "it says the agent cannot be run" "$na_out" "cannot run the agent"
@@ -1036,12 +1041,12 @@ printf '{"cwd":"%s"}\n{"customTitle":"RoOnly"}\n' "$FIX" > "$HOME/.claude/projec
 RO="$FIX/resume-only"; mkdir -p "$RO"
 printf 'OLD notes from an earlier cycle\n\n<!-- cl:clho:1:1:1:1 -->\n' > "$RO/RoOnly.md"
 live_up
-env -i HOME="$HOME" PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
+env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
   CL_HANDOFF_DIR="$RO" CL_HANDOFF_TIMEOUT=1 CL_HANDOFF_ATTEMPTS=1 \
   bash "$CL" stop --keep-tabs >/dev/null 2>&1
 check "the saved row is marked resume-only" "1" \
   "$(jq -r '.[]|select(.name=="RoOnly")|.resume_only' "$STATEDIR/state.json" 2>/dev/null | grep -c true)"
-ro_out=$(env -i HOME="$HOME" PATH="$NOTMUX_PATH" CL_HANDOFF_DIR="$RO" \
+ro_out=$(env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$NOTMUX_PATH" CL_HANDOFF_DIR="$RO" \
   CL_HANDOFF_FALLBACK_BASE="$FIX/ro-fb2" bash "$CL" start 2>&1)
 not_contains "…so the next start does not rotate" "$ro_out" "--rotate-from"
 contains     "…it resumes, as promised"           "$ro_out" 'cl "RoOnly"'
@@ -1057,7 +1062,7 @@ SH="$FIX/skip-hard"; mkdir -p "$SH"
 printf 'pending\n\n<!-- cl:clho:2:2:2:2 -->\n' > "$SH/SkipHard.md"
 : > "$SH/consumed"     # the clear cannot succeed
 live_up
-env -i HOME="$HOME" PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
+env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
   CL_HANDOFF_DIR="$SH" bash "$CL" stop --keep-tabs --no-handoff >/dev/null 2>&1
 check "the row still records resume-only" "1" \
   "$(jq -r '.[]|select(.name=="SkipHard")|.resume_only' "$STATEDIR/state.json" 2>/dev/null | grep -c true)"
@@ -1076,7 +1081,7 @@ printf 'work\n\n<!-- cl:clho:5:5:5:5 -->\n' > "$GONE/T-Gone.md"
 mkdir -p "$FIX/vanishing"
 printf '{"cwd":"%s"}\n{"customTitle":"T-Gone"}\n' "$FIX/vanishing" > "$HOME/.claude/projects/p1/sid-gone.jsonl"
 rmdir "$FIX/vanishing"
-gone_out=$(env -i HOME="$HOME" PATH="$NOTMUX_PATH" CL_HANDOFF_DIR="$GONE" \
+gone_out=$(env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$NOTMUX_PATH" CL_HANDOFF_DIR="$GONE" \
   CL_HANDOFF_FALLBACK_BASE="$FIX/gone-fb" CL_AGENT_REC="$FIX/gone-argv" \
   bash "$CL" "T-Gone" --rotate-from "$GONE/T-Gone.md" 2>&1)
 contains "it says the directory is gone" "$gone_out" "no longer exists"
@@ -1098,7 +1103,7 @@ printf 'work\n\n<!-- cl:clho:8:8:8:8 -->\n' > "$OCC/T-Occupied.md"
 # $NOTMUX first, for the stand-in agent, then $BASEPATH for real tmux. Without a
 # runnable agent the preflight refuses earlier and the tmux guard is never
 # reached — the assertion would pass for the wrong reason.
-occ_out=$(env -i HOME="$HOME" PATH="$NOTMUX:$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
+occ_out=$(env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$NOTMUX:$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
   CL_HANDOFF_DIR="$OCC" CL_HANDOFF_FALLBACK_BASE="$FIX/occ-fb" \
   CL_AGENT_REC="$FIX/occ-argv" \
   bash "$CL" "T-Occupied" --rotate-from "$OCC/T-Occupied.md" 2>&1)
@@ -1121,7 +1126,7 @@ echo "two claimers racing for one handoff: exactly one wins"
 # Claiming has to be atomic FROM THE SOURCE, which is what rename gives.
 CLM="$FIX/two-claimers"; mkdir -p "$CLM/consumed"
 printf 'the one handoff\n\n<!-- cl:clho:9:9:9:9 -->\n' > "$CLM/active.md"
-race=$(env -i HOME="$HOME" PATH="$BASEPATH" bash -c '
+race=$(env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$BASEPATH" bash -c '
   eval "$(sed -n "/^_link_noclobber/,/^}/p;/^_reserve_and_move/,/^}/p" "$1")"
   d="$2"
   # Both claimers pick their destination first, then contend for the source —
@@ -1144,7 +1149,7 @@ echo "a newer handoff published mid-claim is never destroyed"
 # is at the source at that instant, so nothing is silently dropped.
 MID="$FIX/mid-claim"; mkdir -p "$MID/consumed"
 printf 'OLDER generation\n\n<!-- cl:clho:1:1:1:1 -->\n' > "$MID/active.md"
-mid=$(env -i HOME="$HOME" PATH="$BASEPATH" bash -c '
+mid=$(env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$BASEPATH" bash -c '
   eval "$(sed -n "/^_reserve_and_move/,/^}/p" "$1")"
   d="$2"
   # Reserve the destination, then let a writer replace the active path before the
@@ -1161,7 +1166,7 @@ echo "a lost claimer leaves no empty reservation behind"
 # The reservation is created before the move, so a claimer that loses the race
 # must release it or consumed/ fills with zero-byte files that look like handoffs.
 LOSE="$FIX/lost-claim"; mkdir -p "$LOSE/consumed"
-lost=$(env -i HOME="$HOME" PATH="$BASEPATH" bash -c '
+lost=$(env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$BASEPATH" bash -c '
   eval "$(sed -n "/^_reserve_and_move/,/^}/p" "$1")"
   d="$2"
   _reserve_and_move "$d/nonexistent.md" "$d/consumed/orphan.md"; echo "rc=$?"
@@ -1193,7 +1198,7 @@ bash -n "$FNS_PLAN"  || { echo "FIXTURE FAILED: plan bundle does not parse"  >&2
 # Driven through a `claim_handoff` whose _archive_move is wrapped so the swap
 # happens exactly between validation and the rename — deterministic, not a sleep.
 swap_probe() { # <store> <replacement-content> <want_sid>  -> rc + stderr
-  env -i HOME="$HOME" PATH="$BASEPATH" FNS_CLAIM="$FNS_CLAIM" bash -c '
+  env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$BASEPATH" FNS_CLAIM="$FNS_CLAIM" bash -c '
     . "$FNS_CLAIM"
     CONSUMED_SUBDIR=consumed; INCOMPLETE_SUBDIR=incomplete
     MANUAL_MARKER_PREFIX="<!-- cl:manual:"
@@ -1234,7 +1239,7 @@ echo "…and the same swap through ordinary plan_rotation is refused too"
 # check-then-consume shape.
 SW3="$FIX/swap-plan"; mkdir -p "$SW3"
 printf 'validated and complete\n\n<!-- cl:clho:2:2:2:2 -->\n' > "$SW3/T-Swap.md"
-r3=$(env -i HOME="$HOME" PATH="$BASEPATH" FNS_PLAN="$FNS_PLAN" bash -c '
+r3=$(env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$BASEPATH" FNS_PLAN="$FNS_PLAN" bash -c '
   . "$FNS_PLAN"
   CONSUMED_SUBDIR=consumed; INCOMPLETE_SUBDIR=incomplete
   root="$2"
@@ -1249,7 +1254,7 @@ echo "…while an unswapped claim still succeeds"
 # The control: acceptance-after-the-move must not reject everything.
 SW4="$FIX/swap-none"; mkdir -p "$SW4"
 printf 'complete and unswapped\n\n<!-- cl:clho:3:3:3:3 -->\n' > "$SW4/T-Swap.md"
-r4=$(env -i HOME="$HOME" PATH="$BASEPATH" FNS_CLAIM="$FNS_CLAIM" bash -c '
+r4=$(env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$BASEPATH" FNS_CLAIM="$FNS_CLAIM" bash -c '
   . "$FNS_CLAIM"
   CONSUMED_SUBDIR=consumed; INCOMPLETE_SUBDIR=incomplete
   claim_handoff "$2" "T-Swap" >/dev/null 2>&1; echo "rc=$?"' _ "$CL" "$SW4" 2>&1)

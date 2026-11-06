@@ -70,8 +70,10 @@ extract_fns() {
 }
 
 LIB="$FIX/lib.sh"
-extract_fns "$CL" handoff_target_busy handoff_nonce run_bounded send_text_tmux handoff_send_once request_handoff > "$LIB"
-for fn in handoff_target_busy handoff_nonce run_bounded send_text_tmux handoff_send_once request_handoff; do
+extract_fns "$CL" handoff_target_busy handoff_nonce run_bounded send_text_tmux handoff_send_once request_handoff \
+  handoff_ask_mark handoff_ask_seen handoff_ask_wait handoff_ask_resend handoff_ask_retype handoff_poll_marks handoff_send_checked > "$LIB"
+for fn in handoff_target_busy handoff_nonce run_bounded send_text_tmux handoff_send_once request_handoff \
+          handoff_ask_mark handoff_ask_seen handoff_ask_wait handoff_ask_resend handoff_ask_retype handoff_poll_marks handoff_send_checked; do
   grep -q "^${fn}()" "$LIB" || setup_failed "could not extract ${fn} from the shipped script"
 done
 # Guards on the extract, not on the product: if these functions ever stop
@@ -258,6 +260,29 @@ contains "…it says which backend was killed"     "$out" "tmux send"
 contains "…and how long it waited"               "$out" "after 1s"
 contains "…reporting the session unreachable"    "$out" "unreachable"
 
+echo "delivery check: only the WHOLE line counts, and a busy session is never re-typed into"
+TRD="$FIX/tr-proj/p"; mkdir -p "$TRD"; TRF="$TRD/sid-v.jsonl"
+printf '{"type":"user","message":{"content":"earlier"}}\n' > "$TRF"
+seen() { ( . "$LIB"; PROJECTS="$FIX/tr-proj"; m=$(handoff_ask_mark sid-v); eval "$1"; handoff_ask_seen "$m" 'cl stop: read and follow "X/Name.request"' && echo seen || echo missing ); }
+check "nothing new after the mark is missing" "missing" "$(seen ':')"
+check "a tail that lost its start is missing" "missing" \
+  "$(seen "printf '%s\n' '{\"type\":\"user\",\"message\":{\"content\":\"follow \\\"X/Name.request\\\"\"}}' >> '$TRF'")"
+check "the whole line is seen" "seen" \
+  "$(seen "printf '%s\n' '{\"type\":\"user\",\"message\":{\"content\":\"cl stop: read and follow \\\"X/Name.request\\\"\"}}' >> '$TRF'")"
+check "…as is the same line queued while busy" "seen" \
+  "$(seen "printf '%s\n' '{\"type\":\"queue-operation\",\"operation\":\"enqueue\",\"content\":\"cl stop: read and follow \\\"X/Name.request\\\"\"}' >> '$TRF'")"
+check "a line already there BEFORE the mark does not count" "missing" "$(seen ':')"
+rt() { # <busy-rc>
+  : > "$FIX/rt.log"
+  ( . "$LIB"; PROJECTS="$FIX/no-projects"; CL_HANDOFF_VERIFY=1
+    eval "handoff_target_busy() { return $1 ; }"
+    handoff_send_once() { echo sent >> "$FIX/rt.log"; return 0; }
+    handoff_ask_retype N sid t LINE ) >/dev/null 2>&1
+  grep -c . "$FIX/rt.log" | tr -d ' '
+}
+check "a busy session is not typed into again" "0" "$(rt 0)"
+check "…an idle one is, once" "1" "$(rt 1)"
+
 # ── request_handoff: still the SINGLE-session path (`cl start --fresh`) ──────
 # `cl stop` no longer uses it; it remains the right shape for one session, where
 # serial IS the whole job. Driven with stubs, because a real busy claude cannot
@@ -278,7 +303,9 @@ run_rh() { # <busy-rc> <attempts> <timeout> <session-cap>
     # Never matches, so every attempt runs to its full window — the window is
     # what is being measured.
     handoff_marker() { printf ''; }
-    build_handoff_prompt() { printf 'ASK nonce=%s' "$3"; }
+    build_handoff_ask() { printf 'ASK nonce=%s' "$3"; }
+    handoff_request_path() { printf '%s/never.request' "$FIX"; }
+    PROJECTS="$FIX/no-projects"   # no transcript: delivery cannot be checked here
     handoff_send_once() { printf '%s\n' "$4" >> "$SENDS"; return 0; }
     request_handoff "Target" "sid-1" "$FIX" "tname" ""
   ) > "$FIX/rh.out" 2>&1
@@ -343,24 +370,48 @@ trap 'rtmux kill-server >/dev/null 2>&1; rm -rf "$FIX"' EXIT
 # needs.
 AGENT="$FIX/agent.py"
 cat > "$AGENT" <<'PYEOF'
-import os, re, sys, termios, time
+import json, os, re, sys, termios, time
 fd = sys.stdin.fileno()
 old = termios.tcgetattr(fd)
-data = b""
+# AGENT_DROP: the real fault (2026-11-06) — the first typed line arrives with its
+# START missing. Only the tail reaches the transcript, the way it did in iTerm.
+drop = int(os.environ.get("AGENT_DROP", "0"))
+arrivals = 0
+def read_line():
+    data = b""
+    while True:
+        c = sys.stdin.buffer.read(1)
+        if not c:
+            return None
+        if c in (b"\r", b"\n"):
+            return data.decode("utf-8", "replace")
+        data += c
 try:
     new = termios.tcgetattr(fd)
     new[3] = new[3] & ~termios.ECHO & ~termios.ICANON
     termios.tcsetattr(fd, termios.TCSADRAIN, new)
     while True:
-        c = sys.stdin.buffer.read(1)
-        if not c or c in (b"\r", b"\n"):
+        line = read_line()
+        if line is None:
+            sys.exit(0)
+        arrivals += 1
+        if arrivals == 1 and drop:
+            line = line[drop:]
+        # Claude records each submitted turn in its transcript; cl checks for it.
+        tr = os.environ.get("AGENT_TRANSCRIPT")
+        if tr:
+            with open(tr, "a") as fh:
+                fh.write(json.dumps({"type": "user", "message": {"role": "user", "content": line}}) + "\n")
+        with open(os.environ["AGENT_RECV"], "a") as fh:
+            fh.write(line + "\n")
+        req = re.search(r'handoff request in "([^"]+)"$', line)
+        if req:
             break
-        data += c
 finally:
     termios.tcsetattr(fd, termios.TCSADRAIN, old)
-text = data.decode("utf-8", "replace")
-with open(os.environ["AGENT_RECV"], "w") as fh:
-    fh.write(text)
+# The typed line only points at the request; the instruction is in that file.
+with open(req.group(1)) as fh:
+    text = fh.read()
 path = re.search(r'handoff to "([^"]+)"', text)
 nonce = re.search(r'(clho:[0-9]+:[0-9]+:[0-9]+:[0-9]+)', text)
 # Deliberately AFTER the read: a handoff is work, and a window that only passes
@@ -395,12 +446,12 @@ if path and mode != "0":
 time.sleep(120)
 PYEOF
 
-mk_agent() { # <name> <mtime> <delay> <answer 0|1>
+mk_agent() { # <name> <mtime> <delay> <answer 0|1> [chars lost from first arrival] [transcript, "" = never records]
   printf '{"cwd":"%s"}\n{"customTitle":"%s"}\n' "$FIX" "$1" \
     > "$HOME/.claude/projects/p1/sid-$1.jsonl"
   touch -t "$2" "$HOME/.claude/projects/p1/sid-$1.jsonl"
   rtmux new-session -d -s "$1" -c "$FIX" \
-    "AGENT_RECV='$FIX/recv-$1.txt' AGENT_DELAY='$3' AGENT_ANSWER='$4' python3 '$AGENT'" 2>/dev/null
+    "AGENT_RECV='$FIX/recv-$1.txt' AGENT_DELAY='$3' AGENT_ANSWER='$4' AGENT_DROP='${5:-0}' AGENT_TRANSCRIPT='${6-$HOME/.claude/projects/p1/sid-$1.jsonl}' python3 '$AGENT'" 2>/dev/null
 }
 reset_sessions() { rm -f "$HOME/.claude/projects/p1/"*.jsonl "$FIX"/recv-*.txt; }
 
@@ -440,10 +491,13 @@ check "the handoff files exist on disk" "3" \
   "$(ls -1 "$FIX/store-par"/Agent*.md 2>/dev/null | wc -l | tr -d ' ')"
 contains "…with a terminal marker, written by the agent" \
   "$(tail -1 "$FIX/store-par/AgentA.md" 2>/dev/null)" "<!-- cl:clho:"
-# The prompt alone had to carry the path and the token, since nothing was passed
-# to the agent out of band.
-contains "the prompt that reached the pane named the file" \
-  "$(cat "$FIX/recv-AgentA.txt" 2>/dev/null)" "handoff to"
+# Nothing was passed to the agent out of band: it found the path and the token by
+# following the one typed line to the request file.
+contains "the line typed into the pane points at the request file" \
+  "$(cat "$FIX/recv-AgentA.txt" 2>/dev/null)" "handoff request in \"$FIX/store-par/AgentA.request\""
+check "…which is removed once its handoff is confirmed" "0" "$([ -e "$FIX/store-par/AgentA.request" ] && echo 1 || echo 0)"
+contains "…and an ask that arrived whole is not typed again" "$par" "asked \"AgentA\""
+not_contains "…(no retype)" "$par" "did not arrive whole"
 rtmux kill-server >/dev/null 2>&1
 
 echo "every session gets the WHOLE window — the budget is no longer divided"
@@ -644,6 +698,53 @@ check "the last ask precedes the end of the wait" "1" \
   "$([ -n "$last_ask" ] && [ -n "$done_line" ] && [ "$last_ask" -lt "$done_line" ] && echo 1 || echo 0)"
 check "…and both sessions are gone afterwards" "0" \
   "$(rtmux list-sessions 2>/dev/null | grep -c '^Order')"
+rtmux kill-server >/dev/null 2>&1
+
+echo "an ask that arrives with its start missing is noticed and typed again"
+# The real fault (2026-11-02..06): in iTerm the typed line lost its START, so the
+# handoff path and nonce never arrived and cl waited out the whole timeout. The
+# agent here drops the first 40 characters of its first arrival; only that tail
+# reaches its transcript.
+reset_sessions
+mk_agent Trunc 202610121200 0 1 40
+env -i HOME="$HOME" PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
+  CL_HANDOFF_DIR="$FIX/store-trunc" CL_HANDOFF_TIMEOUT=10 CL_HANDOFF_ATTEMPTS=1 CL_HANDOFF_VERIFY=2 \
+  bash "$CL" stop --keep-tabs > "$FIX/trunc.out" 2>&1
+tr_out="$(cat "$FIX/trunc.out")"
+contains "cl sees the ask did not arrive whole" "$tr_out" 'the handoff ask to "Trunc" did not arrive whole — typing it again'
+check "…the agent received it twice: cut, then whole" "2" "$(grep -c . "$FIX/recv-Trunc.txt" 2>/dev/null)"
+contains "…and the handoff then lands, inside one round" "$tr_out" 'handoff written for "Trunc"'
+not_contains "…with no 'could not confirm' warning" "$tr_out" "could not confirm"
+rtmux kill-server >/dev/null 2>&1
+
+echo "several asks that never show up cost ONE confirmation window, not one each"
+# Codex review, PR #26: confirming each retype on its own serialised the wait —
+# about 100s for nineteen stale transcripts, outside the handoff budget. These
+# agents answer but never record a turn, so every ask looks lost twice.
+reset_sessions
+for a in S1 S2 S3 S4 S5; do mk_agent "$a" 202610121200 0 1 0 ""; done
+start=$(date +%s)
+env -i HOME="$HOME" PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
+  CL_HANDOFF_DIR="$FIX/store-stale" CL_HANDOFF_TIMEOUT=10 CL_HANDOFF_ATTEMPTS=1 CL_HANDOFF_VERIFY=3 \
+  bash "$CL" stop --keep-tabs > "$FIX/stale.out" 2>&1
+stale_elapsed=$(( $(date +%s) - start ))
+stale="$(cat "$FIX/stale.out")"
+check "every one of them is typed again" "5" "$(grep -c 'did not arrive whole' "$FIX/stale.out")"
+check "…and each reported unconfirmed, once" "5" "$(grep -c 'could not confirm' "$FIX/stale.out")"
+# Two shared 3s windows plus dispatch and kills is ~10s; one window per session
+# would be 3 + 5×3 = 18s of verification alone.
+check "…in two shared windows, not one per session (${stale_elapsed}s)" "1" "$([ "$stale_elapsed" -lt 16 ] && echo 1 || echo 0)"
+contains "…and their handoffs still land" "$stale" "5 of 5 asked handoff(s) landed"
+rtmux kill-server >/dev/null 2>&1
+
+echo "…and with the check off, the same cut-off ask is never answered"
+# The control: proves the retype is what rescued it, not the fixture.
+reset_sessions
+mk_agent Trunc2 202610121200 0 1 40
+env -i HOME="$HOME" PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
+  CL_HANDOFF_DIR="$FIX/store-trunc2" CL_HANDOFF_TIMEOUT=3 CL_HANDOFF_ATTEMPTS=1 CL_HANDOFF_VERIFY=0 \
+  bash "$CL" stop --keep-tabs > "$FIX/trunc2.out" 2>&1
+contains "no retype means no handoff" "$(cat "$FIX/trunc2.out")" 'no handoff from "Trunc2"'
 rtmux kill-server >/dev/null 2>&1
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
