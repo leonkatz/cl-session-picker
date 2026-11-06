@@ -71,9 +71,9 @@ extract_fns() {
 
 LIB="$FIX/lib.sh"
 extract_fns "$CL" handoff_target_busy handoff_nonce run_bounded send_text_tmux handoff_send_once request_handoff \
-  handoff_ask_mark handoff_ask_seen handoff_ask_wait handoff_ask_retype handoff_send_checked > "$LIB"
+  handoff_ask_mark handoff_ask_seen handoff_ask_wait handoff_ask_resend handoff_ask_retype handoff_poll_marks handoff_send_checked > "$LIB"
 for fn in handoff_target_busy handoff_nonce run_bounded send_text_tmux handoff_send_once request_handoff \
-          handoff_ask_mark handoff_ask_seen handoff_ask_wait handoff_ask_retype handoff_send_checked; do
+          handoff_ask_mark handoff_ask_seen handoff_ask_wait handoff_ask_resend handoff_ask_retype handoff_poll_marks handoff_send_checked; do
   grep -q "^${fn}()" "$LIB" || setup_failed "could not extract ${fn} from the shipped script"
 done
 # Guards on the extract, not on the product: if these functions ever stop
@@ -446,12 +446,12 @@ if path and mode != "0":
 time.sleep(120)
 PYEOF
 
-mk_agent() { # <name> <mtime> <delay> <answer 0|1> [chars lost from the first arrival]
+mk_agent() { # <name> <mtime> <delay> <answer 0|1> [chars lost from first arrival] [transcript, "" = never records]
   printf '{"cwd":"%s"}\n{"customTitle":"%s"}\n' "$FIX" "$1" \
     > "$HOME/.claude/projects/p1/sid-$1.jsonl"
   touch -t "$2" "$HOME/.claude/projects/p1/sid-$1.jsonl"
   rtmux new-session -d -s "$1" -c "$FIX" \
-    "AGENT_RECV='$FIX/recv-$1.txt' AGENT_DELAY='$3' AGENT_ANSWER='$4' AGENT_DROP='${5:-0}' AGENT_TRANSCRIPT='$HOME/.claude/projects/p1/sid-$1.jsonl' python3 '$AGENT'" 2>/dev/null
+    "AGENT_RECV='$FIX/recv-$1.txt' AGENT_DELAY='$3' AGENT_ANSWER='$4' AGENT_DROP='${5:-0}' AGENT_TRANSCRIPT='${6-$HOME/.claude/projects/p1/sid-$1.jsonl}' python3 '$AGENT'" 2>/dev/null
 }
 reset_sessions() { rm -f "$HOME/.claude/projects/p1/"*.jsonl "$FIX"/recv-*.txt; }
 
@@ -715,6 +715,26 @@ contains "cl sees the ask did not arrive whole" "$tr_out" 'the handoff ask to "T
 check "…the agent received it twice: cut, then whole" "2" "$(grep -c . "$FIX/recv-Trunc.txt" 2>/dev/null)"
 contains "…and the handoff then lands, inside one round" "$tr_out" 'handoff written for "Trunc"'
 not_contains "…with no 'could not confirm' warning" "$tr_out" "could not confirm"
+rtmux kill-server >/dev/null 2>&1
+
+echo "several asks that never show up cost ONE confirmation window, not one each"
+# Codex review, PR #26: confirming each retype on its own serialised the wait —
+# about 100s for nineteen stale transcripts, outside the handoff budget. These
+# agents answer but never record a turn, so every ask looks lost twice.
+reset_sessions
+for a in S1 S2 S3 S4 S5; do mk_agent "$a" 202610121200 0 1 0 ""; done
+start=$(date +%s)
+env -i HOME="$HOME" PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
+  CL_HANDOFF_DIR="$FIX/store-stale" CL_HANDOFF_TIMEOUT=10 CL_HANDOFF_ATTEMPTS=1 CL_HANDOFF_VERIFY=3 \
+  bash "$CL" stop --keep-tabs > "$FIX/stale.out" 2>&1
+stale_elapsed=$(( $(date +%s) - start ))
+stale="$(cat "$FIX/stale.out")"
+check "every one of them is typed again" "5" "$(grep -c 'did not arrive whole' "$FIX/stale.out")"
+check "…and each reported unconfirmed, once" "5" "$(grep -c 'could not confirm' "$FIX/stale.out")"
+# Two shared 3s windows plus dispatch and kills is ~10s; one window per session
+# would be 3 + 5×3 = 18s of verification alone.
+check "…in two shared windows, not one per session (${stale_elapsed}s)" "1" "$([ "$stale_elapsed" -lt 16 ] && echo 1 || echo 0)"
+contains "…and their handoffs still land" "$stale" "5 of 5 asked handoff(s) landed"
 rtmux kill-server >/dev/null 2>&1
 
 echo "…and with the check off, the same cut-off ask is never answered"

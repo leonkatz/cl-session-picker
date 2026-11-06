@@ -3275,18 +3275,47 @@ handoff_send_once() {
   return 1
 }
 
-# handoff_ask_retype <name> <sid> <tmux_name> <line>: the ask did not show up
-# in the transcript, so type it once more. Not into a session that is working:
-# it queues typed input, so its ask may simply be waiting (see the re-ask rule in
-# request_handoff). 1 only if the pane became unreachable.
-handoff_ask_retype() {
+# handoff_ask_resend <name> <sid> <tmux_name> <line>: the ask did not show up
+# in the transcript, so type it once more and print the new mark. Not into a
+# session that is working: it queues typed input, so its ask may simply be
+# waiting (see the re-ask rule in request_handoff). Returns 0 sent, 1 the pane
+# became unreachable, 2 left alone because it is busy.
+handoff_ask_resend() {
   local mark
-  handoff_target_busy "$3" "$2" "$1" && return 0
+  handoff_target_busy "$3" "$2" "$1" && return 2
   printf '⚠ the handoff ask to "%s" did not arrive whole — typing it again\n' "$1" >&2
   mark=$(handoff_ask_mark "$2")
   handoff_send_once "$1" "$2" "$3" "$4" || return 1
+  printf '%s' "$mark"
+}
+
+# handoff_ask_retype <name> <sid> <tmux_name> <line>: resend, then wait for it.
+# For ONE session; the broadcast resends all of them first and confirms them in
+# one shared window instead (handoff_poll_marks). 1 only if unreachable.
+handoff_ask_retype() {
+  local mark rc
+  mark=$(handoff_ask_resend "$@"); rc=$?
+  [ "$rc" = "2" ] && return 0
+  [ "$rc" = "0" ] || return 1
   handoff_ask_wait "$CL_HANDOFF_VERIFY" "$mark" "$4" && return 0
   printf '⚠ could not confirm that "%s" received the handoff ask — waiting for its handoff anyway\n' "$1" >&2
+  return 0
+}
+
+# handoff_poll_marks: one shared CL_HANDOFF_VERIFY window over every pending
+# session of do_stop's arrays (_n, _h_state, _h_mark, _h_line — read through
+# bash's dynamic scope). A session whose line is seen has its mark cleared, so
+# what is still marked afterwards is what never arrived whole.
+handoff_poll_marks() {
+  local t=0 unseen=1 i
+  while [ "$unseen" -gt 0 ] && [ "$t" -le $(( CL_HANDOFF_VERIFY * 4 )) ]; do
+    unseen=0
+    for (( i=0; i<_n; i++ )); do
+      [ "${_h_state[$i]}" = "pending" ] && [ -n "${_h_mark[$i]:-}" ] || continue
+      if handoff_ask_seen "${_h_mark[$i]}" "${_h_line[$i]}"; then _h_mark[$i]=""; else unseen=$((unseen+1)); fi
+    done
+    [ "$unseen" -gt 0 ] && { sleep 0.25; t=$((t+1)); }
+  done
   return 0
 }
 
@@ -3853,23 +3882,29 @@ do_stop() {
   # ── PASS 2b: DID EACH ASK ARRIVE WHOLE? ─────────────────────────────────────
   # Checked after the whole dispatch rather than per send, so the check costs
   # one short shared window instead of one per session. See build_handoff_ask.
+  # The retypes are confirmed together too: per-session confirmation cost one
+  # window per unseen session, outside the budget (Codex review, PR #26).
   if [ -z "$dry_run" ] && [ "$_pending" -gt 0 ]; then
-    local _vt=0 _unseen=1
-    while [ "$_unseen" -gt 0 ] && [ "$_vt" -le $(( CL_HANDOFF_VERIFY * 4 )) ]; do
-      _unseen=0
-      for (( i=0; i<_n; i++ )); do
-        [ "${_h_state[$i]}" = "pending" ] && [ -n "${_h_mark[$i]:-}" ] || continue
-        if handoff_ask_seen "${_h_mark[$i]}" "${_h_line[$i]}"; then _h_mark[$i]=""; else _unseen=$((_unseen+1)); fi
-      done
-      [ "$_unseen" -gt 0 ] && { sleep 0.25; _vt=$((_vt+1)); }
-    done
+    handoff_poll_marks
+    local _resent=0 _m _rrc
     for (( i=0; i<_n; i++ )); do
       [ "${_h_state[$i]}" = "pending" ] && [ -n "${_h_mark[$i]:-}" ] || continue
-      if ! handoff_ask_retype "${_h_name[$i]}" "${_h_sid[$i]}" "${_h_tmux[$i]}" "${_h_line[$i]}"; then
-        printf 'ℹ "%s" became unreachable before its handoff landed\n' "${_h_name[$i]}" >&2
-        _h_state[$i]="unreachable"; _pending=$((_pending-1))
-      fi
+      _m=$(handoff_ask_resend "${_h_name[$i]}" "${_h_sid[$i]}" "${_h_tmux[$i]}" "${_h_line[$i]}"); _rrc=$?
+      case "$_rrc" in
+        0) _h_mark[$i]="$_m"; _resent=$((_resent+1)) ;;
+        1) printf 'ℹ "%s" became unreachable before its handoff landed\n' "${_h_name[$i]}" >&2
+           _h_state[$i]="unreachable"; _pending=$((_pending-1)); _h_mark[$i]="" ;;
+        *) _h_mark[$i]="" ;;   # busy: its ask is queued, not lost
+      esac
     done
+    if [ "$_resent" -gt 0 ]; then
+      handoff_poll_marks
+      for (( i=0; i<_n; i++ )); do
+        [ "${_h_state[$i]}" = "pending" ] && [ -n "${_h_mark[$i]:-}" ] || continue
+        printf '⚠ could not confirm that "%s" received the handoff ask — waiting for its handoff anyway\n' "${_h_name[$i]}" >&2
+        _h_mark[$i]=""
+      done
+    fi
   fi
 
   # ── PASS 3: ONE SHARED WAIT ─────────────────────────────────────────────────
