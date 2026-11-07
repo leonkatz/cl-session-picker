@@ -52,6 +52,11 @@
 #                             #   (180s) for all of them, and CL_HANDOFF_BUDGET
 #                             #   (300s) bounds the waiting across rounds. Asks
 #                             #   before killing anything still mid-task.
+#   claude-session compact "Name"... | --all
+#                             # steps 2-5 of compact-resume WITHOUT a stop: the
+#                             #   pre-compact request, /compact once the cl-done
+#                             #   reply lands, a confirmed compaction. The session
+#                             #   keeps running. Claude only; --dry-run previews.
 #   claude-session handoff    # write THIS session's handoff by hand, from inside
 #                             #   it — the way out when a pane can't be reached.
 #                             #   Pipe the text in, or run it bare to be told
@@ -3594,13 +3599,18 @@ compact_nonce() { printf 'cl-done:%s-%s-%s%s' "$$" "$(date +%s 2>/dev/null || ec
 # minutes, and the transcript alone cannot tell a pause from an end — so it
 # cannot depend on there being a workflow. A custom file supplies only the
 # workflow; the token sentence is appended whatever it says.
+#
+# An optional fourth argument, "compact", is `cl compact`: the session is
+# compacted and keeps running, so it is not told it is about to be restarted.
 build_precompact_prompt() {
-  local root="$1" name="$2" token="$3" tmpl work=""
+  local root="$1" name="$2" token="$3" purpose="${4:-stop}" tmpl work="" what
   if tmpl=$(read_prompt_file "$CL_PRECOMPACT_PROMPT_FILE"); then
     work="$(_prompt_expand "$tmpl" "" "" "$name" "$root") "
   fi
-  printf '%sThis session is about to be compacted and restarted by cl. When you have finished, end your turn with a plain reply whose last line is exactly %s and nothing after it, and run no tool after writing it.' \
-    "$work" "$token" | _prompt_flatten
+  what="This session is about to be compacted and restarted by cl."
+  [ "$purpose" = "compact" ] && what="This session is about to be compacted by cl, and will keep running afterwards."
+  printf '%s%s When you have finished, end your turn with a plain reply whose last line is exactly %s and nothing after it, and run no tool after writing it.' \
+    "$work" "$what" "$token" | _prompt_flatten
 }
 
 # build_handoff_ask <root> <name> <nonce> [precompact]: write the full request
@@ -3608,10 +3618,12 @@ build_precompact_prompt() {
 # typed as before, because a handoff problem must never prevent a stop. The
 # fourth argument selects the pre-compact request instead of the handoff one;
 # the route, the pointer shape and the delivery check are the same for both.
+# A fifth argument, "compact", is `cl compact` asking: the pointer names that
+# command, and the request does not promise a restart (build_precompact_prompt).
 build_handoff_ask() {
-  local root="$1" name="$2" nonce="$3" kind="${4:-handoff}" full rp tmp label
+  local root="$1" name="$2" nonce="$3" kind="${4:-handoff}" purpose="${5:-stop}" full rp tmp label
   if [ "$kind" = "precompact" ]; then
-    full=$(build_precompact_prompt "$root" "$name" "$nonce")
+    full=$(build_precompact_prompt "$root" "$name" "$nonce" "$purpose")
     rp=$(precompact_request_path "$root" "$name"); label="pre-compact request"
   else
     full=$(build_handoff_prompt "$root" "$name" "$nonce")
@@ -3619,7 +3631,7 @@ build_handoff_ask() {
   fi
   tmp="$rp.tmp.$$"
   if printf '%s\n' "$full" > "$tmp" 2>/dev/null && mv -f "$tmp" "$rp" 2>/dev/null; then
-    printf 'cl stop: read and follow the %s in "%s"' "$label" "$rp" | _prompt_flatten
+    printf 'cl %s: read and follow the %s in "%s"' "$purpose" "$label" "$rp" | _prompt_flatten
     return 0
   fi
   rm -f "$tmp" 2>/dev/null
@@ -4362,13 +4374,17 @@ save_state() {
   fi
 }
 
-# _c_fallback <i> <reason> <message>: a compacting session that will be asked
-# for a handoff instead. It then goes through the handoff phase like any other
-# handoff session — including honouring a handoff written by hand.
+# _c_fallback <i> <reason> <stop-message> [compact-message]: a compacting
+# session that will be asked for a handoff instead. It then goes through the
+# handoff phase like any other handoff session — including honouring a handoff
+# written by hand. Under `cl compact` (compact_phase's purpose, read through
+# bash's dynamic scope) there is no handoff phase: the session is simply not
+# compacted, the reason stays in _h_why for the report, and the fourth argument
+# is what is said.
 _c_fallback() {
   _h_rot[$1]="handoff"; _h_state[$1]="idle"; _h_cstate[$1]=""; _h_mark[$1]=""; _h_why[$1]="$2"
   _c_clear_request "$1"
-  printf '%s\n' "$3" >&2
+  if [ "${_c_purpose:-stop}" = "compact" ]; then printf '%s\n' "$4" >&2; else printf '%s\n' "$3" >&2; fi
 }
 
 # _c_clear_request <i>: the pre-compact request has been answered one way or
@@ -4387,9 +4403,14 @@ _c_compacted() {
   _c_clear_request "$1"
 }
 
-# _stop_compact_phase: steps 2-5 of compact-resume for every compacting session
-# of do_stop's arrays at once (read and written through bash's dynamic scope,
-# as handoff_poll_marks does).
+# compact_phase [stop|compact]: steps 2-5 of compact-resume for every
+# compacting session (_h_rot "compact-resume") of the caller's arrays at once,
+# read and written through bash's dynamic scope as handoff_poll_marks does. Two
+# callers declare those arrays: do_stop, and do_compact (`cl compact`), which is
+# the same steps without a stop. The purpose changes only what is SAID and what
+# the request promises, never a step: under "compact" the fallbacks below do
+# not lead anywhere (no handoff, no resume), the session is just reported as
+# not compacted, and do_compact reads the outcome from _h_cstate/_h_why.
 #
 # Every outcome is one of the spec's fallback table, and nothing else:
 #   compacted          -> stop it; resume with a first prompt
@@ -4402,7 +4423,8 @@ _c_compacted() {
 # watch, or no pane to type into, falls back to a handoff — the one route that
 # can still be answered without the pane (`cl handoff` by hand) — and one whose
 # /compact could not be typed after the token resumes as-is.
-_stop_compact_phase() {
+compact_phase() {
+  local _c_purpose="${1:-stop}"
   local i c_count=0 c_pending=0 tok prompt m rrc resent=0 deadline now sz b
   for (( i=0; i<_n; i++ )); do
     [ "${_h_rot[$i]}" = "compact-resume" ] && c_count=$((c_count+1))
@@ -4420,8 +4442,13 @@ _stop_compact_phase() {
   if [ -n "$dry_run" ]; then
     for (( i=0; i<_n; i++ )); do
       [ "${_h_rot[$i]}" = "compact-resume" ] || continue
-      printf '[dry-run] would ask "%s" to finish its pre-compact request, type /compact once it replies, and stop it once compacted (up to %ss)\n' \
-        "${_h_name[$i]}" "$CL_COMPACT_TIMEOUT" >&2
+      if [ "$_c_purpose" = "compact" ]; then
+        printf '[dry-run] would ask "%s" to finish its pre-compact request, type /compact once it replies, and confirm the compaction (up to %ss); it keeps running\n' \
+          "${_h_name[$i]}" "$CL_COMPACT_TIMEOUT" >&2
+      else
+        printf '[dry-run] would ask "%s" to finish its pre-compact request, type /compact once it replies, and stop it once compacted (up to %ss)\n' \
+          "${_h_name[$i]}" "$CL_COMPACT_TIMEOUT" >&2
+      fi
     done
     return 0
   fi
@@ -4430,22 +4457,25 @@ _stop_compact_phase() {
   for (( i=0; i<_n; i++ )); do
     [ "${_h_rot[$i]}" = "compact-resume" ] || continue
     if [ -z "$_CL_STOP_ROOT" ]; then
-      _c_fallback "$i" "no-store" "ℹ no durable location for the pre-compact request of \"${_h_name[$i]}\" — treating it as a handoff session"
+      _c_fallback "$i" "no-store" "ℹ no durable location for the pre-compact request of \"${_h_name[$i]}\" — treating it as a handoff session" \
+        "⚠ no durable location for the pre-compact request of \"${_h_name[$i]}\" — not compacted"
       continue
     fi
     _h_cbase[$i]=$(transcript_mark "${_h_sid[$i]}")
     if [ -z "${_h_cbase[$i]}" ]; then
-      _c_fallback "$i" "no-transcript" "ℹ no transcript to watch for \"${_h_name[$i]}\", so a compaction could not be confirmed — asking it for a handoff instead"
+      _c_fallback "$i" "no-transcript" "ℹ no transcript to watch for \"${_h_name[$i]}\", so a compaction could not be confirmed — asking it for a handoff instead" \
+        "⚠ no transcript to watch for \"${_h_name[$i]}\", so a compaction could not be confirmed — not compacted"
       continue
     fi
     tok=$(compact_nonce); _h_ctok[$i]="$tok"
-    prompt=$(build_handoff_ask "$_CL_STOP_ROOT" "${_h_name[$i]}" "$tok" precompact)
+    prompt=$(build_handoff_ask "$_CL_STOP_ROOT" "${_h_name[$i]}" "$tok" precompact "$_c_purpose")
     _h_mark[$i]=$(handoff_ask_mark "${_h_sid[$i]}"); _h_line[$i]="$prompt"
     if handoff_send_once "${_h_name[$i]}" "${_h_sid[$i]}" "${_h_tmux[$i]}" "$prompt"; then
       _h_state[$i]="cask"; _h_cstate[$i]="await_token"; c_pending=$((c_pending+1))
       printf '  → asked "%s" to finish up before /compact\n' "${_h_name[$i]}" >&2
     else
-      _c_fallback "$i" "unreachable" "ℹ no reachable pane to compact \"${_h_name[$i]}\" (not tmux, not a tagged iTerm tab) — treating it as a handoff session"
+      _c_fallback "$i" "unreachable" "ℹ no reachable pane to compact \"${_h_name[$i]}\" (not tmux, not a tagged iTerm tab) — treating it as a handoff session" \
+        "⚠ no reachable pane to compact \"${_h_name[$i]}\" (not tmux, not a tagged iTerm tab) — not compacted"
     fi
   done
 
@@ -4458,7 +4488,8 @@ _stop_compact_phase() {
       case "$rrc" in
         0) _h_mark[$i]="$m"; resent=$((resent+1)) ;;
         1) c_pending=$((c_pending-1))
-           _c_fallback "$i" "unreachable" "ℹ \"${_h_name[$i]}\" became unreachable before it could compact — treating it as a handoff session" ;;
+           _c_fallback "$i" "unreachable" "ℹ \"${_h_name[$i]}\" became unreachable before it could compact — treating it as a handoff session" \
+             "⚠ \"${_h_name[$i]}\" became unreachable before it could compact — not compacted" ;;
         *) _h_mark[$i]="" ;;   # busy: queued, not lost
       esac
     done
@@ -4509,7 +4540,11 @@ _stop_compact_phase() {
                 _h_cstate[$i]="resume"; _h_state[$i]="cdone"; _h_taken[$i]="resume"; _h_why[$i]="compact-unsent"
                 _c_clear_request "$i"
                 c_pending=$((c_pending-1))
-                printf '⚠ could not type /compact into "%s" — it will resume as-is\n' "${_h_name[$i]}" >&2
+                if [ "$_c_purpose" = "compact" ]; then
+                  printf '⚠ could not type /compact into "%s" — not compacted\n' "${_h_name[$i]}" >&2
+                else
+                  printf '⚠ could not type /compact into "%s" — it will resume as-is\n' "${_h_name[$i]}" >&2
+                fi
               fi
             fi
           fi
@@ -4544,16 +4579,152 @@ _stop_compact_phase() {
           # is not proven at rest and the ordinary mid-task prompt applies.
           _c_compacted "$i" "$(compact_boundary_after "${_h_cbase[$i]}")" "boundary-no-token"
         else
-          _c_fallback "$i" "no-token" "⚠ no cl-done reply from \"${_h_name[$i]}\" within ${CL_COMPACT_TIMEOUT}s — not compacting it; asking it for a handoff instead"
+          _c_fallback "$i" "no-token" "⚠ no cl-done reply from \"${_h_name[$i]}\" within ${CL_COMPACT_TIMEOUT}s — not compacting it; asking it for a handoff instead" \
+            "⚠ no cl-done reply from \"${_h_name[$i]}\" within ${CL_COMPACT_TIMEOUT}s — it did not finish its turn; not compacted"
         fi ;;
       await_boundary)
         _h_cstate[$i]="resume"; _h_state[$i]="cdone"; _h_taken[$i]="resume"; _h_why[$i]="no-boundary"
         _c_clear_request "$i"
-        printf '⚠ "%s" did not confirm a compaction within %ss of /compact — it will resume as-is (a handoff now would queue behind the compaction)\n' \
-          "${_h_name[$i]}" "$CL_COMPACT_TIMEOUT" >&2 ;;
+        if [ "$_c_purpose" = "compact" ]; then
+          # Not retyped: a second /compact would compact the summary again
+          # if the first one is merely slow.
+          printf '⚠ "%s" did not confirm a compaction within %ss of /compact — compaction not confirmed (not typing it again)\n' \
+            "${_h_name[$i]}" "$CL_COMPACT_TIMEOUT" >&2
+        else
+          printf '⚠ "%s" did not confirm a compaction within %ss of /compact — it will resume as-is (a handoff now would queue behind the compaction)\n' \
+            "${_h_name[$i]}" "$CL_COMPACT_TIMEOUT" >&2
+        fi ;;
     esac
   done
   return 0
+}
+
+# _compact_outcome <why> <cstate>: the path a `cl compact` target took, in
+# words, for its report line.
+_compact_outcome() {
+  case "$1" in
+    ok)                      printf 'compacted by /compact' ;;
+    boundary-before-compact) printf 'already compacted (on its own, before /compact)' ;;
+    boundary-no-token)       printf 'already compacted (on its own, before /compact; its turn had not finished)' ;;
+    no-token)                printf 'did not finish its turn; not compacted' ;;
+    no-boundary)             printf 'compaction not confirmed' ;;
+    compact-unsent)          printf '/compact could not be typed; not compacted' ;;
+    unreachable)             printf 'no reachable pane; not compacted' ;;
+    no-transcript)           printf 'no transcript to watch; not compacted' ;;
+    no-store)                printf 'no durable location for the request; not compacted' ;;
+    *) if [ "$2" = "compacted" ]; then printf 'compacted'; else printf 'not compacted (%s)' "${1:-unknown}"; fi ;;
+  esac
+}
+
+# _compact_add <name> <sid> <cwd>: one `cl compact` target, as a slot of
+# do_compact's arrays (dynamic scope), shaped as do_stop shapes a compacting one.
+_compact_add() {
+  _h_name[$_n]="$1"; _h_sid[$_n]="$2"; _h_cwd[$_n]="$3"
+  _h_tmux[$_n]="$(tmux_name "$1" claude)"; _h_agent[$_n]="claude"; _h_rot[$_n]="compact-resume"
+  _h_state[$_n]="idle"; _h_path[$_n]=""; _h_nonce[$_n]=""; _h_mark[$_n]=""; _h_line[$_n]=""
+  _h_taken[$_n]=""; _h_why[$_n]=""; _h_cbase[$_n]=""; _h_ctok[$_n]=""; _h_cstate[$_n]=""
+  _h_cauto[$_n]=0; _h_cmark[$_n]=""; _h_clastsz[$_n]=""; _h_cbid[$_n]=""; _h_cpre[$_n]=""; _h_cpost[$_n]=""
+  _h_cidle[$_n]=0
+  _n=$((_n+1))
+}
+
+# do_compact [--dry-run] <name>... | --all: steps 2-5 of compact-resume
+# (docs/restart-modes.md) without a stop. The session keeps running: nothing
+# here saves state, retires, kills, changes a row or a mode, or rotates a
+# handoff. It shares compact_phase with do_stop, so every check — the cl-done
+# token in an assistant text block, one /compact, a MANUAL boundary or the
+# Compacted output, a boundary before /compact meaning "already done" — is the
+# same code, in the same single CL_COMPACT_TIMEOUT window for every target.
+#
+# The fallbacks are not the stop's: there is nothing to fall back TO. No token
+# in time means the turn never finished, so /compact is not typed at all; no
+# boundary after /compact is reported and /compact is not retyped (a slow
+# compaction retyped would compact its own summary). Either way the exit is
+# non-zero, as it is for a named target that is not a running Claude session.
+#
+# Nothing is written to the rotation log. Its rows are one per STOP and `cl
+# rotate stats` counts them as stops (sessions, handoffs, kept, context); a
+# compaction that stopped nothing would be counted as a stop.
+do_compact() {
+  local dry_run="" all=0 arg nm seen
+  local -a want=()
+  for arg in "$@"; do
+    case "$arg" in
+      --all)     all=1 ;;
+      --dry-run) dry_run="--dry-run" ;;
+      -h|--help) print_compact_help; return 0 ;;
+      -*) echo "claude-session: compact: unrecognised flag '$arg' (cl compact --help)" >&2; return 1 ;;
+      *)  want+=("$arg") ;;
+    esac
+  done
+  if [ "$all" = "1" ] && [ "${#want[@]}" -gt 0 ]; then
+    echo "claude-session: compact: name sessions or use --all, not both" >&2; return 1
+  fi
+  if [ "$all" = "0" ] && [ "${#want[@]}" -eq 0 ]; then
+    echo "claude-session: compact: which session? Name one or more, or use --all (cl compact --help)" >&2; return 1
+  fi
+  command -v jq >/dev/null 2>&1 || { echo "claude-session: compact needs jq (brew install jq)" >&2; return 1; }
+
+  local -a _h_name _h_sid _h_cwd _h_tmux _h_agent _h_rot _h_state _h_path _h_nonce _h_mark _h_line
+  local -a _h_taken _h_why _h_cbase _h_ctok _h_cstate _h_cauto _h_cmark _h_clastsz _h_cbid _h_cpre _h_cpost _h_cidle
+  local _n=0 i rc=0 name sid cwd epoch agent _rows codex_skipped="" crow xrow
+  _rows="$(discover)"
+
+  if [ "$all" = "1" ]; then
+    while IFS=$'\t' read -r name sid cwd epoch agent; do
+      [ -n "$name" ] || continue
+      session_is_live "$name" "$sid" "$agent" || continue
+      case "$agent" in
+        claude) _compact_add "$name" "$sid" "$cwd" ;;
+        # Running Codex threads only: discovery lists every stored one, and
+        # naming dozens of dormant threads would bury the report.
+        codex)  codex_skipped="${codex_skipped}${codex_skipped:+, }${name}" ;;
+      esac
+    done <<< "$_rows"
+    [ -n "$codex_skipped" ] && printf 'ℹ skipping Codex session(s) — compaction is Claude-only: %s\n' "$codex_skipped" >&2
+  else
+    for nm in "${want[@]}"; do
+      seen=0
+      for (( i=0; i<_n; i++ )); do [ "${_h_name[$i]}" = "$nm" ] && seen=1; done
+      [ "$seen" = "1" ] && continue
+      crow=$(printf '%s\n' "$_rows" | awk -F'\t' -v n="$nm" '$1==n && $5=="claude" {print; exit}')
+      xrow=$(printf '%s\n' "$_rows" | awk -F'\t' -v n="$nm" '$1==n && $5=="codex" {print; exit}')
+      if [ -n "$crow" ]; then
+        IFS=$'\t' read -r name sid cwd epoch agent <<< "$crow"
+        if session_is_live "$name" "$sid" claude; then
+          _compact_add "$name" "$sid" "$cwd"
+        else
+          printf '⚠ "%s" is not running — nothing to compact (skipped)\n' "$nm" >&2; rc=1
+        fi
+      elif [ -n "$xrow" ]; then
+        printf 'ℹ "%s" is a Codex session — compaction is Claude-only (skipped)\n' "$nm" >&2; rc=1
+      else
+        printf '⚠ no session named "%s" (try --list) — skipped\n' "$nm" >&2; rc=1
+      fi
+    done
+  fi
+
+  if [ "$_n" -eq 0 ]; then
+    if [ "$all" = "1" ]; then echo "no running Claude sessions to compact"; else echo "nothing to compact"; fi
+    return "$rc"
+  fi
+
+  _CL_STOP_ROOT=""
+  if [ -z "$dry_run" ]; then handoff_root >/dev/null && _CL_STOP_ROOT="$_CL_HANDOFF_ROOT"; fi
+  compact_phase compact
+  [ -n "$dry_run" ] && return "$rc"
+
+  printf '\n'
+  for (( i=0; i<_n; i++ )); do
+    if [ "${_h_cstate[$i]}" = "compacted" ]; then
+      printf '✓ %s: %s%s\n' "${_h_name[$i]}" "$(_compact_outcome "${_h_why[$i]}" compacted)" \
+        "$( [ -n "${_h_cpre[$i]}" ] && printf ', %s → %s tokens' "${_h_cpre[$i]}" "${_h_cpost[$i]:-?}" )"
+    else
+      printf '✗ %s: %s\n' "${_h_name[$i]}" "$(_compact_outcome "${_h_why[$i]}" "${_h_cstate[$i]}")"
+      rc=1
+    fi
+  done
+  return "$rc"
 }
 
 # mark_row_modes <lines of agent\tname\tmode\tboundary>: record on each SAVED
@@ -4784,7 +4955,7 @@ do_stop() {
   # once under ONE CL_COMPACT_TIMEOUT window. It runs BEFORE the handoff
   # broadcast because one of its outcomes — no token in time — is a fallback to
   # a handoff, and those sessions then join that broadcast like any other.
-  _stop_compact_phase
+  compact_phase stop
 
   # A HAND-WRITTEN HANDOFF IS ALREADY AN ANSWER, and it is discovered HERE —
   # after the compact phase, so a session that fell back to a handoff is counted
@@ -6030,6 +6201,25 @@ cl stop [flags]   prepare each Claude session by its mode (`cl mode`):
 EOF
 }
 
+print_compact_help() {
+  cat <<'EOF'
+cl compact [--dry-run] "Name" ["Name"...] | --all
+                  compact running Claude sessions WITHOUT stopping them:
+                  ask each to finish up (a pre-compact request that ends
+                  with a cl-done reply), type /compact once it replies, and
+                  confirm the compaction from its transcript. The session
+                  keeps running; nothing is saved, stopped or changed.
+                  Codex sessions are skipped (compaction is Claude-only).
+                  Exits non-zero if any target was not confirmed compacted.
+
+  --all               every running Claude session cl knows
+  --dry-run           show what would happen; send nothing
+  -h, --help          this help
+
+  One shared wait for all targets: CL_COMPACT_TIMEOUT (600s).
+EOF
+}
+
 print_help() {
   cat <<'EOF'
 cl — pick, launch and resume named Claude Code and Codex sessions
@@ -6048,6 +6238,9 @@ cl — pick, launch and resume named Claude Code and Codex sessions
   cl start                    bring back the sessions from the last stop
   cl start --fresh "Name" [--dry-run]
                               rotate ONE session onto a fresh one via its handoff
+  cl compact "Name"... | --all
+                              compact running Claude sessions without stopping
+                              them (`cl compact --help`)
   cl restore [--list]         restore the saved set from an earlier snapshot
 
   cl handoff [--path]         write THIS session's handoff by hand
@@ -6079,6 +6272,8 @@ case "${1:-}" in
   # do_stop's status is meaningful the same way (non-zero when a session was
   # left running), so it is propagated rather than flattened to 0.
   stop)    shift; do_stop "$@"; exit $? ;;
+  # Non-zero when any target was not confirmed compacted, so it is propagated.
+  compact) shift; do_compact "$@"; exit $? ;;
   start)
     shift
     if [ "${1:-}" = "--fresh" ]; then shift; do_fresh_start "$@"; else do_start; fi

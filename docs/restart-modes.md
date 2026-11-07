@@ -1,8 +1,9 @@
 # Restart modes — design
 
 Status: phases 1 and 2 implemented — the four modes for Claude, mode storage
-and migration, compact-resume end to end, and Codex `fresh` (below). The design
-review's findings are folded in and marked **(R)**.
+and migration, compact-resume end to end, and Codex `fresh` (below) — and
+`cl compact` (steps 2-5 without a stop, below). The design review's findings
+are folded in and marked **(R)**.
 
 Where phase 1 settles something this page leaves open:
 
@@ -234,10 +235,41 @@ are re-offered to the new thread by the watcher's own re-send.
   mode `resume`), records the old id in `fresh-history.json` and prints its
   recovery command, as the other failure paths do.
 
+## `cl compact`: steps 2-5 without a stop
+
+`cl compact "Name" ["Name"...]` or `cl compact --all` (every running Claude
+session cl knows). It runs the same code as the stop's compact phase
+(`compact_phase`, which `do_stop` calls as `compact_phase stop`): the
+pre-compact request with its `cl-done` token, the token wait, one `/compact`,
+and the boundary or `Compacted` confirmation, for every target in one shared
+`CL_COMPACT_TIMEOUT` window. A boundary before `/compact` means it is already
+compacted and `/compact` is skipped, as in a stop.
+
+What is different:
+
+- **No stop.** Nothing is saved, retired, killed or rotated; no row and no mode
+  changes. The session keeps running.
+- **The request says so.** The pointer reads `cl compact: …`, and the request
+  says the session will keep running rather than that it is about to be
+  restarted. The optional workflow file applies as for a stop.
+- **Fallbacks lead nowhere.** No token in time: nothing more is done ("did not
+  finish its turn; not compacted"). No boundary after `/compact`: "compaction
+  not confirmed", and `/compact` is not typed again — a slow compaction
+  retyped would compact its own summary. No pane or no transcript: not
+  compacted. Any of these makes the exit non-zero.
+- **Targets.** A named session that is not running, or is not known, is
+  reported and skipped (non-zero). A Codex session is skipped with a note —
+  named, that is non-zero; under `--all` it is only noted. `--all` with no
+  running Claude session exits 0. Naming no target, or names and `--all`
+  together, is refused.
+- **The report** is one line per target: the path taken and the boundary
+  record's `preTokens → postTokens`.
+- **No rotation log line.** The log is one row per stop and `cl rotate stats`
+  counts its rows as stops; a compaction that stopped nothing does not fit
+  that schema, so it is not logged.
+
 ## Out of scope here
 
-- `cl compact [<session>|--all]`: steps 2-5 without a stop. It reuses
-  everything above and comes next.
 - Clearing leftover text in an input box before typing. A line appended to
   leftover text shows up as "not arrived whole" and is retyped once; clearing
   it belongs inside the senders if it is ever needed.
