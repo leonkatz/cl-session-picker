@@ -230,14 +230,19 @@ are re-offered to the new thread by the watcher's own re-send.
   neither listed nor in `archived_sessions/` stops the run as
   `archive-uncertain`, discarding nothing and launching nothing. A rollback
   also refuses unless the old thread is still listed.
-- **Not exactly-once.** A run that dies after thread/start takes effect but
-  before `created` is written leaves a thread whose id was never saved. A
-  retry at `begun` reconciles from local storage first: exactly one unnamed
-  thread in that cwd, created since `begun` and known to no transaction, is
-  adopted (then named like any `created` retry); more than one stops the run
-  as ambiguous; none means nothing persisted, and creation starts over. A
-  thread another name's transaction is creating in the same cwd at that moment
-  could be counted, which can only make it stop.
+- **Not exactly-once, and nothing is adopted.** A run that dies after
+  thread/start takes effect but before `created` is written leaves a thread
+  whose id was never saved. Whose a thread is cannot be established from local
+  storage, so cl never adopts one: not by age, cwd, being the only candidate,
+  or even the creation marker it passes to thread/start (`threadSource =
+  cl-fresh:<cycle>`, which Codex 0.163 writes into the rollout's
+  `session_meta.thread_source`). The marker only DETECTS: a retry at `begun`
+  that finds a thread carrying it stops, names it, and prints how to settle it
+  by hand; nothing is made, archived or launched. No marked thread means
+  creation starts over. In the probe, an unnamed thread whose app-server exits
+  writes no rollout, so in practice there is nothing to find; a Codex that did
+  persist one without the marker would get a second thread, never a stolen
+  one.
 - **Probed against Codex 0.163.0** (throwaway `CODEX_HOME`, no credentials):
   `thread/start` alone, with the app-server closed before naming, wrote no
   rollout, and a second app-server then refused both `thread/name/set` ("no
@@ -245,23 +250,32 @@ are re-offered to the new thread by the watcher's own re-send.
   named, a second app-server could rename it and read the name back. So a
   `created` retry works for a named rollout, and fails closed — a rollback,
   the old thread untouched — when there is none. `thread/list` returned no
-  threads in that setup, so reconciliation reads local storage instead.
+  threads in that setup. The same probe showed `threadSource` passed to
+  thread/start returned by thread/start and thread/read and written to the
+  rollout as `thread_source`.
 - **Serialised.** The whole sequence runs under a per-name claim taken before
   any thread is made; the row is read again inside it. A second `cl start`
   waits up to `CL_FRESH_CLAIM_WAIT` (10s) and then leaves it to the first. The
   claim is a symlink made with `ln -sn`; anything else at its path (a
-  directory, a file) is refused. A claim whose holder has died is taken over
-  under a separate takeover mutex, so the unlink can only remove the dead
-  holder's claim, never a successor's. The one residual window is a taker
-  dying mid-takeover and two others racing to clear its mutex, which can only
-  cost a refused start.
+  directory, a file) is refused. A claim whose holder has died is NOT taken
+  over: every takeover protocol reduces to compare-then-delete somewhere, and
+  a late delete can remove a live claim. The start refuses and prints how to
+  check that nothing is still working on it (`ps -p <pid>`, `pgrep` for
+  another `cl start`) and a removal conditional on the link still naming that
+  exact dead holder. A refused start is the accepted cost.
 - **Launch acceptance.** The row stays mode `fresh` with `fresh_pending` = the
   cycle until the launch is verified as codex on the new id: a tmux session
   stamped for that id whose pane runs Codex resuming that id, or cl's launch
   record for that name and id, running the same. "Runs Codex" is read from
-  the command line as tokens — the executable (or the script a node wrapper
-  runs) is `codex`, and the first word after its options is `resume <id>` —
-  never as a substring, which a foreign process could carry in any argument.
+  the kernel, not `ps`: `proc_identity` (shared with the Claude side) gives
+  the executing image's path (libproc `proc_pidpath`) and argv with its real
+  boundaries (`KERN_PROCARGS2`), through `python3 -I`. The executable must be
+  named `codex`, or be `node` with an argv element that is (or resolves to)
+  `…/@openai/codex/bin/codex.js`; then the first argv element past the options
+  must be `resume`, followed by the id. `ps -o command=` would split one
+  argv[0] of `codex resume <id>` into three words, and `ps -o comm=` follows
+  `exec -a`. An identity that cannot be read — no python3, a failed read, a
+  process gone — is no evidence.
   The journal is removed only once the row's move to `resume` has been
   written and read back; if it cannot be, the journal and the pending row
   both stay.
