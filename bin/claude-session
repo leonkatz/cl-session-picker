@@ -3701,6 +3701,16 @@ send_text_tmux() {
   tmux send-keys -t "=$1:" Enter 2>/dev/null
 }
 
+# send_text_pane <pane-id> <text>: the same, into ONE pane named by its id
+# (%N). "=<session>:" means that session's ACTIVE pane, which is whatever has
+# focus — another window, a shell, `cat` — not necessarily the agent. A pane id
+# does not move with focus, so a caller that has proven which pane runs the
+# session (compact_target_bound) types into exactly that one.
+send_text_pane() {
+  tmux send-keys -t "$1" -l -- "$2" 2>/dev/null || return 1
+  tmux send-keys -t "$1" Enter 2>/dev/null
+}
+
 # send_text_iterm <tag> <text>: type literal text into the iTerm session
 # tagged user.clSession == <tag> (the same tag launch_session/launch_named set
 # via tag_iterm_session). Best-effort: a session that was never tagged (started
@@ -3760,10 +3770,18 @@ send_text_tmux() {
 # testing it means typing into live sessions, and the untested path was the
 # broken one. Two days of work on retry and budget behaviour sat downstream of
 # an ask that could never arrive.
+#
+# An optional third argument is the tty the tagged session must be on
+# ("/dev/ttysNNN"). The tag is matched by NAME, and the session's process is
+# found separately (compact_target_bound), so on their own they are two
+# independent matches; checking the tagged session's tty against the
+# process's, in the same script that types, is what binds them. A tag on any
+# other tty gets nothing.
 send_text_iterm() {
-  local tag="$1" text="$2" etag etext found
+  local tag="$1" text="$2" want_tty="${3:-}" etag etext etty found
   etag="${tag//\\/\\\\}"; etag="${etag//\"/\\\"}"
   etext="${text//\\/\\\\}"; etext="${etext//\"/\\\"}"
+  etty="${want_tty//\\/\\\\}"; etty="${etty//\"/\\\"}"
   found=$(osascript 2>/dev/null <<OSA
 tell application "iTerm"
   set hit to missing value
@@ -3777,6 +3795,7 @@ tell application "iTerm"
     end repeat
   end repeat
   if hit is missing value then return "no"
+  if "${etty}" is not "" and (tty of hit) is not "${etty}" then return "mismatch"
   tell hit to write text "${etext}" newline NO
   delay 0.15
   tell hit to write text (ASCII character 13) newline NO
@@ -3859,11 +3878,26 @@ run_bounded() {
 # fails: a live tmux session that refuses send-keys is a broken pane, not an
 # iTerm tab, and typing a handoff request into some other window is worse than
 # reporting it unreachable.
+#
+# An optional fifth argument is a destination compact_target_bound proved: a
+# pane id ("%N", which must still belong to that tmux session) or an iTerm tty
+# ("tty:/dev/ttysNNN"). With one, ONLY that destination is typed into.
 handoff_send_once() {
-  local name="$1" sid="$2" t="$3" prompt="$4" rc
+  local name="$1" sid="$2" t="$3" prompt="$4" dest="${5:-}" rc
   # EVERY route is bounded. A send that hangs is not a slow send, it is a stop
   # that never finishes, and the operator cannot tell the two apart from a dark
   # terminal. The timeout is reported per route so a wedged backend names itself.
+  case "$dest" in
+    %*)
+      [ "$(tmux display-message -p -t "$dest" '#{session_name}' 2>/dev/null)" = "$t" ] || return 1
+      run_bounded "${CL_HANDOFF_SEND_TIMEOUT:-20}" send_text_pane "$dest" "$prompt"; rc=$?
+      [ "$rc" = "124" ] && printf '⚠ the tmux send for "%s" was still running after %ss — killed it\n' "$name" "${CL_HANDOFF_SEND_TIMEOUT:-20}" >&2
+      [ "$rc" = "0" ]; return $? ;;
+    tty:*)
+      run_bounded "${CL_HANDOFF_SEND_TIMEOUT:-20}" send_text_iterm "$t" "$prompt" "${dest#tty:}"; rc=$?
+      [ "$rc" = "124" ] && printf '⚠ the iTerm send for "%s" was still running after %ss — killed it\n' "$name" "${CL_HANDOFF_SEND_TIMEOUT:-20}" >&2
+      [ "$rc" = "0" ]; return $? ;;
+  esac
   if [ -n "$t" ] && tmux has-session -t "=${t}" 2>/dev/null; then
     run_bounded "${CL_HANDOFF_SEND_TIMEOUT:-20}" send_text_tmux "$t" "$prompt"; rc=$?
     [ "$rc" = "124" ] && printf '⚠ the tmux send for "%s" was still running after %ss — killed it\n' "$name" "${CL_HANDOFF_SEND_TIMEOUT:-20}" >&2
@@ -3881,13 +3915,14 @@ handoff_send_once() {
 # session that is working: it queues typed input, so its ask may simply be
 # waiting (see the re-ask rule in request_handoff). Returns 0 sent, 1 the pane
 # became unreachable, 2 left alone because it is busy.
-# An optional fifth argument names the ask in that message ("pre-compact").
+# An optional fifth argument names the ask in that message ("pre-compact"); a
+# sixth is handoff_send_once's proven destination.
 handoff_ask_resend() {
   local mark
   handoff_target_busy "$3" "$2" "$1" && return 2
   printf '⚠ the %s ask to "%s" did not arrive whole — typing it again\n' "${5:-handoff}" "$1" >&2
   mark=$(handoff_ask_mark "$2")
-  handoff_send_once "$1" "$2" "$3" "$4" || return 1
+  handoff_send_once "$1" "$2" "$3" "$4" "${6:-}" || return 1
   printf '%s' "$mark"
 }
 
@@ -3986,9 +4021,10 @@ _mark_size() { wc -c < "${1%%$'\t'*}" 2>/dev/null | tr -d ' '; }
 # session did what it was asked — wrote the token as its last line, with no
 # call outstanding — and then wrote nothing more for two polls. A session that
 # writes the token early, or new input that starts another turn between this
-# check and the /compact that follows, is outside what it can see. The window
-# is bounded (one poll interval), and typed input queues rather than
-# interrupting, so the worst case is a /compact that runs after that turn.
+# check and the /compact that follows, is outside what it can see. That gap is
+# short (the pane re-check and the send itself), but nothing bounds it; typed
+# input queues rather than interrupting, so the likely worst case is a
+# /compact that runs after that turn.
 #
 # The rule itself is _CL_JQ_TOKEN_FINAL, shared with compact_idle_record, so
 # "finished with the token" cannot mean two different things in two places.
@@ -4404,38 +4440,59 @@ save_state() {
 # is what is said.
 _c_fallback() {
   _h_rot[$1]="handoff"; _h_state[$1]="idle"; _h_cstate[$1]=""; _h_mark[$1]=""; _h_why[$1]="$2"
-  _c_clear_request "$1"
+  _c_clear "$1"
   if [ "${_c_purpose:-stop}" = "compact" ]; then printf '%s\n' "$4" >&2; else printf '%s\n' "$3" >&2; fi
 }
 
 # _c_clear_request <i>: the pre-compact request has been answered one way or
 # the other, so its file goes, as a handoff request's does once it lands.
 #
-# Only THIS cycle's request: once a token was issued, a file that does not hold
-# it was written by a newer, concurrent run and is left alone. A removal that
-# fails is said, not swallowed — the file is an instruction still on disk.
+# Only THIS cycle's request. No token issued means no request of ours exists,
+# so nothing is touched: the file there, if any, is another run's. With one,
+# the file is first RENAMED to a name only this call knows, then checked, so a
+# successor written in between cannot be the thing deleted: if the moved file
+# is ours it is removed, and if not it is linked back (a link fails rather
+# than overwrite, and a request written since replaced it anyway — writers
+# `mv -f` into place). A removal that fails returns 1 and says so: the file is
+# an instruction still on disk. _C_CLEARED says what happened (removed |
+# absent | not-ours | failed), for a caller that has to report it.
 _c_clear_request() {
-  local rp
+  local rp tmp
+  _C_CLEARED="absent"
   [ -n "$_CL_STOP_ROOT" ] || return 0
+  [ -n "${_h_ctok[$1]:-}" ] || return 0
   rp=$(precompact_request_path "$_CL_STOP_ROOT" "${_h_name[$1]}")
   [ -e "$rp" ] || return 0
-  if [ -n "${_h_ctok[$1]:-}" ] && ! grep -qF -- "${_h_ctok[$1]}" "$rp" 2>/dev/null; then
-    return 0
-  fi
-  rm -f "$rp" 2>/dev/null
-  if [ -e "$rp" ]; then
+  tmp="$rp.clearing.$$.$RANDOM$RANDOM"
+  if ! mv -f "$rp" "$tmp" 2>/dev/null; then
+    [ -e "$rp" ] || return 0
+    _C_CLEARED="failed"
     printf '⚠ could not remove the pre-compact request %s — remove it by hand\n' "$rp" >&2
     return 1
   fi
-  return 0
+  if grep -qF -- "${_h_ctok[$1]}" "$tmp" 2>/dev/null; then
+    rm -f "$tmp" 2>/dev/null
+    if [ -e "$tmp" ]; then
+      _C_CLEARED="failed"
+      printf '⚠ could not remove the pre-compact request %s — remove it by hand\n' "$tmp" >&2
+      return 1
+    fi
+    _C_CLEARED="removed"; return 0
+  fi
+  ln "$tmp" "$rp" 2>/dev/null; rm -f "$tmp" 2>/dev/null
+  _C_CLEARED="not-ours"; return 0
 }
+
+# _c_clear <i>: _c_clear_request for a slot, its failure HONOURED: recorded in
+# _h_cleft so the outcome says a request was left behind.
+_c_clear() { _c_clear_request "$1" || _h_cleft[$1]=1; }
 
 # _c_refuse <i> <reason> <detail>: the pane is not proven to be this session,
 # so nothing more is typed into it. In a stop it resumes as-is — NOT a handoff,
 # whose ask would go into the same pane; under `cl compact` it is not compacted.
 _c_refuse() {
   _h_cstate[$1]="resume"; _h_state[$1]="cdone"; _h_taken[$1]="resume"; _h_why[$1]="$2"; _h_mark[$1]=""
-  _c_clear_request "$1"
+  _c_clear "$1"
   if [ "${_c_purpose:-stop}" = "compact" ]; then
     printf '⚠ "%s": %s — not typing into it; not compacted\n' "${_h_name[$1]}" "$3" >&2
   else
@@ -4443,64 +4500,84 @@ _c_refuse() {
   fi
 }
 
-# compact_target_bound <name> <sid> <tmux_name>: is the place cl would type into
-# provably THIS session? Prints why not, and returns 1 for an explicit mismatch
-# or 2 for "cannot tell". Both refuse: a name collision is not a binding.
+# _sid_pids <sid> <name>: every live process tied to this session's id, by the
+# evidence session_pid uses — cl's launch record bound to name AND id, Claude
+# Code's registry proven by start time, a --resume/--session-id argv (exact
+# id, never a fork) — but ALL argv matches, not the first: a tmux server keeps
+# its first client's command line, so the server itself can match.
+_sid_pids() {
+  local sid="$1" name="$2" p
+  { registered_pid "$name" claude "$sid"; claude_registry_pid "$sid"
+    for p in $(pgrep -f "(-resume|-session-id) $sid( |\$)" 2>/dev/null); do
+      case "$(ps -p "$p" -o command= 2>/dev/null)" in *--fork-session*) continue ;; esac
+      printf '%s\n' "$p"
+    done; } | awk 'NF && !seen[$0]++'
+}
+
+# compact_target_bound <name> <sid> <tmux_name>: WHERE cl may type for this
+# session. Prints the proven destination and returns 0 — a pane id ("%N") or
+# an iTerm tty ("tty:/dev/ttysNNN") — or prints why not and returns 1 for an
+# explicit mismatch or 2 for "cannot tell". Both refuse.
 #
-#   a tmux pane stamped by cl (@cl_agent / @cl_sid, see tmux_claim):
-#     claude + this sid                  -> bound
-#     claude + no sid yet ("-")          -> bound: cl's own launch before the
-#                                           id existed (`cl new`)
-#     another agent, or another sid      -> MISMATCH, refused
-#   an UNSTAMPED tmux pane (one cl did not start, e.g. a hand-run claude):
-#     the process tied to this sid (session_pid: cl's launch record, Claude
-#     Code's registry, or a --resume/--session-id argv, never a fork) runs IN
-#     the pane being typed into — that pane's process or a descendant of it
-#                                        -> bound
-#     no such process, or it runs elsewhere -> refused (cannot tell)
-#   no tmux session (the tagged-iTerm route):
-#     a process tied to this sid, or cl's own launch record under this name
-#     (unbound_owner_pid)                -> bound
-#     neither                            -> refused (cannot tell)
-#
-# The checks are retire_session's ownership evidence, applied before TYPING
-# rather than before killing; a session cl launched is always bound.
+# The evidence is always a PROCESS tied to this session's id (_sid_pids)
+# running in the destination itself — never a name, and never a stamp alone:
+#   tmux: the pane, among ALL the session's panes, whose process is that
+#     process or an ancestor of it. Its id is returned and typed into, so a
+#     second window, or a focus switch, cannot redirect the text. The cl stamp
+#     (@cl_agent/@cl_sid) is session-scoped, so it can only REFUSE: another
+#     agent or another id is an explicit mismatch. A stamp naming no id yet
+#     ("-", `cl new`) proves cl launched something there, not that it runs
+#     this transcript, so it too needs the process.
+#   no tmux session (the tagged-iTerm route): the tied process's tty. The tag
+#     and the process are separate matches, so send_text_iterm types only if
+#     the tagged session is on that tty. A process with no tty: refused.
 compact_target_bound() {
-  local name="$1" sid="$2" t="$3" a s pid pane p n=0
+  local name="$1" sid="$2" t="$3" a s pid p n panes hit pid_tty
   if [ -n "$t" ] && tmux has-session -t "=$t" 2>/dev/null; then
     a=$(tmux show-option -qv -t "=$t:" "@cl_agent" 2>/dev/null)
     s=$(tmux show-option -qv -t "=$t:" "@cl_sid" 2>/dev/null)
-    if [ -n "$a" ]; then
-      if [ "$a" != "claude" ]; then
-        printf 'the tmux pane at %s is stamped as a %s session' "$t" "$a"; return 1
-      fi
-      case "$s" in ''|-) return 0 ;; esac
-      [ "$s" = "$sid" ] && return 0
-      printf 'the tmux pane at %s is stamped as another session (%s)' "$t" "$s"; return 1
+    if [ -n "$a" ] && [ "$a" != "claude" ]; then
+      printf 'the tmux session at %s is stamped as a %s session' "$t" "$a"; return 1
     fi
-    pid=$(session_pid "$sid" claude "$name")
-    pane=$(tmux display-message -p -t "=$t:" '#{pane_pid}' 2>/dev/null)
-    if [ -n "$pid" ] && [ -n "$pane" ]; then
-      p="$pid"
+    case "$s" in
+      ''|-|"$sid") : ;;
+      *) printf 'the tmux session at %s is stamped as another session (%s)' "$t" "$s"; return 1 ;;
+    esac
+    panes=$(tmux list-panes -s -t "=$t" -F '#{pane_id} #{pane_pid}' 2>/dev/null)
+    for pid in $(_sid_pids "$sid" "$name"); do
+      p="$pid"; n=0
       while [ -n "$p" ] && [ "$p" -gt 1 ] 2>/dev/null && [ "$n" -lt 32 ]; do
-        [ "$p" = "$pane" ] && return 0
+        hit=$(printf '%s\n' "$panes" | awk -v pp="$p" '$2 == pp {print $1; exit}')
+        if [ -n "$hit" ]; then printf '%s' "$hit"; return 0; fi
         p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' '); n=$((n+1))
       done
-    fi
-    printf 'cannot verify that the tmux pane at %s runs this session (no cl stamp, and no process tied to its id in that pane)' "$t"
+    done
+    printf 'cannot verify that any pane of the tmux session at %s runs this session (no process tied to its id in it)' "$t"
     return 2
   fi
-  [ -n "$(session_pid "$sid" claude "$name")" ] && return 0
-  [ -n "$(unbound_owner_pid "$name")" ] && return 0
-  printf 'cannot verify which window runs this session (no tmux pane, and no process tied to its id)'
+  for pid in $(_sid_pids "$sid" "$name"); do
+    pid_tty=$(ps -o tty= -p "$pid" 2>/dev/null | tr -d ' ')
+    case "$pid_tty" in ''|'??'|-) continue ;; esac
+    printf 'tty:/dev/%s' "${pid_tty#/dev/}"; return 0
+  done
+  printf 'cannot verify which window runs this session (no tmux session, and no process tied to its id on a terminal)'
   return 2
 }
 
 # _c_bound <i>: compact_target_bound for one slot, refusing it on failure.
+# The first proof fixes the destination (_h_cdest); every later check must
+# find the session in that SAME place, or the slot is refused — what cl types
+# next goes exactly where it was proven, never to wherever the name now leads.
 _c_bound() {
   local why rc
   why=$(compact_target_bound "${_h_name[$1]}" "${_h_sid[$1]}" "${_h_tmux[$1]}"); rc=$?
-  [ "$rc" = "0" ] && return 0
+  if [ "$rc" = "0" ]; then
+    if [ -n "${_h_cdest[$1]:-}" ] && [ "${_h_cdest[$1]}" != "$why" ]; then
+      _c_refuse "$1" "unverified-pane" "the session is no longer where it was proven (${_h_cdest[$1]}, now $why)"
+      return 1
+    fi
+    _h_cdest[$1]="$why"; return 0
+  fi
   if [ "$rc" = "1" ]; then _c_refuse "$1" "foreign-pane" "$why"; else _c_refuse "$1" "unverified-pane" "$why"; fi
   return 1
 }
@@ -4511,7 +4588,7 @@ _c_compacted() {
   IFS='|' read -r b_id b_trig b_pre b_post <<< "$2"
   _h_cstate[$1]="compacted"; _h_state[$1]="cdone"; _h_taken[$1]="compact-resume"; _h_why[$1]="$3"
   _h_cbid[$1]="$b_id"; _h_cpre[$1]="$b_pre"; _h_cpost[$1]="$b_post"
-  _c_clear_request "$1"
+  _c_clear "$1"
 }
 
 # compact_phase [stop|compact]: steps 2-5 of compact-resume for every
@@ -4584,7 +4661,7 @@ compact_phase() {
     tok=$(compact_nonce); _h_ctok[$i]="$tok"
     prompt=$(build_handoff_ask "$_CL_STOP_ROOT" "${_h_name[$i]}" "$tok" precompact "$_c_purpose")
     _h_mark[$i]=$(handoff_ask_mark "${_h_sid[$i]}"); _h_line[$i]="$prompt"
-    if handoff_send_once "${_h_name[$i]}" "${_h_sid[$i]}" "${_h_tmux[$i]}" "$prompt"; then
+    if handoff_send_once "${_h_name[$i]}" "${_h_sid[$i]}" "${_h_tmux[$i]}" "$prompt" "${_h_cdest[$i]}"; then
       _h_state[$i]="cask"; _h_cstate[$i]="await_token"; c_pending=$((c_pending+1))
       printf '  → asked "%s" to finish up before /compact\n' "${_h_name[$i]}" >&2
     else
@@ -4599,7 +4676,7 @@ compact_phase() {
     for (( i=0; i<_n; i++ )); do
       [ "${_h_state[$i]}" = "cask" ] && [ -n "${_h_mark[$i]:-}" ] || continue
       if ! _c_bound "$i"; then c_pending=$((c_pending-1)); continue; fi
-      m=$(handoff_ask_resend "${_h_name[$i]}" "${_h_sid[$i]}" "${_h_tmux[$i]}" "${_h_line[$i]}" "pre-compact"); rrc=$?
+      m=$(handoff_ask_resend "${_h_name[$i]}" "${_h_sid[$i]}" "${_h_tmux[$i]}" "${_h_line[$i]}" "pre-compact" "${_h_cdest[$i]}"); rrc=$?
       case "$rrc" in
         0) _h_mark[$i]="$m"; resent=$((resent+1)) ;;
         1) c_pending=$((c_pending-1))
@@ -4653,12 +4730,12 @@ compact_phase() {
                 c_pending=$((c_pending-1)); _h_clastsz[$i]="$sz"; continue
               fi
               _h_cmark[$i]=$(transcript_mark "${_h_sid[$i]}")
-              if handoff_send_once "${_h_name[$i]}" "${_h_sid[$i]}" "${_h_tmux[$i]}" "/compact"; then
+              if handoff_send_once "${_h_name[$i]}" "${_h_sid[$i]}" "${_h_tmux[$i]}" "/compact" "${_h_cdest[$i]}"; then
                 _h_cstate[$i]="await_boundary"
                 printf '  → "%s" replied; typed /compact\n' "${_h_name[$i]}" >&2
               else
                 _h_cstate[$i]="resume"; _h_state[$i]="cdone"; _h_taken[$i]="resume"; _h_why[$i]="compact-unsent"
-                _c_clear_request "$i"
+                _c_clear "$i"
                 c_pending=$((c_pending-1))
                 if [ "$_c_purpose" = "compact" ]; then
                   printf '⚠ could not type /compact into "%s" — not compacted\n' "${_h_name[$i]}" >&2
@@ -4704,7 +4781,7 @@ compact_phase() {
         fi ;;
       await_boundary)
         _h_cstate[$i]="resume"; _h_state[$i]="cdone"; _h_taken[$i]="resume"; _h_why[$i]="no-boundary"
-        _c_clear_request "$i"
+        _c_clear "$i"
         if [ "$_c_purpose" = "compact" ]; then
           # Not retyped: a second /compact would compact the summary again
           # if the first one is merely slow.
@@ -4741,12 +4818,18 @@ _compact_outcome() {
 # _compact_interrupted <status>: do_compact's INT/TERM/HUP trap, run inside its
 # dynamic scope. Clears this run's own pre-compact requests, says so, exits.
 _compact_interrupted() {
-  local i
+  local i removed=0 failed=0
   trap - INT TERM HUP
   for (( i=0; i<${_n:-0}; i++ )); do
-    [ -n "${_h_ctok[$i]:-}" ] && _c_clear_request "$i"
+    [ -n "${_h_ctok[$i]:-}" ] || continue
+    _c_clear_request "$i"
+    case "$_C_CLEARED" in removed) removed=$((removed+1)) ;; failed) failed=$((failed+1)) ;; esac
   done
-  printf '\n⚠ cl compact interrupted — removed its pending pre-compact request(s); a request already typed cannot be recalled, and nothing was compacted by this run after this point\n' >&2
+  printf '\n⚠ cl compact interrupted' >&2
+  [ "$removed" -gt 0 ] && printf ' — removed %s pending pre-compact request(s) of this run' "$removed" >&2
+  [ "$failed" -gt 0 ] && printf ' — could NOT remove %s (named above; remove by hand)' "$failed" >&2
+  [ "$removed" -eq 0 ] && [ "$failed" -eq 0 ] && printf ' — no pending pre-compact request of this run was left to remove' >&2
+  printf '. A request already typed cannot be recalled.\n' >&2
   exit "$1"
 }
 
@@ -4758,7 +4841,7 @@ _compact_add() {
   _h_state[$_n]="idle"; _h_path[$_n]=""; _h_nonce[$_n]=""; _h_mark[$_n]=""; _h_line[$_n]=""
   _h_taken[$_n]=""; _h_why[$_n]=""; _h_cbase[$_n]=""; _h_ctok[$_n]=""; _h_cstate[$_n]=""
   _h_cauto[$_n]=0; _h_cmark[$_n]=""; _h_clastsz[$_n]=""; _h_cbid[$_n]=""; _h_cpre[$_n]=""; _h_cpost[$_n]=""
-  _h_cidle[$_n]=0
+  _h_cidle[$_n]=0; _h_cdest[$_n]=""; _h_cleft[$_n]=0
   _n=$((_n+1))
 }
 
@@ -4801,6 +4884,9 @@ do_compact() {
 
   local -a _h_name _h_sid _h_cwd _h_tmux _h_agent _h_rot _h_state _h_path _h_nonce _h_mark _h_line
   local -a _h_taken _h_why _h_cbase _h_ctok _h_cstate _h_cauto _h_cmark _h_clastsz _h_cbid _h_cpre _h_cpost _h_cidle
+  # _h_cdest  where the session was proven to be (compact_target_bound)
+  # _h_cleft  1 when its pre-compact request could not be removed
+  local -a _h_cdest _h_cleft
   local _n=0 i rc=0 name sid cwd epoch agent _rows codex_skipped="" crow xrow
   _rows="$(discover)"
 
@@ -4862,6 +4948,9 @@ do_compact() {
     if [ "${_h_cstate[$i]}" = "compacted" ]; then
       printf '✓ %s: %s%s\n' "${_h_name[$i]}" "$(_compact_outcome "${_h_why[$i]}" compacted)" \
         "$( [ -n "${_h_cpre[$i]}" ] && printf ', %s → %s tokens' "${_h_cpre[$i]}" "${_h_cpost[$i]:-?}" )"
+      if [ "${_h_cleft[$i]}" = "1" ]; then
+        printf '  ⚠ %s: its pre-compact request could not be removed (see above)\n' "${_h_name[$i]}"; rc=1
+      fi
     else
       printf '✗ %s: %s\n' "${_h_name[$i]}" "$(_compact_outcome "${_h_why[$i]}" "${_h_cstate[$i]}")"
       rc=1
@@ -5024,6 +5113,9 @@ do_stop() {
   #   _h_cbid/_h_cpre/_h_cpost  the confirming boundary's uuid and token figures
   #   _h_cidle  1 once the transcript proves the session at rest since then
   local -a _h_taken _h_why _h_cbase _h_ctok _h_cstate _h_cauto _h_cmark _h_clastsz _h_cbid _h_cpre _h_cpost _h_cidle
+  # _h_cdest  where the session was proven to be (compact_target_bound)
+  # _h_cleft  1 when its pre-compact request could not be removed
+  local -a _h_cdest _h_cleft
   # _h_cmode  a Codex session's mode for this stop (resume|fresh); empty for
   #           Claude, whose mode is _h_rot. Kept apart so a Codex row stays out
   #           of every handoff, compaction and log decision _h_rot drives.
@@ -5085,7 +5177,7 @@ do_stop() {
     fi
     _h_taken[$_n]=""; _h_why[$_n]=""; _h_cbase[$_n]=""; _h_ctok[$_n]=""; _h_cstate[$_n]=""
     _h_cauto[$_n]=0; _h_cmark[$_n]=""; _h_clastsz[$_n]=""; _h_cbid[$_n]=""; _h_cpre[$_n]=""; _h_cpost[$_n]=""
-    _h_cidle[$_n]=0
+    _h_cidle[$_n]=0; _h_cdest[$_n]=""; _h_cleft[$_n]=0
     _h_cmode[$_n]=""
     [ "$agent" = "codex" ] && _h_cmode[$_n]=$(codex_stop_mode "$name" "$no_handoff" "$env_rotate")
     _n=$((_n+1))

@@ -241,10 +241,12 @@ mk_agent() { # <name> <sid> <mode> [delay] [chars lost from the first arrival]
   # process's children for caffeinate. AGENT_BUSY comes from the caller's env.
   printf '{"cwd":"%s"}\n{"customTitle":"%s"}\n' "$FIX/work" "$1" > "$PROJ/$2.jsonl"
   rtmux new-session -d -s "$1" -c "$FIX" \
-    "AGENT_BUSY='${AGENT_BUSY:-0}' AGENT_MODE='$3' AGENT_DELAY='${4:-0.5}' AGENT_DROP='${5:-0}' AGENT_TRANSCRIPT='$PROJ/$2.jsonl' AGENT_RECV='$FIX/recv-$1.txt' exec python3 '$AGENT'" 2>/dev/null \
+    "AGENT_BUSY='${AGENT_BUSY:-0}' AGENT_MODE='$3' AGENT_DELAY='${4:-0.5}' AGENT_DROP='${5:-0}' AGENT_TRANSCRIPT='$PROJ/$2.jsonl' AGENT_RECV='$FIX/recv-$1.txt' exec python3 '$AGENT' --resume '$2'" 2>/dev/null \
     || setup_failed "could not start the agent for $1"
-  # Stamped as cl stamps the panes it launches (tmux_claim): the session-to-pane
-  # binding cl checks before typing anything into a pane.
+  # Bound as cl's own sessions are: stamped as cl stamps the panes it launches
+  # (tmux_claim), and running a process tied to the session's id (here by its
+  # --resume argv; a real claude is also in Claude Code's registry). cl types
+  # only into a pane holding that process.
   stamp "$1" claude "$2"
 }
 stamp() { rtmux set-option -t "=$1:" @cl_agent "$2" >/dev/null && rtmux set-option -t "=$1:" @cl_sid "$3" >/dev/null \
@@ -505,7 +507,7 @@ stamp Foreign codex "0a1b2c3d-1111-2222-3333-444455556666"
 stop_run "$FIX/foreign.out"
 foreign="$(cat "$FIX/foreign.out")"
 check "nothing is typed into it" "0" "$(nlines "$FIX/recv-Foreign.txt")"
-contains "…and it says why" "$foreign" '"Foreign": the tmux pane at Foreign is stamped as a codex session — not typing into it; it will resume as-is'
+contains "…and it says why" "$foreign" '"Foreign": the tmux session at Foreign is stamped as a codex session — not typing into it; it will resume as-is'
 not_contains "no handoff is asked of it either" "$foreign" 'asked "Foreign" for'
 check "the row says resume" "resume" "$(row_field Foreign mode)"
 check "…with the reason logged" "foreign-pane" "$(log_field reasons)"

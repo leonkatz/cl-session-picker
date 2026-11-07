@@ -47,9 +47,9 @@ awk '/^cat > "\$AGENT" <<'"'"'PYEOF'"'"'$/{f=1; next} f && /^PYEOF$/{exit} f{pri
 grep -q 'compact_boundary' "$AGENT" || setup_failed "could not read the simulated agent out of test-compact-resume.sh"
 
 mk_agent() { # <name> <sid> <mode> [delay]
-  mk_pane "$@"
-  # Stamped as cl stamps the panes it launches (tmux_claim): the binding cl
-  # checks before typing into a pane. Panes cl did not stamp are tested below.
+  # Bound as cl's own sessions are: a process tied to the session's id (here
+  # its --resume argv) in the pane, and the session stamped as tmux_claim does.
+  mk_pane "$1" "$2" "$3" "${4:-0.5}" "--resume $2"
   stamp "$1" claude "$2"
 }
 mk_pane() { # <name> <sid> <mode> [delay] [extra agent argv]: an UNSTAMPED pane
@@ -332,7 +332,7 @@ stamp Collision codex "$CXID"
 compact_run "$FIX/collision.out" -- --all
 collision="$(cat "$FIX/collision.out")"
 check "nothing is typed into it" "0" "$(nlines "$FIX/recv-Collision.txt")"
-contains "it says why" "$collision" '"Collision": the tmux pane at Collision is stamped as a codex session — not typing into it; not compacted'
+contains "it says why" "$collision" '"Collision": the tmux session at Collision is stamped as a codex session — not typing into it; not compacted'
 contains "…and reports it" "$collision" "✗ Collision: its pane belongs to another session; nothing typed, not compacted"
 check "…exit non-zero" "1" "$(cat "$FIX/collision.out.rc")"
 check "no request file is left behind" "0" "$(ls "$FIX/store" 2>/dev/null | grep -c .)"
@@ -346,19 +346,25 @@ check "nothing is typed into it" "0" "$(nlines "$FIX/recv-Other.txt")"
 contains "it says why" "$(cat "$FIX/other.out")" "stamped as another session (sid-someone-else)"
 check "…exit non-zero" "1" "$(cat "$FIX/other.out.rc")"
 
-echo "a pane stamped Claude before its id was known (cl new) is cl's own"
+echo "a session stamped Claude before its id was known (cl new) still needs the process"
 reset
 mk_agent Newish sid-new ok
 stamp Newish claude -
 compact_run "$FIX/newish.out" -- Newish
-contains "it is compacted" "$(cat "$FIX/newish.out")" "✓ Newish: compacted by /compact"
+contains "with the process tied to its id in the pane, it is compacted" "$(cat "$FIX/newish.out")" "✓ Newish: compacted by /compact"
+reset
+mk_pane NewLoose sid-newloose ok
+stamp NewLoose claude -
+compact_run "$FIX/newloose.out" -- NewLoose
+check "without it, nothing is typed: the stamp proves a launch, not this transcript" "0" "$(nlines "$FIX/recv-NewLoose.txt")"
+contains "…refused as unverified" "$(cat "$FIX/newloose.out")" "✗ NewLoose: its pane could not be verified"
 
 echo "an unstamped pane whose process cannot be tied to the session gets nothing"
 reset
 mk_pane Loose sid-loose ok
 compact_run "$FIX/loose.out" -- Loose
 check "nothing is typed into it" "0" "$(nlines "$FIX/recv-Loose.txt")"
-contains "it says why" "$(cat "$FIX/loose.out")" "cannot verify that the tmux pane at Loose runs this session"
+contains "it says why" "$(cat "$FIX/loose.out")" "cannot verify that any pane of the tmux session at Loose runs this session"
 contains "…and reports it" "$(cat "$FIX/loose.out")" "✗ Loose: its pane could not be verified as this session"
 check "…exit non-zero" "1" "$(cat "$FIX/loose.out.rc")"
 
@@ -390,9 +396,71 @@ check "the premise: the request arrived" "1" "$(nlines "$FIX/recv-Swap.txt")"
 stamp Swap codex "$CXID"
 wait "$swap_job"
 check "/compact is never typed into the re-stamped pane" "0" "$(typed_compact Swap)"
-contains "…it says why" "$(cat "$FIX/swap.out")" '"Swap": the tmux pane at Swap is stamped as a codex session — not typing into it'
+contains "…it says why" "$(cat "$FIX/swap.out")" '"Swap": the tmux session at Swap is stamped as a codex session — not typing into it'
 check "…exit non-zero" "1" "$(cat "$FIX/swap.out.rc")"
 check "…and its request file is cleared" "0" "$([ -e "$FIX/store/Swap.precompact" ] && echo 1 || echo 0)"
+
+echo "a second, ACTIVE window in a stamped session gets nothing (review repro)"
+# The stamp is session-scoped: "=Owned:" is whichever pane has focus. Here that
+# is `cat`; the text must go to the agent's own pane, by its id.
+reset
+mk_agent Owned sid-owner ok
+rtmux new-window -t '=Owned:' -n unrelated 'cat'
+compact_run "$FIX/owned.out" CL_COMPACT_TIMEOUT=10 -- Owned
+check "the agent's pane got the request and /compact" "2 1" "$(nlines "$FIX/recv-Owned.txt") $(typed_compact Owned)"
+check "the active window got nothing" "" "$(rtmux capture-pane -p -t '=Owned:unrelated' | tr -d '[:space:]')"
+contains "…and it is compacted" "$(cat "$FIX/owned.out")" "✓ Owned: compacted by /compact"
+
+echo "a focus switch between the request and /compact does not redirect it"
+reset
+mk_agent Focus sid-focus ok 3
+( compact_run "$FIX/focus.out" -- Focus ) &
+focus_job=$!
+for (( w=0; w<80; w++ )); do [ -s "$FIX/recv-Focus.txt" ] && break; sleep 0.1; done
+check "the premise: the request arrived" "1" "$(nlines "$FIX/recv-Focus.txt")"
+rtmux new-window -t '=Focus:' -n stolen 'cat'
+wait "$focus_job"
+check "/compact went to the agent's pane" "1" "$(typed_compact Focus)"
+check "…and nothing into the window that took focus" "" "$(rtmux capture-pane -p -t '=Focus:stolen' | tr -d '[:space:]')"
+contains "…compacted" "$(cat "$FIX/focus.out")" "✓ Focus: compacted by /compact"
+
+echo "a refusal before any token was issued deletes no request (review repro)"
+reset
+mk_pane Loose sid-loose ok
+mkdir -p "$FIX/store"; printf 'another run, cl-done:other-run\n' > "$FIX/store/Loose.precompact"
+compact_run "$FIX/loose2.out" -- Loose
+contains "the premise: it was refused before asking" "$(cat "$FIX/loose2.out")" "✗ Loose: its pane could not be verified"
+check "another run's request is left exactly as it was" "another run, cl-done:other-run" "$(cat "$FIX/store/Loose.precompact" 2>/dev/null)"
+
+# ── the bare route: no tmux session, a tagged iTerm window ───────────────────
+# Real iTerm tabs are never driven here. A stand-in osascript records the
+# script it is given and answers "no" (no such tagged window), so what is
+# checked is what cl would ask iTerm to verify before typing.
+FAKEOSA="$FIX/fakeosa"; mkdir -p "$FAKEOSA"
+printf '#!/bin/sh\ncat > "%s/osa-script.txt"\necho no\n' "$FIX" > "$FAKEOSA/osascript"; chmod +x "$FAKEOSA/osascript"
+echo "the bare route binds the tagged window to the session process's tty"
+reset; rm -f "$FIX/osa-script.txt"
+mk_agent Host sid-host ok
+printf '{"cwd":"%s"}\n{"customTitle":"Bare"}\n' "$FIX/work" > "$PROJ/sid-bare.jsonl"
+# The session's process, on a terminal, under ANOTHER tmux name: no tmux
+# session at "Bare", so the iTerm route is the one taken.
+rtmux new-window -t '=Host:' -n bare "exec python3 -c 'import time; time.sleep(120)' --resume sid-bare"
+sleep 0.5
+bare_tty=$(rtmux display-message -p -t '=Host:bare' '#{pane_tty}')
+compact_run "$FIX/bare.out" PATH="$FAKEOSA:$BASEPATH" -- Bare
+contains "iTerm is asked to type only into a tagged window on that tty" "$(cat "$FIX/osa-script.txt" 2>/dev/null)" \
+  "if \"$bare_tty\" is not \"\" and (tty of hit) is not \"$bare_tty\" then return \"mismatch\""
+contains "…and with no such window, nothing is compacted" "$(cat "$FIX/bare.out")" "✗ Bare: no reachable pane; not compacted"
+echo "a tied process with no terminal is refused before iTerm is asked"
+reset; rm -f "$FIX/osa-script.txt"
+printf '{"cwd":"%s"}\n{"customTitle":"NoTty"}\n' "$FIX/work" > "$PROJ/sid-notty.jsonl"
+python3 -c 'import os, sys, time; os.setsid(); time.sleep(60)' --resume sid-notty </dev/null >/dev/null 2>&1 &
+notty_pid=$!
+sleep 0.5
+compact_run "$FIX/notty.out" PATH="$FAKEOSA:$BASEPATH" -- NoTty
+kill "$notty_pid" 2>/dev/null; wait "$notty_pid" 2>/dev/null
+contains "it is refused as unverified" "$(cat "$FIX/notty.out")" "✗ NoTty: its pane could not be verified"
+check "…and iTerm was never asked" "0" "$([ -e "$FIX/osa-script.txt" ] && echo 1 || echo 0)"
 
 # ── interrupted ──────────────────────────────────────────────────────────────
 echo "SIGTERM after dispatch removes this run's request, and only that"
@@ -413,8 +481,12 @@ for variant in own newer; do
   if [ "$variant" = "own" ]; then
     check "own: its request file is removed" "0" "$([ -e "$FIX/store/Interrupted.precompact" ] && echo 1 || echo 0)"
     contains "own: …and it says a typed request cannot be recalled" "$(cat "$FIX/int.out")" "cannot be recalled"
+    contains "own: …and that it removed one" "$(cat "$FIX/int.out")" "removed 1 pending pre-compact request(s) of this run"
   else
     check "newer: the newer request is left alone" "a newer request, cl-done:999" "$(cat "$FIX/store/Interrupted.precompact" 2>/dev/null)"
+    not_contains "newer: …and it does not claim to have removed one" "$(cat "$FIX/int.out")" "removed 1"
+    contains "newer: …it says there was none of its own to remove" "$(cat "$FIX/int.out")" "no pending pre-compact request of this run was left to remove"
+    check "newer: no clearing leftovers" "0" "$(ls "$FIX/store" | grep -c clearing)"
   fi
   check "$variant: the session is still running" "1" "$(running Interrupted)"
   check "$variant: nothing more was typed" "1" "$(nlines "$FIX/recv-Interrupted.txt")"

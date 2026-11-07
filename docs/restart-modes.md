@@ -103,9 +103,9 @@ second sender is written.
    "turn ended" record, so the evidence is that the session did what it was
    asked (the token last, no call outstanding) and then went quiet for two
    polls. A session that writes the token early, or new input that starts a
-   turn between the check and the `/compact`, is outside what cl can see; the
-   gap is one poll, and typed input queues behind a running turn rather than
-   interrupting it.
+   turn between the check and the `/compact`, is outside what cl can see. The
+   gap is short — the pane re-check and the send — but nothing bounds it;
+   typed input queues behind a running turn rather than interrupting it.
    **Before anything is typed** (the request, a retype of it, and again
    before `/compact`) the pane is checked to be this session; see "Which pane
    is this session" below. A pane that is not is given nothing.
@@ -146,18 +146,26 @@ failure resumes plainly and is reported.
 ### Which pane is this session
 
 A tmux session at the right name is not proof: names collide, and a name
-match is all liveness checks. So before typing, `compact_target_bound` asks
-for the binding retire_session's ownership rules rely on:
+match is all liveness checks. A cl stamp (`@cl_agent`/`@cl_sid`) is not proof
+either: it is session-scoped, while typing to `=<session>:` reaches whichever
+pane has focus. So the evidence is always a **process tied to this session's
+id** — cl's launch record bound to name and id, Claude Code's registry proven
+by start time, or a `--resume`/`--session-id` argv for exactly that id (never
+a fork) — running in the place cl types into. `compact_target_bound` returns
+that place, and only it is typed into:
 
 | what sits at the name | result |
 |---|---|
-| a pane cl stamped Claude with this session's id | typed into |
-| a pane cl stamped Claude with no id yet (`cl new`) | typed into: cl's own |
-| a pane stamped as another agent, or another session's id | **refused**: an explicit mismatch, reported |
-| an unstamped pane whose active process is, or is an ancestor of, the process tied to this session's id (cl's launch record, Claude Code's registry, or a `--resume`/`--session-id` argv; never a fork) | typed into: a hand-run `claude --resume` of this session |
-| an unstamped pane with no such process in it | **refused**: cannot tell |
-| no tmux session: a process tied to the id, or cl's own launch record under the name (the tagged-iTerm route) | typed into |
-| no tmux session and neither | **refused**: cannot tell |
+| a tmux session one of whose panes runs (or is an ancestor of) the tied process | typed into **that pane, by its id** (`send-keys -t %N`), whichever window has focus |
+| …and stamped as another agent, or another session's id | **refused**: an explicit mismatch, reported |
+| …stamped Claude with no id yet (`cl new`), or unstamped, with no tied process in any pane | **refused**: a stamp proves a launch, not this transcript |
+| no tmux session: the tied process on a terminal (the tagged-iTerm route) | typed into the tagged iTerm session **only if it is on that process's tty**, checked by the same script that types |
+| no tmux session, and no tied process on a terminal | **refused**: cannot tell |
+
+The first proof fixes the destination for the whole run. It is proven again
+before a retype of the request and before `/compact`; a session found
+anywhere else then, or not at all, is refused, so neither a focus switch nor a
+new pane at the name can redirect what is typed.
 
 A refused session in a stop **resumes as-is**: not a handoff, whose ask would
 go into the same pane. Under `cl compact` it is not compacted. Either way the
@@ -298,12 +306,17 @@ What is different:
   running Claude session exits 0. Naming no target, or names and `--all`
   together, is refused.
 - **Interrupted** (INT, TERM, HUP), it removes the pre-compact requests this
-  run wrote — only files holding this run's token, so a newer concurrent
-  request for the same session stays — restores the traps it replaced, and
-  exits 130/143/129. A pointer already typed cannot be recalled: a session that
-  has read it will still finish its turn and reply; it just gets no
-  `/compact`. A request file that cannot be removed is reported, never
-  silently left.
+  run wrote, restores the traps it replaced, and exits 130/143/129, saying how
+  many it removed and naming any it could not. A pointer already typed cannot
+  be recalled: a session that has read it will still finish its turn and
+  reply; it just gets no `/compact`.
+- **Which request is "this run's".** Only a file holding a token this run
+  issued. A session refused or skipped before a token was issued has no
+  request of this run, so nothing is removed for it. Removal renames the file
+  to a name only that call knows, checks the token, then deletes it — or links
+  it back if it is not ours — so a newer request written in between is never
+  the one deleted. A removal that fails is reported, and under `cl compact`
+  makes the exit non-zero.
 - **The report** is one line per target: the path taken and the boundary
   record's `preTokens → postTokens`.
 - **No rotation log line.** The log is one row per stop and `cl rotate stats`

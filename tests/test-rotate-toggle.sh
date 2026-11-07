@@ -542,14 +542,16 @@ has "the default stop compacts (dry run)" "$out" 'would ask "Alpha" to finish it
 has "…and says so per session" "$out" "rotation compact-resume"
 
 printf 'a compact-resume stop whose panes cannot be reached falls back, and logs why\n'
-# These stand-in sessions have no pane cl can type into. The pre-compact ask
-# cannot be sent, so each falls back to a handoff, which cannot be sent either,
-# and each is stopped and resumed as-is. The mode logged is still the one ASKED.
+# These stand-in sessions have no pane cl can type into: no tmux session, and
+# their processes are on no terminal, so cl cannot prove which window runs
+# them. Nothing is typed — not the pre-compact ask, and not a handoff ask,
+# which would go to the same unproven place — and each is stopped and resumed
+# as-is. The mode logged is still the one ASKED.
 rm -f "$LOG" "$ROT"
 cl stop --keep-tabs >/dev/null 2>&1
 check "the row's mode is the mode asked" "compact-resume" "$(awk -F'\t' 'NR==2{print $2}' "$LOG")"
 check "…the paths taken are in their own column" "resume,resume" "$(awk -F'\t' 'NR==2{print $11}' "$LOG")"
-check "…with why" "unreachable+unreachable,unreachable+unreachable" "$(awk -F'\t' 'NR==2{print $12}' "$LOG")"
+check "…with why" "unverified-pane,unverified-pane" "$(awk -F'\t' 'NR==2{print $12}' "$LOG")"
 check "…and the saved rows record what was carried out" "resume" \
   "$(jq -r '.[] | select(.name=="Alpha" and (.agent // "claude")=="claude") | .mode' "$STATE")"
 check "…by agent AND name: the Codex row gets no mode" "" \
