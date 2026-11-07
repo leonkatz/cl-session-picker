@@ -453,9 +453,9 @@ cl mode --codex "Review" fresh    # or resume, or clear
 A fresh Codex session is stopped like any other. On `cl start`, before
 anything is launched, `cl` makes the new thread through `codex app-server`
 (`thread/start`, then `thread/name/set` to the session's name, and the name
-read back), archives the old thread with `codex archive` — before the
-coordination lane is re-armed, so nothing can elect the old one — and moves
-the saved row onto the new id. Only then does the ordinary path run
+read back), archives the old thread with `codex archive` — on the tmux path
+before the coordination lane is re-armed, so nothing can elect the old one —
+and moves the saved row onto the new id. Only then does the ordinary path run
 `codex resume <new-id> "<first prompt>"`, so the new thread is owned, stopped
 and listed like any other, and its first turn fires the repo's SessionStart
 hook. The first prompt comes from
@@ -465,6 +465,15 @@ one unarchived) and the old thread is resumed plainly, with the reason printed.
 The old id is kept in `fresh-history.json`, with the command to bring it back
 (`codex unarchive <id> && codex resume <id>`). `CL_CODEX_RPC_TIMEOUT` (default
 20s) bounds each app-server request.
+
+Without tmux (the iTerm shape) the new thread is made by the session's tab,
+which runs after `cl start` has already re-armed the lanes. So for that short
+window the election can still pick the old thread; it moves to the new one on
+the new thread's first turn, whose SessionStart hook elects it.
+
+`CL_ROTATE=fresh` and `CL_ROTATE=resume` (or `0`/`off`) apply to Codex
+sessions for that stop too; a Claude-only mode in `CL_ROTATE` leaves a Codex
+session on its stored mode, and `--no-handoff` makes it `resume`.
 
 ### Measuring whether it pays
 

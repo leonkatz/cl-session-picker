@@ -174,7 +174,10 @@ resume path:
 1. `codex app-server`: `thread/start` returns the new `thread.id`;
    `thread/name/set` gives it the session's name; read the name back.
 2. Archive the old thread (`codex archive <old-id>`) **before** anything re-arms,
-   so the election cannot pick it.
+   so the election cannot pick it. (This holds on the tmux path. In the
+   bare-iTerm shape `cl start` re-arms before the tab runs steps 1-4, so the
+   election can briefly pick the old thread; it heals on the new thread's
+   first SessionStart — see the bare-tab note below.)
 3. Rewrite the state row's sid to the new id.
 4. Let the ordinary path run `codex resume <new-id> "<first prompt>"`. Every
    existing ownership mechanism then works unchanged, and the first turn fires
@@ -222,7 +225,14 @@ are re-offered to the new thread by the watcher's own re-send.
 - **The bare-tab path** carries the mode and the old id in the tab command
   (`cl --codex "Name" --restart-mode fresh <old-id>`); the tab does steps 1-4.
   A tab that runs after the name has moved on to another thread resumes that
-  thread rather than replacing it.
+  thread rather than replacing it. Because `cl start` re-arms the lanes before
+  its tabs run, archive-before-rearm does not hold here: until the new thread's
+  first turn fires SessionStart, the election may still name the old one.
+- **`CL_ROTATE`** set to `fresh` or `resume` (or `0`/`off`) applies to a Codex
+  session for that stop; a Claude-only mode in it does not change a Codex row.
+- **A refused tmux launch after steps 1-3** keeps the row (now on the new id,
+  mode `resume`), records the old id in `fresh-history.json` and prints its
+  recovery command, as the other failure paths do.
 
 ## Out of scope here
 
