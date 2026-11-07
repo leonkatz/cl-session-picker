@@ -3970,22 +3970,41 @@ _mark_size() { wc -c < "${1%%$'\t'*}" 2>/dev/null | tr -d ' '; }
 # in a tool_result — a `user` record — and a plain search would "confirm" a turn
 # that has only just begun. (That is why handoff_ask_seen, which matches user
 # records, is not reused here.) So the token counts only:
-#   * in an ASSISTANT TEXT block, after the mark;
-#   * in the LAST conversation record (user/assistant — metadata records such
-#     as system notes are not turns and do not move "last");
-#   * with no tool_use after that text block, since a tool call means the turn
-#     is still going.
+#   * in the FINAL REPLY: the assistant records after the last user record
+#     (a user record is a typed turn or a tool_result), the last conversation
+#     record being one of them — metadata records such as system notes are
+#     not turns and do not move "last";
+#   * as the exact LAST LINE of the last text block of that reply (surrounding
+#     whitespace aside). A token mentioned mid-text ("I will end with
+#     cl-done:N" and then more) is a turn still talking about its end;
+#   * with NO tool_use block anywhere in that reply, in any block order: a call
+#     the transcript has no result for is a turn that is still going.
 # The caller adds the fourth condition: the size stable across two polls.
+#
+# WHAT THIS IS, HONESTLY: cooperation, not a runtime end-of-turn signal. Claude
+# Code writes no "turn ended" record cl can read, so the proof is that the
+# session did what it was asked — wrote the token as its last line, with no
+# call outstanding — and then wrote nothing more for two polls. A session that
+# writes the token early, or new input that starts another turn between this
+# check and the /compact that follows, is outside what it can see. The window
+# is bounded (one poll interval), and typed input queues rather than
+# interrupting, so the worst case is a /compact that runs after that turn.
+#
+# The rule itself is _CL_JQ_TOKEN_FINAL, shared with compact_idle_record, so
+# "finished with the token" cannot mean two different things in two places.
+_CL_JQ_TOKEN_FINAL='def cl_blocks: (.message.content // [])
+  | if type == "string" then [{type: "text", text: .}] elif type == "array" then . else [] end;
+def token_final($tok):
+  length > 0 and (last.type == "assistant")
+  and ((. as $all | ([range(0; $all | length) | select($all[.].type == "user")] | max) as $u
+        | $all[(if $u == null then 0 else $u + 1 end):]) as $reply
+       | ([$reply[] | cl_blocks[] | select(.type == "tool_use")] | length) == 0
+         and (([$reply | last | cl_blocks[] | select(.type == "text")] | last) as $t
+              | $t != null
+                and ((($t.text // "") | sub("\\s+$"; "") | split("\n") | last // "") | sub("^\\s+"; "")) == $tok));'
 compact_token_seen() {
-  _tail_records "$1" | jq -s -e --arg tok "$2" '
-    map(select(.type == "user" or .type == "assistant")) | last
-    | select(. != null and .type == "assistant")
-    | (.message.content // [])
-    | (if type == "string" then [{type: "text", text: .}] elif type == "array" then . else [] end)
-    | to_entries
-    | ([.[] | select(.value.type == "tool_use") | .key] | max) as $tu
-    | ([.[] | select(.value.type == "text" and ((.value.text // "") | contains($tok))) | .key] | max) as $tx
-    | $tx != null and ($tu == null or $tx > $tu)' >/dev/null 2>&1
+  _tail_records "$1" | jq -s -e --arg tok "$2" "$_CL_JQ_TOKEN_FINAL"'
+    map(select(.type == "user" or .type == "assistant")) | token_final($tok)' >/dev/null 2>&1
 }
 
 # compact_boundary_after <mark> [trigger]: print "<uuid>|<trigger>|<pre>|<post>"
@@ -4043,17 +4062,19 @@ compact_output_after() {
 # unattended, is answered "no" and fails the stop.
 #
 # Idle means that record is the Compacted output — or, with a token (a session
-# that compacted on its own and then finished its turn), the assistant reply
-# carrying it. Deliberately NOT any free-text mention of "SessionStart" and
+# that compacted on its own and then finished its turn), a reply that passes
+# EXACTLY compact_token_seen's rule (_CL_JQ_TOKEN_FINAL: the token as the final
+# line, no tool_use anywhere in the reply). A looser "text contains the token"
+# here would call a session idle while a tool call in that same reply runs —
+# and after an auto boundary, idle is what lets the stop retire it unprompted.
+# Deliberately NOT any free-text mention of "SessionStart" and
 # "compact": a tool_result can contain both, and matching it would skip the
 # prompt for a session that is busy.
 compact_idle_record() {
-  _tail_records "$1" | jq -s -e --arg tok "${2:-}" "$_CL_JQ_COMPACTED"'
-    map(select(.type == "user" or .type == "assistant")) | last | select(. != null)
-    | compacted_output
-      or ($tok != "" and .type == "assistant"
-          and ([(.message.content // []) | if type == "array" then .[] else empty end
-                | select(.type == "text") | (.text // "") | contains($tok)] | any))' >/dev/null 2>&1
+  _tail_records "$1" | jq -s -e --arg tok "${2:-}" "$_CL_JQ_COMPACTED$_CL_JQ_TOKEN_FINAL"'
+    map(select(.type == "user" or .type == "assistant")) as $c
+    | ($c | length) > 0
+      and (($c | last | compacted_output) or ($tok != "" and ($c | token_final($tok))))' >/dev/null 2>&1
 }
 
 # compact_preflight <sid> <boundary-uuid>: before `cl start` resumes a session
@@ -4389,9 +4410,99 @@ _c_fallback() {
 
 # _c_clear_request <i>: the pre-compact request has been answered one way or
 # the other, so its file goes, as a handoff request's does once it lands.
+#
+# Only THIS cycle's request: once a token was issued, a file that does not hold
+# it was written by a newer, concurrent run and is left alone. A removal that
+# fails is said, not swallowed — the file is an instruction still on disk.
 _c_clear_request() {
-  [ -n "$_CL_STOP_ROOT" ] && rm -f "$(precompact_request_path "$_CL_STOP_ROOT" "${_h_name[$1]}")" 2>/dev/null
+  local rp
+  [ -n "$_CL_STOP_ROOT" ] || return 0
+  rp=$(precompact_request_path "$_CL_STOP_ROOT" "${_h_name[$1]}")
+  [ -e "$rp" ] || return 0
+  if [ -n "${_h_ctok[$1]:-}" ] && ! grep -qF -- "${_h_ctok[$1]}" "$rp" 2>/dev/null; then
+    return 0
+  fi
+  rm -f "$rp" 2>/dev/null
+  if [ -e "$rp" ]; then
+    printf '⚠ could not remove the pre-compact request %s — remove it by hand\n' "$rp" >&2
+    return 1
+  fi
   return 0
+}
+
+# _c_refuse <i> <reason> <detail>: the pane is not proven to be this session,
+# so nothing more is typed into it. In a stop it resumes as-is — NOT a handoff,
+# whose ask would go into the same pane; under `cl compact` it is not compacted.
+_c_refuse() {
+  _h_cstate[$1]="resume"; _h_state[$1]="cdone"; _h_taken[$1]="resume"; _h_why[$1]="$2"; _h_mark[$1]=""
+  _c_clear_request "$1"
+  if [ "${_c_purpose:-stop}" = "compact" ]; then
+    printf '⚠ "%s": %s — not typing into it; not compacted\n' "${_h_name[$1]}" "$3" >&2
+  else
+    printf '⚠ "%s": %s — not typing into it; it will resume as-is\n' "${_h_name[$1]}" "$3" >&2
+  fi
+}
+
+# compact_target_bound <name> <sid> <tmux_name>: is the place cl would type into
+# provably THIS session? Prints why not, and returns 1 for an explicit mismatch
+# or 2 for "cannot tell". Both refuse: a name collision is not a binding.
+#
+#   a tmux pane stamped by cl (@cl_agent / @cl_sid, see tmux_claim):
+#     claude + this sid                  -> bound
+#     claude + no sid yet ("-")          -> bound: cl's own launch before the
+#                                           id existed (`cl new`)
+#     another agent, or another sid      -> MISMATCH, refused
+#   an UNSTAMPED tmux pane (one cl did not start, e.g. a hand-run claude):
+#     the process tied to this sid (session_pid: cl's launch record, Claude
+#     Code's registry, or a --resume/--session-id argv, never a fork) runs IN
+#     the pane being typed into — that pane's process or a descendant of it
+#                                        -> bound
+#     no such process, or it runs elsewhere -> refused (cannot tell)
+#   no tmux session (the tagged-iTerm route):
+#     a process tied to this sid, or cl's own launch record under this name
+#     (unbound_owner_pid)                -> bound
+#     neither                            -> refused (cannot tell)
+#
+# The checks are retire_session's ownership evidence, applied before TYPING
+# rather than before killing; a session cl launched is always bound.
+compact_target_bound() {
+  local name="$1" sid="$2" t="$3" a s pid pane p n=0
+  if [ -n "$t" ] && tmux has-session -t "=$t" 2>/dev/null; then
+    a=$(tmux show-option -qv -t "=$t:" "@cl_agent" 2>/dev/null)
+    s=$(tmux show-option -qv -t "=$t:" "@cl_sid" 2>/dev/null)
+    if [ -n "$a" ]; then
+      if [ "$a" != "claude" ]; then
+        printf 'the tmux pane at %s is stamped as a %s session' "$t" "$a"; return 1
+      fi
+      case "$s" in ''|-) return 0 ;; esac
+      [ "$s" = "$sid" ] && return 0
+      printf 'the tmux pane at %s is stamped as another session (%s)' "$t" "$s"; return 1
+    fi
+    pid=$(session_pid "$sid" claude "$name")
+    pane=$(tmux display-message -p -t "=$t:" '#{pane_pid}' 2>/dev/null)
+    if [ -n "$pid" ] && [ -n "$pane" ]; then
+      p="$pid"
+      while [ -n "$p" ] && [ "$p" -gt 1 ] 2>/dev/null && [ "$n" -lt 32 ]; do
+        [ "$p" = "$pane" ] && return 0
+        p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' '); n=$((n+1))
+      done
+    fi
+    printf 'cannot verify that the tmux pane at %s runs this session (no cl stamp, and no process tied to its id in that pane)' "$t"
+    return 2
+  fi
+  [ -n "$(session_pid "$sid" claude "$name")" ] && return 0
+  [ -n "$(unbound_owner_pid "$name")" ] && return 0
+  printf 'cannot verify which window runs this session (no tmux pane, and no process tied to its id)'
+  return 2
+}
+
+# _c_bound <i>: compact_target_bound for one slot, refusing it on failure.
+_c_bound() {
+  local why rc
+  why=$(compact_target_bound "${_h_name[$1]}" "${_h_sid[$1]}" "${_h_tmux[$1]}"); rc=$?
+  [ "$rc" = "0" ] && return 0
+  if [ "$rc" = "1" ]; then _c_refuse "$1" "foreign-pane" "$why"; else _c_refuse "$1" "unverified-pane" "$why"; fi
+  return 1
 }
 
 # _c_compacted <i> <boundary-tsv> <reason>: record a confirmed compaction.
@@ -4467,6 +4578,9 @@ compact_phase() {
         "⚠ no transcript to watch for \"${_h_name[$i]}\", so a compaction could not be confirmed — not compacted"
       continue
     fi
+    # Before anything is typed: a pane that is not provably this session gets
+    # nothing, not even the pointer.
+    _c_bound "$i" || continue
     tok=$(compact_nonce); _h_ctok[$i]="$tok"
     prompt=$(build_handoff_ask "$_CL_STOP_ROOT" "${_h_name[$i]}" "$tok" precompact "$_c_purpose")
     _h_mark[$i]=$(handoff_ask_mark "${_h_sid[$i]}"); _h_line[$i]="$prompt"
@@ -4484,6 +4598,7 @@ compact_phase() {
     handoff_poll_marks cask
     for (( i=0; i<_n; i++ )); do
       [ "${_h_state[$i]}" = "cask" ] && [ -n "${_h_mark[$i]:-}" ] || continue
+      if ! _c_bound "$i"; then c_pending=$((c_pending-1)); continue; fi
       m=$(handoff_ask_resend "${_h_name[$i]}" "${_h_sid[$i]}" "${_h_tmux[$i]}" "${_h_line[$i]}" "pre-compact"); rrc=$?
       case "$rrc" in
         0) _h_mark[$i]="$m"; resent=$((resent+1)) ;;
@@ -4532,6 +4647,11 @@ compact_phase() {
               # Step 4: /compact, ONCE, with no busy gate — claude_busy stays
               # true for minutes after a turn, and the token already proves the
               # turn ended. The mark is taken just before typing.
+              # The pane is checked AGAIN: minutes may have passed since the
+              # request, and what sits at that name now is what gets /compact.
+              if ! _c_bound "$i"; then
+                c_pending=$((c_pending-1)); _h_clastsz[$i]="$sz"; continue
+              fi
               _h_cmark[$i]=$(transcript_mark "${_h_sid[$i]}")
               if handoff_send_once "${_h_name[$i]}" "${_h_sid[$i]}" "${_h_tmux[$i]}" "/compact"; then
                 _h_cstate[$i]="await_boundary"
@@ -4612,8 +4732,22 @@ _compact_outcome() {
     unreachable)             printf 'no reachable pane; not compacted' ;;
     no-transcript)           printf 'no transcript to watch; not compacted' ;;
     no-store)                printf 'no durable location for the request; not compacted' ;;
+    foreign-pane)            printf 'its pane belongs to another session; nothing typed, not compacted' ;;
+    unverified-pane)         printf 'its pane could not be verified as this session; nothing typed, not compacted' ;;
     *) if [ "$2" = "compacted" ]; then printf 'compacted'; else printf 'not compacted (%s)' "${1:-unknown}"; fi ;;
   esac
+}
+
+# _compact_interrupted <status>: do_compact's INT/TERM/HUP trap, run inside its
+# dynamic scope. Clears this run's own pre-compact requests, says so, exits.
+_compact_interrupted() {
+  local i
+  trap - INT TERM HUP
+  for (( i=0; i<${_n:-0}; i++ )); do
+    [ -n "${_h_ctok[$i]:-}" ] && _c_clear_request "$i"
+  done
+  printf '\n⚠ cl compact interrupted — removed its pending pre-compact request(s); a request already typed cannot be recalled, and nothing was compacted by this run after this point\n' >&2
+  exit "$1"
 }
 
 # _compact_add <name> <sid> <cwd>: one `cl compact` target, as a slot of
@@ -4711,7 +4845,16 @@ do_compact() {
 
   _CL_STOP_ROOT=""
   if [ -z "$dry_run" ]; then handoff_root >/dev/null && _CL_STOP_ROOT="$_CL_HANDOFF_ROOT"; fi
+  # Interrupted mid-phase, the requests this run wrote are removed (only those:
+  # _c_clear_request matches each file to this run's token). A pointer already
+  # TYPED cannot be recalled — a session that has read it will still finish
+  # its turn and reply; it just gets no /compact.
+  local _prev_traps; _prev_traps=$(trap -p INT TERM HUP)
+  trap '_compact_interrupted 130' INT
+  trap '_compact_interrupted 143' TERM
+  trap '_compact_interrupted 129' HUP
   compact_phase compact
+  trap - INT TERM HUP; [ -n "$_prev_traps" ] && eval "$_prev_traps"
   [ -n "$dry_run" ] && return "$rc"
 
   printf '\n'

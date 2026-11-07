@@ -47,11 +47,19 @@ awk '/^cat > "\$AGENT" <<'"'"'PYEOF'"'"'$/{f=1; next} f && /^PYEOF$/{exit} f{pri
 grep -q 'compact_boundary' "$AGENT" || setup_failed "could not read the simulated agent out of test-compact-resume.sh"
 
 mk_agent() { # <name> <sid> <mode> [delay]
+  mk_pane "$@"
+  # Stamped as cl stamps the panes it launches (tmux_claim): the binding cl
+  # checks before typing into a pane. Panes cl did not stamp are tested below.
+  stamp "$1" claude "$2"
+}
+mk_pane() { # <name> <sid> <mode> [delay] [extra agent argv]: an UNSTAMPED pane
   printf '{"cwd":"%s"}\n{"customTitle":"%s"}\n' "$FIX/work" "$1" > "$PROJ/$2.jsonl"
   rtmux new-session -d -s "$1" -c "$FIX" \
-    "AGENT_MODE='$3' AGENT_DELAY='${4:-0.5}' AGENT_TRANSCRIPT='$PROJ/$2.jsonl' AGENT_RECV='$FIX/recv-$1.txt' exec python3 '$AGENT'" 2>/dev/null \
+    "AGENT_MODE='$3' AGENT_DELAY='${4:-0.5}' AGENT_TRANSCRIPT='$PROJ/$2.jsonl' AGENT_RECV='$FIX/recv-$1.txt' exec python3 '$AGENT' ${5:-}" 2>/dev/null \
     || setup_failed "could not start the agent for $1"
 }
+stamp() { rtmux set-option -t "=$1:" @cl_agent "$2" >/dev/null && rtmux set-option -t "=$1:" @cl_sid "$3" >/dev/null \
+  || setup_failed "could not stamp $1"; }
 # A Claude session cl knows (it has a named transcript) that is not running.
 mk_dormant() { printf '{"cwd":"%s"}\n{"customTitle":"%s"}\n' "$FIX/work" "$1" > "$PROJ/$2.jsonl"; }
 # A running Codex thread cl owns: a rollout and a name in Codex's index, and a
@@ -258,6 +266,159 @@ contains "an unknown name is reported" "$mixed" 'no session named "Nobody"'
 contains "the running one is still compacted" "$mixed" "✓ Live: compacted by /compact"
 check "…once, though it was named twice" "1 1" "$(grep -c 'pre-compact request in' "$FIX/recv-Live.txt") $(typed_compact Live)"
 check "no session was started for the dormant one" "0" "$(rtmux list-sessions 2>/dev/null | grep -c '^Dormant')"
+
+echo "an auto compaction and NO token: already compacted, turn unfinished"
+reset
+mk_agent AutoSil sid-as auto-silent
+compact_run "$FIX/autosil.out" CL_COMPACT_TIMEOUT=4 -- AutoSil
+autosil="$(cat "$FIX/autosil.out")"
+check "exits 0: the compaction the command is for did happen" "0" "$(cat "$FIX/autosil.out.rc")"
+check "/compact is never typed" "0" "$(typed_compact AutoSil)"
+check "…so it compacted exactly once" "1" "$(boundaries sid-as)"
+contains "the report says so, with that boundary's figures" "$autosil" \
+  "✓ AutoSil: already compacted (on its own, before /compact; its turn had not finished), 990000 → 21000 tokens"
+check "it is still running" "1" "$(running AutoSil)"
+
+# ── the token must be the end of the final reply ─────────────────────────────
+echo "the token predicate, on the exact near-misses"
+PRED="$FIX/pred.sh"
+{ awk '/^_tail_records\(\) \{/{f=1} f{print} f && /^}$/{exit}' "$CL"
+  awk '/^_CL_JQ_COMPACTED=/{f=1} f{print} f && /;.$/{exit}' "$CL"
+  awk '/^_CL_JQ_TOKEN_FINAL=/{f=1} f{print} f && /;.$/{exit}' "$CL"
+  awk '/^compact_token_seen\(\) \{/{f=1} f{print} f && /^}$/{exit}' "$CL"
+  awk '/^compact_idle_record\(\) \{/{f=1} f{print} f && /^}$/{exit}' "$CL"; } > "$PRED"
+grep -q '^compact_idle_record()' "$PRED" && grep -q '^_CL_JQ_TOKEN_FINAL=' "$PRED" || setup_failed "could not extract the token predicates"
+pred() { # <case> <records> -> "token idle"
+  printf '%s\n' "$2" > "$FIX/pred.jsonl"
+  ( . "$PRED"
+    compact_token_seen "$FIX/pred.jsonl"$'\t'0 cl-done:123; a=$?
+    compact_idle_record "$FIX/pred.jsonl"$'\t'0 cl-done:123; printf '%s %s' "$a" "$?" )
+}
+A='{"type":"assistant","message":{"content":'
+check "the token as the final line of a finished reply counts (both predicates)" "0 0" \
+  "$(pred ok "$A"'[{"type":"text","text":"Workflow done.\ncl-done:123\n"}]}}')"
+check "\"I will end with cl-done:N\" then more text does not" "1 1" \
+  "$(pred midline "$A"'[{"type":"text","text":"I will end with cl-done:123\nStill working, not finished."}]}}')"
+check "…nor the token mid-sentence" "1 1" \
+  "$(pred midsentence "$A"'[{"type":"text","text":"The requested marker is cl-done:123. Still working; this is not my final reply."}]}}')"
+check "a tool_use BEFORE the token text, in one record, does not" "1 1" \
+  "$(pred toolfirst "$A"'[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"sleep 60"}},{"type":"text","text":"cl-done:123"}]}}')"
+check "a tool_use AFTER it, in one record, does not" "1 1" \
+  "$(pred toolafter "$A"'[{"type":"text","text":"cl-done:123"},{"type":"tool_use","id":"t1","name":"Bash","input":{}}]}}')"
+check "a tool_use in an earlier record of the same reply does not" "1 1" \
+  "$(pred split "$A"'[{"type":"tool_use","id":"t1","name":"Bash","input":{}}]}}'$'\n'"$A"'[{"type":"text","text":"cl-done:123"}]}}')"
+check "…but one answered by a tool_result before the reply does" "0 0" \
+  "$(pred answered "$A"'[{"type":"tool_use","id":"t1","name":"Bash","input":{}}]}}'$'\n''{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"x"}]}}'$'\n'"$A"'[{"type":"text","text":"ok\ncl-done:123"}]}}')"
+check "a longer token is not this one" "1 1" "$(pred longer "$A"'[{"type":"text","text":"cl-done:1234"}]}}')"
+
+echo "a token that is not the last line: /compact is never typed"
+reset
+mk_agent MidLine sid-ml token-midline
+compact_run "$FIX/midline.out" CL_COMPACT_TIMEOUT=4 -- MidLine
+check "/compact is never typed" "0" "$(typed_compact MidLine)"
+contains "…not compacted" "$(cat "$FIX/midline.out")" "✗ MidLine: did not finish its turn; not compacted"
+echo "a tool call then the token in one record: /compact is never typed"
+reset
+mk_agent ToolText sid-tx tool-then-text
+compact_run "$FIX/tooltext.out" CL_COMPACT_TIMEOUT=4 -- ToolText
+check "/compact is never typed" "0" "$(typed_compact ToolText)"
+contains "…not compacted" "$(cat "$FIX/tooltext.out")" "✗ ToolText: did not finish its turn; not compacted"
+
+# ── the pane must provably be the session ────────────────────────────────────
+echo "a pane stamped as a Codex session, at a Claude session's name, gets nothing"
+reset
+mk_agent Collision sid-stale ok
+stamp Collision codex "$CXID"
+compact_run "$FIX/collision.out" -- --all
+collision="$(cat "$FIX/collision.out")"
+check "nothing is typed into it" "0" "$(nlines "$FIX/recv-Collision.txt")"
+contains "it says why" "$collision" '"Collision": the tmux pane at Collision is stamped as a codex session — not typing into it; not compacted'
+contains "…and reports it" "$collision" "✗ Collision: its pane belongs to another session; nothing typed, not compacted"
+check "…exit non-zero" "1" "$(cat "$FIX/collision.out.rc")"
+check "no request file is left behind" "0" "$(ls "$FIX/store" 2>/dev/null | grep -c .)"
+
+echo "a pane stamped as ANOTHER Claude session gets nothing"
+reset
+mk_agent Other sid-mine ok
+stamp Other claude sid-someone-else
+compact_run "$FIX/other.out" -- Other
+check "nothing is typed into it" "0" "$(nlines "$FIX/recv-Other.txt")"
+contains "it says why" "$(cat "$FIX/other.out")" "stamped as another session (sid-someone-else)"
+check "…exit non-zero" "1" "$(cat "$FIX/other.out.rc")"
+
+echo "a pane stamped Claude before its id was known (cl new) is cl's own"
+reset
+mk_agent Newish sid-new ok
+stamp Newish claude -
+compact_run "$FIX/newish.out" -- Newish
+contains "it is compacted" "$(cat "$FIX/newish.out")" "✓ Newish: compacted by /compact"
+
+echo "an unstamped pane whose process cannot be tied to the session gets nothing"
+reset
+mk_pane Loose sid-loose ok
+compact_run "$FIX/loose.out" -- Loose
+check "nothing is typed into it" "0" "$(nlines "$FIX/recv-Loose.txt")"
+contains "it says why" "$(cat "$FIX/loose.out")" "cannot verify that the tmux pane at Loose runs this session"
+contains "…and reports it" "$(cat "$FIX/loose.out")" "✗ Loose: its pane could not be verified as this session"
+check "…exit non-zero" "1" "$(cat "$FIX/loose.out.rc")"
+
+echo "an unstamped pane running the process tied to the session's id is allowed"
+reset
+# Another session first, so the tmux server's own argv is not this pane's
+# command line (the server keeps its first client's argv, --resume included).
+mk_agent First sid-first ok
+mk_pane Tied sid-tied ok 0.5 "--resume sid-tied"
+compact_run "$FIX/tied.out" -- Tied
+contains "it is compacted (a hand-run claude --resume of this id)" "$(cat "$FIX/tied.out")" "✓ Tied: compacted by /compact"
+check "…with exactly one /compact" "1" "$(typed_compact Tied)"
+echo "…but the same process in a DIFFERENT pane does not vouch for this one"
+reset
+mk_agent First sid-first ok
+mk_pane Elsewhere sid-else ok
+mk_pane Decoy sid-decoy silent 0.5 "--resume sid-else"
+compact_run "$FIX/else.out" -- Elsewhere
+check "nothing is typed into the pane at the name" "0" "$(nlines "$FIX/recv-Elsewhere.txt")"
+contains "…refused as unverified" "$(cat "$FIX/else.out")" "✗ Elsewhere: its pane could not be verified"
+
+echo "the pane is checked again before /compact"
+reset
+mk_agent Swap sid-swap ok 3
+( compact_run "$FIX/swap.out" -- Swap ) &
+swap_job=$!
+for (( w=0; w<80; w++ )); do [ -s "$FIX/recv-Swap.txt" ] && break; sleep 0.1; done
+check "the premise: the request arrived" "1" "$(nlines "$FIX/recv-Swap.txt")"
+stamp Swap codex "$CXID"
+wait "$swap_job"
+check "/compact is never typed into the re-stamped pane" "0" "$(typed_compact Swap)"
+contains "…it says why" "$(cat "$FIX/swap.out")" '"Swap": the tmux pane at Swap is stamped as a codex session — not typing into it'
+check "…exit non-zero" "1" "$(cat "$FIX/swap.out.rc")"
+check "…and its request file is cleared" "0" "$([ -e "$FIX/store/Swap.precompact" ] && echo 1 || echo 0)"
+
+# ── interrupted ──────────────────────────────────────────────────────────────
+echo "SIGTERM after dispatch removes this run's request, and only that"
+for variant in own newer; do
+  reset
+  mk_agent Interrupted sid-int silent
+  env -i HOME="$HOME" PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" CL_HANDOFF_DIR="$FIX/store" CL_HANDOFF_VERIFY=1 \
+    CL_COMPACT_TIMEOUT=60 bash "$CL" compact Interrupted > "$FIX/int.out" 2>&1 < /dev/null &
+  int_pid=$!
+  for (( w=0; w<80; w++ )); do [ -s "$FIX/recv-Interrupted.txt" ] && break; sleep 0.1; done
+  check "$variant: the premise: the request was written and typed" "1 1" \
+    "$([ -f "$FIX/store/Interrupted.precompact" ] && echo 1 || echo 0) $(nlines "$FIX/recv-Interrupted.txt")"
+  # A newer, concurrent run's request for the same session: not ours to delete.
+  [ "$variant" = "newer" ] && printf 'a newer request, cl-done:999\n' > "$FIX/store/Interrupted.precompact"
+  sleep 1.5
+  kill -TERM "$int_pid"; wait "$int_pid"; int_rc=$?
+  check "$variant: exits 143" "143" "$int_rc"
+  if [ "$variant" = "own" ]; then
+    check "own: its request file is removed" "0" "$([ -e "$FIX/store/Interrupted.precompact" ] && echo 1 || echo 0)"
+    contains "own: …and it says a typed request cannot be recalled" "$(cat "$FIX/int.out")" "cannot be recalled"
+  else
+    check "newer: the newer request is left alone" "a newer request, cl-done:999" "$(cat "$FIX/store/Interrupted.precompact" 2>/dev/null)"
+  fi
+  check "$variant: the session is still running" "1" "$(running Interrupted)"
+  check "$variant: nothing more was typed" "1" "$(nlines "$FIX/recv-Interrupted.txt")"
+done
 
 # ── dry run ──────────────────────────────────────────────────────────────────
 echo "--dry-run sends nothing"

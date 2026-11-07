@@ -450,6 +450,10 @@ not finish its turn; not compacted"), and no confirmed compaction after it is
 reported ("compaction not confirmed") without typing `/compact` again. Each
 session is reported with the path it took and the boundary's `preTokens` →
 `postTokens`. It writes nothing to the rotation log, which counts stops.
+Like a stop, it types only into a pane it can prove is that session (cl's own
+stamp, or the session's process running in it) and refuses anything else; an
+interrupted run removes its own pending requests, though a request already
+typed cannot be recalled.
 
 **Codex sessions** can be `resume` (their default, whatever the Claude default
 is) or `fresh`; the other two need a Claude session acting on itself, and are

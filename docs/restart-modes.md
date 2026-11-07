@@ -90,11 +90,25 @@ second sender is written.
    so it cannot depend on there being a workflow. The optional workflow text
    comes from `~/.config/claude-session/precompact-prompt.txt` (for example
    "update your session board"); by default there is none.
-3. **Wait for the token**, in parallel. It counts only in an **assistant text
-   block** after the baseline, in the last record, with no later `tool_use`,
+3. **Wait for the token**, in parallel. It counts only as the exact **last
+   line of the last text block** of the session's final reply (the assistant
+   records after the last user record, the last conversation record among
+   them), with **no `tool_use` anywhere in that reply** in any block order,
    and with the file size stable across two polls **(R)**. Reading the request
    file puts the nonce in a `tool_result`, which is a `user` record, so the
-   delivery check's matcher must not be reused for this.
+   delivery check's matcher must not be reused for this. The idle check of
+   step 6 uses the same rule for its token arm.
+
+   This is **cooperation, not a runtime signal**. Claude Code writes no
+   "turn ended" record, so the evidence is that the session did what it was
+   asked (the token last, no call outstanding) and then went quiet for two
+   polls. A session that writes the token early, or new input that starts a
+   turn between the check and the `/compact`, is outside what cl can see; the
+   gap is one poll, and typed input queues behind a running turn rather than
+   interrupting it.
+   **Before anything is typed** (the request, a retype of it, and again
+   before `/compact`) the pane is checked to be this session; see "Which pane
+   is this session" below. A pane that is not is given nothing.
 4. **Type `/compact`**, once, as soon as the token arrives. There is no busy
    check **(R)**: `claude_busy` stays true for minutes after a turn (the
    lingering helper child), so a gate would starve every session. The token is
@@ -128,6 +142,27 @@ case `mark_resume_only` guards against. Before resuming, a preflight checks
 that the transcript exists and that its last boundary is the one the stop
 recorded on the row. On tmux, `has-session` is polled about 5s after launch. A
 failure resumes plainly and is reported.
+
+### Which pane is this session
+
+A tmux session at the right name is not proof: names collide, and a name
+match is all liveness checks. So before typing, `compact_target_bound` asks
+for the binding retire_session's ownership rules rely on:
+
+| what sits at the name | result |
+|---|---|
+| a pane cl stamped Claude with this session's id | typed into |
+| a pane cl stamped Claude with no id yet (`cl new`) | typed into: cl's own |
+| a pane stamped as another agent, or another session's id | **refused**: an explicit mismatch, reported |
+| an unstamped pane whose active process is, or is an ancestor of, the process tied to this session's id (cl's launch record, Claude Code's registry, or a `--resume`/`--session-id` argv; never a fork) | typed into: a hand-run `claude --resume` of this session |
+| an unstamped pane with no such process in it | **refused**: cannot tell |
+| no tmux session: a process tied to the id, or cl's own launch record under the name (the tagged-iTerm route) | typed into |
+| no tmux session and neither | **refused**: cannot tell |
+
+A refused session in a stop **resumes as-is**: not a handoff, whose ask would
+go into the same pane. Under `cl compact` it is not compacted. Either way the
+reason (`foreign-pane`, `unverified-pane`) is logged or reported. The check
+covers typing only; what the stop later retires is retire_session's own rule.
 
 ### Timing
 
@@ -262,6 +297,13 @@ What is different:
   named, that is non-zero; under `--all` it is only noted. `--all` with no
   running Claude session exits 0. Naming no target, or names and `--all`
   together, is refused.
+- **Interrupted** (INT, TERM, HUP), it removes the pre-compact requests this
+  run wrote — only files holding this run's token, so a newer concurrent
+  request for the same session stays — restores the traps it replaced, and
+  exits 130/143/129. A pointer already typed cannot be recalled: a session that
+  has read it will still finish its turn and reply; it just gets no
+  `/compact`. A request file that cannot be removed is reported, never
+  silently left.
 - **The report** is one line per target: the path taken and the boundary
   record's `preTokens → postTokens`.
 - **No rotation log line.** The log is one row per stop and `cl rotate stats`
