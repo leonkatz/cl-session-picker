@@ -2778,9 +2778,13 @@ tmux_start_and_attach() { # t cwd cmd agent [sid] [display-name]
 # display name, the derivation collides ("A B" and "A.B" map to one identity),
 # and anything may already be sitting at it. A user option is proof — nothing
 # but this function writes it.
+#
+# The target is "=name:", not "=name": set-option and show-option take a pane
+# target, and tmux 3.8 resolves a bare "=name" there as no session at all, so
+# the stamp was never written or read and every cl session looked unowned.
 tmux_claim() {
-  tmux set-option -t "=$1" "@cl_agent" "$2" >/dev/null 2>&1 || return 0
-  tmux set-option -t "=$1" "@cl_sid" "${3:--}" >/dev/null 2>&1 || return 0
+  tmux set-option -t "=$1:" "@cl_agent" "$2" >/dev/null 2>&1 || return 0
+  tmux set-option -t "=$1:" "@cl_sid" "${3:--}" >/dev/null 2>&1 || return 0
   return 0
 }
 
@@ -2788,8 +2792,8 @@ tmux_claim() {
 # thread? Used on the KILL path only, where a wrong answer ends someone's work.
 tmux_owned() {
   local a s2
-  a=$(tmux show-option -qv -t "=$1" "@cl_agent" 2>/dev/null)
-  s2=$(tmux show-option -qv -t "=$1" "@cl_sid" 2>/dev/null)
+  a=$(tmux show-option -qv -t "=$1:" "@cl_agent" 2>/dev/null)
+  s2=$(tmux show-option -qv -t "=$1:" "@cl_sid" 2>/dev/null)
   [ "$a" = "$2" ] || return 1
   [ -n "${3:-}" ] || return 0
   [ -n "$s2" ] && [ "$s2" != "-" ] && [ "$s2" = "$3" ]
