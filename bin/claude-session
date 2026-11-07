@@ -63,6 +63,8 @@
 #                             #   docs/restart-modes.md. `mode "Name" <mode>`
 #                             #   sets one, `mode "Name"` shows it, `mode "Name"
 #                             #   clear` un-sets it, `mode --default <mode>`.
+#                             #   `mode --codex "Name" fresh|resume` for a
+#                             #   Codex session (resume unless set).
 #   claude-session rotate     # the older spelling of the same setting:
 #                             #   on = handoff, off = resume.
 #                             #   `rotate` / `rotate status` reports it (run
@@ -1097,7 +1099,8 @@ rotate_unlock() { store_unlock "$ROTATE"; }
 
 # ── RESTART MODES ──────────────────────────────────────────────────────────
 #
-# What `cl stop` / `cl start` do with a Claude session (docs/restart-modes.md):
+# What `cl stop` / `cl start` do with a Claude session (docs/restart-modes.md;
+# a Codex session can be resume or fresh — see CODEX MODES below):
 #
 #   compact-resume  pre-compact request, /compact, stop; resume with a first prompt
 #   handoff         ask for a handoff, stop; start fresh from it
@@ -1143,9 +1146,9 @@ rotate_default() {
 # rotate_for <name> [agent] -> compact-resume | handoff | fresh | resume | n/a
 #
 # n/a for Codex, and that is a fact about the mechanism rather than a setting:
-# compaction and a handoff both need a Claude session acting on itself, and a
-# Codex thread always resumes as itself in this version. Reporting "resume"
-# would imply the others could be chosen for it.
+# compaction and a handoff both need a Claude session acting on itself. A Codex
+# session's own mode (resume or fresh) is codex_mode_for's answer, kept out of
+# this one so no Claude pass can act on it.
 rotate_for() {
   local name="$1" agent="${2:-claude}" v
   [ "$agent" = "claude" ] || { printf 'n/a'; return 0; }
@@ -1163,12 +1166,66 @@ rotate_for() {
 # ambiguous without it — "off" could be the experiment or a one-off override.
 rotate_source() {
   local name="$1" agent="${2:-claude}" v
-  [ "$agent" = "claude" ] || { printf 'mechanism'; return 0; }
+  if [ "$agent" != "claude" ]; then
+    [ -n "$(_codex_mode_stored "$name")" ] && { printf 'session'; return 0; }
+    printf 'default'; return 0
+  fi
   if [ -r "$ROTATE" ] && command -v jq >/dev/null 2>&1; then
     v=$(jq -r --arg a "$agent" --arg n "$name" '.sessions[$a][$n] // empty' "$ROTATE" 2>/dev/null)
     _rotate_valid "$v" && { printf 'session'; return 0; }
   fi
   printf 'default'
+}
+
+# ── CODEX MODES ────────────────────────────────────────────────────────────
+#
+# A Codex session can be `resume` (the default) or `fresh`. The other two are
+# Claude mechanisms — a compaction and a handoff both need the session to act
+# on itself through a pane cl can type into and a transcript it can read — so
+# they are refused for Codex rather than stored and ignored.
+#
+# Kept apart from rotate_for, which still answers n/a for Codex: everything the
+# stop does with that answer (the handoff and compaction passes, the rotation
+# log) is about those Claude mechanisms, and a Codex row must stay out of all
+# of them. The Codex mode is read by its own callers only.
+#
+# There is no Codex default in the store: the stored default may be
+# compact-resume, which a Codex session cannot do, and following it would make
+# every Codex session's mode depend on a setting chosen for Claude ones.
+CL_CODEX_MODE_BUILTIN_DEFAULT="resume"
+_codex_mode_ok() { case "$1" in resume|fresh) return 0 ;; esac; return 1; }
+# _codex_mode_stored <name> -> resume | fresh | (nothing): the stored value,
+# only when it is one a Codex session can actually have.
+_codex_mode_stored() {
+  local v
+  [ -r "$ROTATE" ] && command -v jq >/dev/null 2>&1 || return 0
+  v=$(jq -r --arg n "$1" '.sessions.codex[$n] // empty' "$ROTATE" 2>/dev/null)
+  [ -n "$v" ] || return 0
+  v=$(_mode_normalize "$v") || return 0
+  _codex_mode_ok "$v" && printf '%s' "$v"
+  return 0
+}
+# codex_mode_for <name> -> resume | fresh. A stored value a Codex session cannot
+# have (a hand edit) is reported and the default used, as rotate_for does.
+codex_mode_for() {
+  local v raw
+  v=$(_codex_mode_stored "$1")
+  if [ -z "$v" ] && [ -r "$ROTATE" ] && command -v jq >/dev/null 2>&1; then
+    raw=$(jq -r --arg n "$1" '.sessions.codex[$n] // empty' "$ROTATE" 2>/dev/null)
+    [ -n "$raw" ] && printf 'claude-session: ignoring setting "%s" for Codex session "%s" in %s (a Codex session can be resume or fresh)\n' \
+      "$raw" "$1" "$ROTATE" >&2
+  fi
+  printf '%s' "${v:-$CL_CODEX_MODE_BUILTIN_DEFAULT}"
+}
+# codex_stop_mode <name> <no_handoff> <env_mode> -> resume | fresh: the mode a
+# stop carries out for a Codex session, with the same precedence as the Claude
+# one (stop_rotate_resolve). --no-handoff is "resume as-is" for every agent.
+# --require-handoff has nothing to say to a Codex session, so it does not
+# change one; neither does a CL_ROTATE that names a Claude-only mode.
+codex_stop_mode() {
+  [ "$2" = "1" ] && { printf 'resume'; return 0; }
+  _codex_mode_ok "$3" && { printf '%s' "$3"; return 0; }
+  codex_mode_for "$1"
 }
 
 # stop_rotate_resolve <name> <agent> <no_handoff> <require_handoff> <env_rotate>
@@ -1428,11 +1485,19 @@ _mode_set() {
     rotate_write "$mode" || return 1
     printf 'mode is now %s by default%s\n' "$mode" \
       "$( [ "$mode" = resume ] && printf ' — `cl stop` will not ask for handoffs' )"
+  elif [ "$agent" = "codex" ]; then
+    rotate_write "$mode" "$target" codex || return 1
+    printf 'mode is now %s for Codex session "%s" (the Codex default is %s)\n' "$mode" "$target" "$CL_CODEX_MODE_BUILTIN_DEFAULT"
   else
     rotate_write "$mode" "$target" "$agent" || return 1
     printf 'mode is now %s for "%s" (overriding the default, which is %s)\n' "$mode" "$target" "$(rotate_default)"
   fi
   return 0
+}
+
+# _codex_mode_refuse <mode>: the one wording for a mode Codex cannot have.
+_codex_mode_refuse() {
+  printf 'claude-session: %s is a Claude-only mode — a Codex session can be resume or fresh\n' "$1" >&2
 }
 
 # do_mode: `cl mode` — the restart mode per session.
@@ -1443,21 +1508,27 @@ _mode_set() {
 #   cl mode --default <mode>      set the default
 #
 # Modes: compact-resume (or compact), handoff, fresh, resume — and the legacy
-# on/off, which mean handoff/resume. Codex sessions always resume in this
-# version, so `--codex` is refused rather than stored and ignored.
+# on/off, which mean handoff/resume. `--codex` names a Codex session, which
+# can be resume or fresh; the Claude-only modes are refused for it, not stored
+# and ignored, and so is --default (a Codex session's default is always resume).
 do_mode() {
   local agent="claude" name="" mode=""
   while :; do
     case "${1:-}" in
-      --codex)  echo "claude-session: a Codex session always resumes as itself in this version — there is no mode to set" >&2; return 1 ;;
-      --claude) shift ;;
+      --codex)  agent="codex"; shift ;;
+      --claude) agent="claude"; shift ;;
       --default)
         shift
+        if [ "$agent" = "codex" ]; then
+          echo "claude-session: there is no Codex default to set — a Codex session resumes unless it is set to fresh (cl mode --codex \"Name\" fresh)" >&2
+          return 1
+        fi
         [ -n "${1:-}" ] || { echo 'usage: cl mode --default <compact-resume|handoff|fresh|resume>' >&2; return 1; }
         _mode_normalize "$1" >/dev/null || { echo "claude-session: not a mode: '$1' (compact-resume|handoff|fresh|resume)" >&2; return 1; }
         _mode_set "$(_mode_normalize "$1")"; return $? ;;
       -h|--help)
         printf 'usage: cl mode [<name> [compact-resume|handoff|fresh|resume|clear]] | cl mode --default <mode>\n'
+        printf '       cl mode --codex <name> [resume|fresh|clear]\n'
         return 0 ;;
       *) break ;;
     esac
@@ -1465,15 +1536,26 @@ do_mode() {
   name="${1:-}"; mode="${2:-}"
   [ -n "$name" ] || { do_rotate status; return $?; }
   if [ -z "$mode" ]; then
-    printf '"%s": %s (%s)\n' "$name" "$(rotate_for "$name" "$agent")" "$(rotate_source "$name" "$agent")"
+    if [ "$agent" = "codex" ]; then
+      printf '"%s" [codex]: %s (%s)\n' "$name" "$(codex_mode_for "$name")" "$(rotate_source "$name" codex)"
+    else
+      printf '"%s": %s (%s)\n' "$name" "$(rotate_for "$name" "$agent")" "$(rotate_source "$name" "$agent")"
+    fi
     return 0
   fi
   if [ "$mode" = "clear" ]; then
     rotate_write clear "$name" "$agent" || return 1
-    printf '"%s" follows the default again (%s)\n' "$name" "$(rotate_default)"
+    if [ "$agent" = "codex" ]; then
+      printf 'Codex session "%s" follows the Codex default again (%s)\n' "$name" "$CL_CODEX_MODE_BUILTIN_DEFAULT"
+    else
+      printf '"%s" follows the default again (%s)\n' "$name" "$(rotate_default)"
+    fi
     return 0
   fi
   _mode_normalize "$mode" >/dev/null || { echo "claude-session: not a mode: '$mode' (compact-resume|handoff|fresh|resume)" >&2; return 1; }
+  if [ "$agent" = "codex" ] && ! _codex_mode_ok "$(_mode_normalize "$mode")"; then
+    _codex_mode_refuse "$(_mode_normalize "$mode")"; return 1
+  fi
   _mode_set "$(_mode_normalize "$mode")" "$name" "$agent"
 }
 
@@ -1485,7 +1567,14 @@ do_rotate() {
       shift
       if [ -n "${1:-}" ]; then
         case "$1" in
-          --codex) echo "claude-session: rotation is a Claude mechanism — a Codex thread cannot write a handoff" >&2; return 1 ;;
+          # `off` is resume, which a Codex session can have; `on` is a
+          # handoff, which it cannot.
+          --codex)
+            if [ "$sub" = "on" ]; then
+              echo "claude-session: rotation is a Claude mechanism — a Codex thread cannot write a handoff" >&2; return 1
+            fi
+            agent="codex"; shift
+            [ -n "${1:-}" ] || { echo "claude-session: rotate off --codex needs a session name — there is no Codex default to set" >&2; return 1; } ;;
           --claude) shift ;;
         esac
       fi
@@ -1494,10 +1583,16 @@ do_rotate() {
       _mode_set "$(_mode_normalize "$sub")" "$target" "$agent"
       return $? ;;
     clear)
-      shift; target="${1:-}"
+      shift
+      case "${1:-}" in --codex) agent="codex"; shift ;; --claude) shift ;; esac
+      target="${1:-}"
       [ -n "$target" ] || { echo "claude-session: rotate clear needs a session name" >&2; return 1; }
       rotate_write clear "$target" "$agent" || return 1
-      printf '"%s" follows the default again (%s)\n' "$target" "$(rotate_default)"
+      if [ "$agent" = "codex" ]; then
+        printf 'Codex session "%s" follows the Codex default again (%s)\n' "$target" "$CL_CODEX_MODE_BUILTIN_DEFAULT"
+      else
+        printf '"%s" follows the default again (%s)\n' "$target" "$(rotate_default)"
+      fi
       return 0 ;;
     stats) shift; rotate_stats "$@"; return $? ;;
     status) : ;;
@@ -1524,7 +1619,10 @@ do_rotate() {
     while IFS=$'\t' read -r oa on ov; do
       [ -n "$on" ] || continue
       [ "$shown" = "0" ] && { printf 'per-session overrides:\n'; shown=1; }
-      if _rotate_valid "$ov"; then
+      if [ "$oa" = "codex" ] && ! _codex_mode_ok "$(_mode_normalize "$ov" 2>/dev/null)"; then
+        printf '  %s [%s]: ignoring setting "%s" — a Codex session can be resume or fresh, so it resumes\n' \
+          "$on" "$oa" "$ov"
+      elif _rotate_valid "$ov"; then
         printf '  %s [%s]: %s\n' "$on" "$oa" "$(_mode_normalize "$ov")"
       else
         printf '  %s [%s]: ignoring unreadable setting "%s" — follows the default (%s)\n' \
@@ -1771,7 +1869,7 @@ resume_cmd() {
   [ -n "${3:-}" ] && mf=$(model_flag "$1" "$(model_for "$3" "$1")")
   [ -n "${4:-}" ] && fp=" $(printf '%q' "$4")"
   case "$1" in
-    codex) printf '%s %s resume %s%s' "$(codex_cmd)" "$(codex_args)" "$(printf '%q' "$2")" "$mf" ;;
+    codex) printf '%s %s resume %s%s%s' "$(codex_cmd)" "$(codex_args)" "$(printf '%q' "$2")" "$mf" "$fp" ;;
     *)     printf '%s --resume %s --dangerously-skip-permissions%s%s' "$(claude_cmd)" "$(printf '%q' "$2")" "$mf" "$fp" ;;
   esac
 }
@@ -1786,6 +1884,232 @@ build_compact_resume_prompt() {
     return 0
   fi
   printf 'You were stopped and restarted by cl after compacting your context. Carry on where you left off.'
+}
+
+# ── CODEX `fresh` (docs/restart-modes.md, "fresh, for Codex") ───────────────
+#
+# Launching a bare `codex` would give cl no thread id, and every ownership
+# mechanism keys on one: registered_pid and tmux_owned would reject the new
+# client, the next `cl stop` would call it stopped while it ran, and the
+# coordination election would keep the old thread. So the new thread is made
+# FIRST, through `codex app-server`, and the ordinary resume path then runs it
+# by id like any other:
+#
+#   1. thread/start → the new id; thread/name/set to the session's name; the
+#      name read back with thread/read, so a set that did not take is caught
+#   2. `codex archive <old>` BEFORE anything re-arms, so nothing can elect the
+#      old thread again (discovery reads sessions/ only, and archive moves the
+#      rollout out of it)
+#   3. the restart row moved onto the new id
+#   4. the caller runs `codex resume <new> "<first prompt>"`; the first turn
+#      fires the repo's SessionStart hook, which elects the new thread
+#
+# A failure anywhere in 1-3 undoes what was done — the new thread archived,
+# the old one unarchived — and the caller resumes the old thread plainly. The
+# row never names a thread that is not there.
+
+# The first message of a fresh Codex thread. It exists because a turn is what
+# fires SessionStart; the text itself is yours to change, in a file.
+CL_CODEX_FRESH_PROMPT_FILE="${CL_CODEX_FRESH_PROMPT_FILE:-$HOME/.config/claude-session/codex-fresh-prompt.txt}"
+build_codex_fresh_prompt() {
+  local tmpl
+  if tmpl=$(read_prompt_file "$CL_CODEX_FRESH_PROMPT_FILE"); then
+    printf '%s' "$tmpl" | _prompt_flatten
+    return 0
+  fi
+  printf 'cl started you as a new thread under this session'"'"'s name; the previous thread was archived. Say you are ready, then wait for instructions.'
+}
+
+# Each app-server request is bounded: a server that never answers must cost a
+# start this many seconds and then a plain resume, never a hang.
+CL_CODEX_RPC_TIMEOUT="${CL_CODEX_RPC_TIMEOUT:-20}"
+
+# _crpc_open <cwd>: start `codex app-server` (JSON-RPC over stdio) with fd 7 as
+# its stdin, through a FIFO, because each request depends on the last answer
+# and bash 3.2 has no coproc. Sets _CRPC_DIR and _CRPC_PID.
+#
+# The FIFO is opened read-WRITE: that never blocks, and since this shell then
+# holds a reader too, a server that dies early makes a write fail rather than
+# raise SIGPIPE and take cl down with it. The server is started first so it
+# does not inherit fd 7 — it would then never see EOF when this end closes.
+# Its stdout and stderr go to files: inherited, they would keep a $( ) caller
+# waiting for as long as the server lived.
+_crpc_open() {
+  _CRPC_DIR=$(mktemp -d "${TMPDIR:-/tmp}/clrpc.XXXXXX" 2>/dev/null) || return 1
+  if ! mkfifo "$_CRPC_DIR/in" 2>/dev/null; then rm -rf "$_CRPC_DIR"; return 1; fi
+  : > "$_CRPC_DIR/out"
+  ( cd "$1" 2>/dev/null || cd / ; eval "exec $(codex_cmd) app-server" ) \
+    < "$_CRPC_DIR/in" > "$_CRPC_DIR/out" 2> "$_CRPC_DIR/err" &
+  _CRPC_PID=$!
+  exec 7<>"$_CRPC_DIR/in"
+}
+# _crpc_send <json>: one message, one line.
+_crpc_send() { printf '%s\n' "$1" >&7 2>/dev/null; }
+# _crpc_call <id> <method> <params-json>: send a request and print its result.
+# 1 on an error reply, a dead server, or no answer in CL_CODEX_RPC_TIMEOUT. The
+# reason goes to a file, read back with _crpc_why: callers run this in $( ),
+# where a variable set here would be lost with the subshell.
+_crpc_why() { cat "$_CRPC_DIR/why" 2>/dev/null; }
+_crpc_fail() { printf '%s' "$1" > "$_CRPC_DIR/why" 2>/dev/null; return 1; }
+_crpc_call() {
+  local id="$1" req line ticks=0 limit=$(( CL_CODEX_RPC_TIMEOUT * 10 ))
+  rm -f "$_CRPC_DIR/why" 2>/dev/null
+  req=$(jq -cn --argjson id "$id" --arg m "$2" --argjson p "$3" '{jsonrpc:"2.0", id:$id, method:$m, params:$p}') \
+    || { _crpc_fail "could not build the $2 request"; return 1; }
+  _crpc_send "$req" || { _crpc_fail "codex app-server is not accepting requests"; return 1; }
+  while [ "$ticks" -lt "$limit" ]; do
+    # Line by line with fromjson?, so a half-written last line is skipped
+    # rather than failing the whole read.
+    line=$(jq -R -c --argjson id "$id" 'fromjson? | select(type == "object" and .id == $id)' \
+             "$_CRPC_DIR/out" 2>/dev/null | head -1)
+    if [ -n "$line" ]; then
+      if printf '%s' "$line" | jq -e 'has("error")' >/dev/null 2>&1; then
+        _crpc_fail "$2 failed: $(printf '%s' "$line" | jq -r '.error.message // .error' 2>/dev/null)"
+        return 1
+      fi
+      printf '%s' "$line" | jq -c '.result // {}'
+      return 0
+    fi
+    if ! kill -0 "$_CRPC_PID" 2>/dev/null; then
+      _crpc_fail "codex app-server exited during $2$(head -c 300 "$_CRPC_DIR/err" 2>/dev/null | tr '\n' ' ' | sed 's/^./: &/')"
+      return 1
+    fi
+    sleep 0.1; ticks=$((ticks+1))
+  done
+  _crpc_fail "no answer to $2 within ${CL_CODEX_RPC_TIMEOUT}s"
+  return 1
+}
+# _crpc_close: EOF to the server, a moment to exit on its own, then no choice.
+_crpc_close() {
+  local w=0
+  exec 7>&-
+  if [ -n "${_CRPC_PID:-}" ]; then
+    while kill -0 "$_CRPC_PID" 2>/dev/null && [ "$w" -lt 30 ]; do sleep 0.1; w=$((w+1)); done
+    kill "$_CRPC_PID" 2>/dev/null
+    wait "$_CRPC_PID" 2>/dev/null
+  fi
+  [ -n "${_CRPC_DIR:-}" ] && rm -rf "$_CRPC_DIR"
+  _CRPC_PID=""; _CRPC_DIR=""
+  return 0
+}
+
+# _codex_rollout_active <id>: the thread's rollout is under sessions/, which is
+# exactly what discovery (and so the election's view of the name) reads.
+_codex_rollout_active() {
+  [ -n "$(find "$CODEX_SESSIONS" -type f -name "rollout-*-${1}.jsonl" 2>/dev/null | head -1)" ]
+}
+# _codex_archive / _codex_unarchive <id>: bounded, and judged by where the
+# rollout ended up as well as by the exit code — "archived" means discovery can
+# no longer see it.
+_codex_archive() {
+  run_bounded "$CL_CODEX_RPC_TIMEOUT" "$(agent_cmd_word codex)" archive "$1" >/dev/null 2>&1 || return 1
+  ! _codex_rollout_active "$1"
+}
+_codex_unarchive() {
+  run_bounded "$CL_CODEX_RPC_TIMEOUT" "$(agent_cmd_word codex)" unarchive "$1" >/dev/null 2>&1 || return 1
+  _codex_rollout_active "$1"
+}
+
+# _codex_row_rewrite <name> <old-id> <new-id>: move the restart row onto the new
+# thread (spec step 3), under the row lock ack_state_row takes. The mode becomes
+# resume and the old id is kept as fresh_from: if this launch is refused and
+# the row stays for a later start, that start resumes the new thread rather
+# than making yet another one. No row naming the old id is not a failure —
+# nothing then points at a thread about to be gone.
+_codex_row_rewrite() {
+  local name="$1" old="$2" new="$3" tmp rc=0
+  [ -f "$STATE" ] || return 0
+  [ "$(jq --arg n "$name" --arg s "$old" '[.[] | select((.agent // "claude") == "codex" and .name == $n and .sid == $s)] | length' "$STATE" 2>/dev/null)" = "0" ] && return 0
+  _state_row_lock "$name" || return 1
+  tmp="$STATE.fresh.$$"
+  if jq --arg n "$name" --arg s "$old" --arg new "$new" \
+       'map(if (.agent // "claude") == "codex" and .name == $n and .sid == $s
+            then .sid = $new | .mode = "resume" | .fresh_from = $s else . end)' \
+       "$STATE" > "$tmp" 2>/dev/null && [ -s "$tmp" ] && mv "$tmp" "$STATE" 2>/dev/null; then
+    # Read back: the proof is the file, not the exit codes on the way to it.
+    [ "$(jq --arg n "$name" --arg s "$new" '[.[] | select((.agent // "claude") == "codex" and .name == $n and .sid == $s)] | length' "$STATE" 2>/dev/null)" = "1" ] || rc=1
+  else
+    rc=1
+  fi
+  rm -f "$tmp" 2>/dev/null
+  _state_row_unlock
+  return "$rc"
+}
+
+# codex_fresh_thread <name> <old-id> <cwd> -> the new thread id on stdout.
+# Steps 1-3 above. Non-zero when the caller must resume <old-id> plainly; by
+# then everything this did has been undone, or it says exactly what was not.
+codex_fresh_thread() {
+  local name="$1" old="$2" cwd="$3" res new got why=""
+  command -v jq >/dev/null 2>&1 || { printf '⚠ "%s": a fresh Codex thread needs jq — resuming it plainly\n' "$name" >&2; return 1; }
+  valid_codex_sid "$old" || { printf '⚠ "%s": "%s" is not a Codex thread id — resuming it plainly\n' "$name" "$old" >&2; return 1; }
+  # Never archive a thread something is still working. `cl start` checks
+  # liveness before it gets here; the tab path runs later, so it looks again.
+  if [ -n "$(session_pid "$old" codex)" ] || [ -n "$(registered_pid "$name" codex "$old")" ]; then
+    printf '⚠ "%s": its thread is still running here — not replacing it; resuming it plainly\n' "$name" >&2
+    return 1
+  fi
+  _codex_rollout_active "$old" || {
+    printf '⚠ "%s": thread %s is not in %s (archived or moved?) — not replacing it\n' "$name" "$old" "$CODEX_SESSIONS" >&2
+    return 1
+  }
+  # ── 1. a new thread, named, and the name read back ──
+  if ! _crpc_open "$cwd"; then
+    printf '⚠ "%s": could not start codex app-server — resuming it plainly\n' "$name" >&2
+    return 1
+  fi
+  new=""
+  if ! res=$(_crpc_call 1 initialize '{"clientInfo":{"name":"cl","version":"1"}}'); then
+    why=$(_crpc_why)
+  else
+    _crpc_send '{"jsonrpc":"2.0","method":"initialized"}'
+    if ! res=$(_crpc_call 2 thread/start "$(jq -cn --arg c "$cwd" '{cwd:$c}')"); then
+      why=$(_crpc_why)
+    else
+      new=$(printf '%s' "$res" | jq -r '.thread.id // empty' 2>/dev/null)
+      if ! valid_codex_sid "$new"; then
+        why="thread/start returned no thread id"; new=""
+      elif ! _crpc_call 3 thread/name/set "$(jq -cn --arg t "$new" --arg n "$name" '{threadId:$t, name:$n}')" >/dev/null; then
+        why=$(_crpc_why)
+      elif ! res=$(_crpc_call 4 thread/read "$(jq -cn --arg t "$new" '{threadId:$t}')"); then
+        why=$(_crpc_why)
+      else
+        got=$(printf '%s' "$res" | jq -r '.thread.name // empty' 2>/dev/null)
+        [ "$got" = "$name" ] || why="the new thread's name reads back as \"$got\", not \"$name\""
+      fi
+    fi
+  fi
+  _crpc_close
+  # Discovery has to find the new thread by name, or `cl --codex "<name>"` and
+  # the listing would not.
+  [ -z "$why" ] && [ -n "$new" ] && ! _codex_rollout_active "$new" && why="the new thread has no rollout in $CODEX_SESSIONS"
+  if [ -n "$why" ]; then
+    printf '⚠ "%s": could not make a fresh Codex thread (%s) — resuming it plainly\n' "$name" "$why" >&2
+    [ -n "$new" ] && _codex_fresh_discard "$name" "$new"
+    return 1
+  fi
+  # ── 2. the old thread archived, before anything can elect it ──
+  if ! _codex_archive "$old"; then
+    printf '⚠ "%s": could not archive its old thread %s — resuming it plainly\n' "$name" "$old" >&2
+    _codex_fresh_discard "$name" "$new"
+    return 1
+  fi
+  # ── 3. the row onto the new thread ──
+  if ! _codex_row_rewrite "$name" "$old" "$new"; then
+    printf '⚠ "%s": could not move its restart row onto the new thread — resuming the old one plainly\n' "$name" >&2
+    _codex_unarchive "$old" \
+      || printf '⚠ "%s": and its old thread %s could not be unarchived — run: codex unarchive %s\n' "$name" "$old" "$old" >&2
+    _codex_fresh_discard "$name" "$new"
+    return 1
+  fi
+  printf '%s' "$new"
+}
+# _codex_fresh_discard <name> <id>: archive a new thread that will not be used,
+# so two threads never share the name — discovery is newest-wins, and an empty
+# one would win.
+_codex_fresh_discard() {
+  _codex_archive "$2" \
+    || printf '⚠ "%s": the unused new thread %s is still listed under this name — run: codex archive %s\n' "$1" "$2" "$2" >&2
 }
 
 # CL_SESSION_NAME tells `cl handoff`, run INSIDE a session, which session it is
@@ -2125,53 +2449,12 @@ acquire_launch() {
   return 0
 }
 
-# ack_state_row <name> <agent> <sid>: remove this session's row from STATE, as
-# the ACKNOWLEDGEMENT that a launch really happened.
-#
-# ── WHY THE CHILD DOES THIS AND NOT `cl start` ───────────────────────────────
-#
-# On the iTerm/no-tmux path `cl start` does not launch anything: it writes
-# `cl "<name>"` into a new tab and that tab launches the agent. So the parent
-# cannot know whether a launch succeeded — "AppleScript accepted the text" is
-# not "an agent started" — and consuming the row there loses the session
-# whenever a tab never runs.
-#
-# Keeping the row instead is not a fix on its own, which is the defect this
-# function closes (found in Codex review, 2026-09-29). `cl start` also keeps the
-# row for a session it skips as already live, so "keep it and let a later start
-# sort it out" has no exit: skipping is another keep. The row would survive
-# forever, turning a one-shot stop snapshot into a permanent desired-state list
-# that resurrects sessions the user deliberately closed.
-#
-# The missing operation is an acknowledgement from the process that actually
-# knows. acquire_launch granting ownership is that proof: it is the gate that
-# refuses a second agent on one name, and this shell is about to exec the agent
-# with the same pid and start time the record names. Rotation already commits
-# its handoff claim at exactly this point, so state and handoff are acknowledged
-# together, under the same rule.
-#
-# ── WHY IT LOCKS ─────────────────────────────────────────────────────────────
-#
-# `cl start` opens every tab at once, so N children reach this concurrently.
-# Unserialised read-modify-write on one JSON file silently loses removals: two
-# children each read the same array, each drop their own row, and the second
-# write restores the first's. Same symlink-claim discipline as acquire_launch —
-# atomic `ln -s` carrying the owner's identity, no automatic breaking of a lock
-# whose holder is still alive, bounded waiting.
-#
-# Every failure leaves the row in place. A stale row costs one duplicate tab on
-# the next start; deleting the wrong row costs a session.
-ack_state_row() {
-  local name="$1" agent="${2:-claude}" sid="${3:-}" lock mine tries=0 envfail=0 holder hpid hstart tmp
-  # Nothing to acknowledge: no snapshot, or no jq to rewrite it with. Neither is
-  # an error — a launch outside a stop/start cycle has no row at all.
-  [ -f "$STATE" ] || return 0
-  command -v jq >/dev/null 2>&1 || return 0
-  # Without a thread id this cannot tell one GENERATION of a name from another,
-  # and names are not unique over time. The row it would delete might belong to a
-  # session that was never started, so it deletes nothing. (Codex review,
-  # 2026-09-29 — see the sid qualification below.)
-  case "$sid" in ''|'-') return 0 ;; esac
+# _state_row_lock <name>: take the restart-row lock for a rewrite of STATE,
+# setting _ROW_LOCK and _ROW_LOCK_MINE. Split out of ack_state_row so the one
+# other row rewrite that must not race it — a Codex `fresh` start moving a row
+# onto its new thread — takes the same lock rather than a second one.
+_state_row_lock() {
+  local name="$1" lock mine tries=0 envfail=0 holder hpid hstart
   lock="${STATE}.acklock"
   mine=$(claim_token)
   if [ -e "$lock" ] && [ ! -L "$lock" ]; then
@@ -2213,6 +2496,64 @@ ack_state_row() {
     fi
     sleep 0.05
   done
+
+  _ROW_LOCK="$lock"; _ROW_LOCK_MINE="$mine"
+  return 0
+}
+_state_row_unlock() {
+  [ "$(readlink "$_ROW_LOCK" 2>/dev/null)" = "$_ROW_LOCK_MINE" ] && rm -f "$_ROW_LOCK" 2>/dev/null
+  return 0
+}
+
+# ack_state_row <name> <agent> <sid>: remove this session's row from STATE, as
+# the ACKNOWLEDGEMENT that a launch really happened.
+#
+# ── WHY THE CHILD DOES THIS AND NOT `cl start` ───────────────────────────────
+#
+# On the iTerm/no-tmux path `cl start` does not launch anything: it writes
+# `cl "<name>"` into a new tab and that tab launches the agent. So the parent
+# cannot know whether a launch succeeded — "AppleScript accepted the text" is
+# not "an agent started" — and consuming the row there loses the session
+# whenever a tab never runs.
+#
+# Keeping the row instead is not a fix on its own, which is the defect this
+# function closes (found in Codex review, 2026-09-29). `cl start` also keeps the
+# row for a session it skips as already live, so "keep it and let a later start
+# sort it out" has no exit: skipping is another keep. The row would survive
+# forever, turning a one-shot stop snapshot into a permanent desired-state list
+# that resurrects sessions the user deliberately closed.
+#
+# The missing operation is an acknowledgement from the process that actually
+# knows. acquire_launch granting ownership is that proof: it is the gate that
+# refuses a second agent on one name, and this shell is about to exec the agent
+# with the same pid and start time the record names. Rotation already commits
+# its handoff claim at exactly this point, so state and handoff are acknowledged
+# together, under the same rule.
+#
+# ── WHY IT LOCKS ─────────────────────────────────────────────────────────────
+#
+# `cl start` opens every tab at once, so N children reach this concurrently.
+# Unserialised read-modify-write on one JSON file silently loses removals: two
+# children each read the same array, each drop their own row, and the second
+# write restores the first's. Same symlink-claim discipline as acquire_launch —
+# atomic `ln -s` carrying the owner's identity, no automatic breaking of a lock
+# whose holder is still alive, bounded waiting.
+#
+# Every failure leaves the row in place. A stale row costs one duplicate tab on
+# the next start; deleting the wrong row costs a session.
+ack_state_row() {
+  local name="$1" agent="${2:-claude}" sid="${3:-}" lock mine tmp
+  # Nothing to acknowledge: no snapshot, or no jq to rewrite it with. Neither is
+  # an error — a launch outside a stop/start cycle has no row at all.
+  [ -f "$STATE" ] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  # Without a thread id this cannot tell one GENERATION of a name from another,
+  # and names are not unique over time. The row it would delete might belong to a
+  # session that was never started, so it deletes nothing. (Codex review,
+  # 2026-09-29 — see the sid qualification below.)
+  case "$sid" in ''|'-') return 0 ;; esac
+  _state_row_lock "$name" || return 1
+  lock="$_ROW_LOCK"; mine="$_ROW_LOCK_MINE"
 
   tmp="$STATE.ack.$$"
   # Matched on agent AND name AND sid. Agent qualification alone stops a
@@ -4345,6 +4686,10 @@ do_stop() {
   #   _h_cbid/_h_cpre/_h_cpost  the confirming boundary's uuid and token figures
   #   _h_cidle  1 once the transcript proves the session at rest since then
   local -a _h_taken _h_why _h_cbase _h_ctok _h_cstate _h_cauto _h_cmark _h_clastsz _h_cbid _h_cpre _h_cpost _h_cidle
+  # _h_cmode  a Codex session's mode for this stop (resume|fresh); empty for
+  #           Claude, whose mode is _h_rot. Kept apart so a Codex row stays out
+  #           of every handoff, compaction and log decision _h_rot drives.
+  local -a _h_cmode
   # SEPARATE COUNTERS, because one number cannot answer three questions and the
   # transcript was mixing them (Codex, PR #19): _eligible is every rotation-on
   # session, _manual those already answered by hand, _to_ask what will actually
@@ -4403,6 +4748,8 @@ do_stop() {
     _h_taken[$_n]=""; _h_why[$_n]=""; _h_cbase[$_n]=""; _h_ctok[$_n]=""; _h_cstate[$_n]=""
     _h_cauto[$_n]=0; _h_cmark[$_n]=""; _h_clastsz[$_n]=""; _h_cbid[$_n]=""; _h_cpre[$_n]=""; _h_cpost[$_n]=""
     _h_cidle[$_n]=0
+    _h_cmode[$_n]=""
+    [ "$agent" = "codex" ] && _h_cmode[$_n]=$(codex_stop_mode "$name" "$no_handoff" "$env_rotate")
     _n=$((_n+1))
   done <<< "$_rows"
   # Said once, so a session the operator expected back is not a silent surprise.
@@ -4668,7 +5015,11 @@ do_stop() {
     name="${_h_name[$i]}"; sid_i="${_h_sid[$i]}"; t="${_h_tmux[$i]}"
     agent="${_h_agent[$i]}"; sess_rotate="${_h_rot[$i]}"; _idle=0
     if [ -n "$dry_run" ]; then
-      printf '[dry-run] would evaluate and, if not left running, kill "%s" (rotation %s)\n' "$name" "$sess_rotate" >&2
+      if [ "$agent" = "codex" ]; then
+        printf '[dry-run] would evaluate and, if not left running, kill "%s" (codex, mode %s)\n' "$name" "${_h_cmode[$i]}" >&2
+      else
+        printf '[dry-run] would evaluate and, if not left running, kill "%s" (rotation %s)\n' "$name" "$sess_rotate" >&2
+      fi
       continue
     fi
     if [ "$sess_rotate" != "n/a" ]; then
@@ -4761,6 +5112,8 @@ do_stop() {
     # (A session left running is not recorded: its stop carried nothing out.)
     if [ "$agent" = "claude" ] && [ "${_h_taken[$i]}" != "kept" ]; then
       mode_rows="${mode_rows}${agent}"$'\t'"${name}"$'\t'"${_h_taken[$i]}"$'\t'"${_h_cbid[$i]:--}"$'\n'
+    elif [ "$agent" = "codex" ] && [ -n "${_h_cmode[$i]}" ]; then
+      mode_rows="${mode_rows}${agent}"$'\t'"${name}"$'\t'"${_h_cmode[$i]}"$'\t-\n'
     fi
     [ "$sess_rotate" != "n/a" ] && _log_session "$i"
     # retire_session covers both branches (tmux-hosted and bare process)
@@ -4778,6 +5131,11 @@ do_stop() {
       3)   unresolved_names="${unresolved_names}${name}"$'\n' ;;
       1|2) left_names="${left_names}${name}"$'\n' ;;
     esac
+    # Said here, at the moment it becomes true, because a fresh Codex session
+    # does not come back as the thread that was just stopped.
+    if [ "$rrc" = "0" ] && [ "${_h_cmode[$i]}" = "fresh" ]; then
+      printf '✦ "%s" (codex) is fresh: `cl start` begins a new thread under its name and archives this one\n' "$name" >&2
+    fi
   done
 
   [ -n "$dry_run" ] && return 0
@@ -5006,7 +5364,7 @@ do_start() {
   # consumed handoff through to the tab, and a Codex row has to carry --codex —
   # so the command is built in the same place those are decided, rather than
   # reconstructed from the name later. (It also means STATE is read once.)
-  local name sid cwd agent ronly rmode rbid t i=0 claim cmd rsid_env kept="" cfresh ccompact
+  local name sid cwd agent ronly rmode rbid t i=0 claim cmd rsid_env kept="" cfresh ccompact cxfresh osid nsid
   local -a tab_cmds=() _cr_t=() _cr_name=() _cr_sid=() _cr_cwd=()
   while IFS=$'\t' read -r name sid cwd agent ronly rmode rbid; do
     agent="${agent:-claude}"
@@ -5034,7 +5392,14 @@ do_start() {
       # self-correcting: if the tab worked, the session is live and the next
       # `cl start` skips it; if it did not, the row and the handoff are both
       # still there and a re-run does the right thing.
-      if [ "$agent" != "claude" ]; then
+      if [ "$agent" != "claude" ] && [ "$rmode" = "fresh" ]; then
+        # The tab makes the new thread, as it does the launch: if the tab never
+        # runs, nothing was archived and the row still names the old thread.
+        # The old id travels with it, so a tab that runs late, after the name
+        # has moved on, does not replace a thread nobody stopped.
+        tab_cmds+=("$(tab_cmd "$agent" "$name") --restart-mode fresh $(printf '%q' "$sid")")
+        printf '✦ %s will start as a new Codex thread\n' "$name"
+      elif [ "$agent" != "claude" ]; then
         tab_cmds+=("$(tab_cmd "$agent" "$name")")
       elif [ "$rmode" = "compact-resume" ]; then
         # The MODE travels in the tab command, as --rotate-from does: the tab
@@ -5071,9 +5436,19 @@ do_start() {
     # tmux path: `tmux new-session -d` either creates the session or it does
     # not, and this process sees which — so the claim can be committed or
     # rolled back right here, against real acceptance.
-    claim=""; rsid_env=""; cfresh=0; ccompact=0
+    claim=""; rsid_env=""; cfresh=0; ccompact=0; cxfresh=0; osid="$sid"
     if [ "$agent" != "claude" ]; then
-      rsid_env="$sid"; cmd=$(resume_cmd "$agent" "$sid" "$name")
+      # fresh: a NEW thread made, named and swapped in first (steps 1-3), then
+      # resumed by id like any other, with a first prompt so its first turn
+      # fires SessionStart. Any failure there has been undone, and this is the
+      # plain resume of the old thread.
+      if [ "$rmode" = "fresh" ] && nsid=$(codex_fresh_thread "$name" "$sid" "$cwd"); then
+        sid="$nsid"; cxfresh=1
+        cmd=$(resume_cmd "$agent" "$sid" "$name" "$(build_codex_fresh_prompt)")
+      else
+        cmd=$(resume_cmd "$agent" "$sid" "$name")
+      fi
+      rsid_env="$sid"
     elif [ "$rmode" = "compact-resume" ]; then
       # Never a rotation, whatever the preflight says: no handoff was asked for
       # this cycle, so a handoff in the store predates it — the stale case
@@ -5113,6 +5488,9 @@ do_start() {
       elif [ "$cfresh" = "1" ]; then
         record_fresh_history "$name" "$sid" "$cwd"
         printf '✦ prepared %s as a new session  (%s)\n' "$name" "$cwd"
+      elif [ "$cxfresh" = "1" ]; then
+        record_fresh_history "$name" "$osid" "$cwd" codex
+        printf '✦ prepared %s as a new Codex thread %s; the old one is archived  (%s)\n' "$name" "$sid" "$cwd"
       elif [ "$ccompact" = "1" ]; then
         _cr_t+=("$t"); _cr_name+=("$name"); _cr_sid+=("$sid"); _cr_cwd+=("$cwd")
         printf '⟳ prepared %s from its compaction  (%s)\n' "$name" "$cwd"
@@ -5225,27 +5603,32 @@ consume_state() {
   fi
 }
 
-# record_fresh_history <name> <old_sid> <cwd>: append the retired session id to
+# record_fresh_history <name> <old_sid> <cwd> [agent]: append the retired session id to
 # FRESH_HISTORY so a fresh start is never a dead end — the prior conversation
 # is still resumable by id even though the name now points at the new session.
 # Best-effort (a history-append failure must not block the fresh start); prints
 # the recovery command either way so it's never ONLY in a file nobody opens.
+# A Codex thread was archived on the way, so its recovery is an unarchive first.
 record_fresh_history() {
-  local name="$1" old_sid="$2" cwd="$3" tmp
+  local name="$1" old_sid="$2" cwd="$3" agent="${4:-claude}" tmp
   if command -v jq >/dev/null 2>&1; then
     mkdir -p "$(dirname "$FRESH_HISTORY")" 2>/dev/null
     local prior="[]"; [ -r "$FRESH_HISTORY" ] && prior=$(jq -c '.' "$FRESH_HISTORY" 2>/dev/null || printf '[]')
     tmp="$FRESH_HISTORY.tmp.$$"
     if jq -nc --argjson prior "$prior" --arg name "$name" --arg sid "$old_sid" \
-         --arg cwd "$cwd" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-         '$prior + [{name:$name, old_sid:$sid, cwd:$cwd, at:$at}]' > "$tmp" 2>/dev/null; then
+         --arg cwd "$cwd" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg agent "$agent" \
+         '$prior + [{name:$name, old_sid:$sid, cwd:$cwd, at:$at} + (if $agent == "codex" then {agent:$agent} else {} end)]' > "$tmp" 2>/dev/null; then
       mv "$tmp" "$FRESH_HISTORY"
     else
       rm -f "$tmp"
     fi
   fi
   printf 'previous session of "%s" kept for recovery — resume it directly with:\n' "$name" >&2
-  printf '  claude --resume %s --dangerously-skip-permissions\n' "$(printf '%q' "$old_sid")" >&2
+  if [ "$agent" = "codex" ]; then
+    printf '  codex unarchive %s && codex resume %s\n' "$(printf '%q' "$old_sid")" "$(printf '%q' "$old_sid")" >&2
+  else
+    printf '  claude --resume %s --dangerously-skip-permissions\n' "$(printf '%q' "$old_sid")" >&2
+  fi
 }
 
 # do_fresh_start <name> [--dry-run]: the expensive-context problem this whole
@@ -5555,7 +5938,9 @@ agent_tag() { [ "$1" = "claude" ] && printf '%-6s' '' || printf '%-6s' "$1"; }
 #   resume↻   will not be asked, but a handoff IS waiting — someone wrote one by
 #             hand, and the next stop will clear it. Worth seeing rather than
 #             silently reconciling. (Any mode but handoff can show this.)
-#   —         Codex: always resumes as itself, so nothing to choose
+#
+# A Codex row shows resume or fresh, the only two it can have, and never ↻: a
+# Codex thread writes no handoff, so one waiting under its name is not its own.
 #
 # Short forms, because compact-resume (14 characters) would not fit the column.
 #
@@ -5563,7 +5948,7 @@ agent_tag() { [ "$1" = "claude" ] && printf '%-6s' '' || printf '%-6s' "$1"; }
 # its directory checks once per session.
 rotate_cell() {
   local name="$1" agent="${2:-claude}" root="${3:-}" v="" pending=""
-  [ "$agent" = "claude" ] || { printf '—'; return 0; }
+  [ "$agent" = "claude" ] || { printf '%s' "$(codex_mode_for "$name" 2>/dev/null)"; return 0; }
   v=$(rotate_for "$name" "$agent" 2>/dev/null)
   [ -n "$root" ] && handoff_is_complete "$(handoff_path "$root" "$name")" 2>/dev/null && pending='↻'
   printf '%s%s' "$(_mode_short "$v")" "$pending"
@@ -5593,7 +5978,8 @@ cl stop [flags]   prepare each Claude session by its mode (`cl mode`):
                   compact-resume compacts it first, handoff asks for a
                   handoff, fresh and resume ask nothing. Then save running
                   sessions and stop each one it can safely retire. Codex
-                  sessions are never asked; they resume as they were.
+                  sessions are never asked; they resume as they were, or,
+                  in fresh mode, come back as a new thread under the name.
                   Anything cl manages that is left running is named and the
                   exit is non-zero; a Codex thread cl did not launch is
                   reported and left alone.
@@ -5636,7 +6022,8 @@ cl — pick, launch and resume named Claude Code and Codex sessions
   cl handoff [--path]         write THIS session's handoff by hand
   cl mode ["Name" [compact-resume|handoff|fresh|resume|clear]]
                               how each session is stopped and started again
-                              (`cl mode --default <mode>` sets the default)
+                              (`cl mode --default <mode>` sets the default;
+                              `cl mode --codex "Name" fresh|resume` for Codex)
   cl rotate [status|on|off|clear|stats] ["Name"]
                               the same setting: on = handoff, off = resume
   cl model [--codex|--claude] [<name> <model-id>|<name> -]
@@ -5734,6 +6121,31 @@ case "${1:-}" in
     # start` in the no-tmux shape for a Claude row whose stop recorded a mode,
     # the way --rotate-from is. This tab is the process that launches, so it is
     # the one that preflights (compact-resume) or retires the old id (fresh).
+    # `cl --codex <name> --restart-mode fresh <old-id>`: the same, for a Codex
+    # row. This tab makes the new thread (codex_fresh_thread) and resumes it by
+    # id; any failure there resumes the old thread plainly.
+    if [ "${2:-}" = "--restart-mode" ] && [ "$AGENT_FILTER" = "codex" ]; then
+      rrow=$(discover | awk -F'\t' -v n="$1" '$1==n && $5=="codex" {print; exit}')
+      [ -n "$rrow" ] || { echo "claude-session: no codex session named '$1' (try --list)" >&2; exit 1; }
+      rcwd=$(printf '%s' "$rrow" | cut -f3); rsid=$(printf '%s' "$rrow" | cut -f2)
+      case "${3:-}" in
+        fresh)
+          if [ -n "${4:-}" ] && [ "$4" != "$rsid" ]; then
+            # The name has moved on since the stop (a newer thread, or this
+            # tab ran twice): that thread was never stopped, so it is resumed,
+            # not replaced.
+            printf 'ℹ "%s" no longer names thread %s — resuming %s as it is\n' "$1" "$4" "$rsid" >&2
+            launch_session "$1" "$rsid" "$rcwd" codex
+          elif rnew=$(codex_fresh_thread "$1" "$rsid" "$rcwd"); then
+            record_fresh_history "$1" "$rsid" "$rcwd" codex
+            launch_session "$1" "$rnew" "$rcwd" codex "$(build_codex_fresh_prompt)"
+          else
+            launch_session "$1" "$rsid" "$rcwd" codex
+          fi ;;
+        *) echo "claude-session: --restart-mode: '${3:-}' is not a Codex restart mode (fresh)" >&2; exit 1 ;;
+      esac
+      exit 0
+    fi
     if [ "${2:-}" = "--restart-mode" ]; then
       rrow=$(discover | awk -F'\t' -v n="$1" '$1==n && $5=="claude" {print; exit}')
       [ -n "$rrow" ] || { echo "claude-session: no claude session named '$1' (try --list)" >&2; exit 1; }
