@@ -71,9 +71,9 @@ extract_fns() {
 
 LIB="$FIX/lib.sh"
 extract_fns "$CL" handoff_target_busy handoff_nonce run_bounded send_text_tmux handoff_send_once request_handoff \
-  handoff_ask_mark handoff_ask_seen handoff_ask_wait handoff_ask_resend handoff_ask_retype handoff_poll_marks handoff_send_checked > "$LIB"
+  transcript_mark handoff_ask_mark handoff_ask_seen handoff_ask_wait handoff_ask_resend handoff_ask_retype handoff_poll_marks handoff_send_checked > "$LIB"
 for fn in handoff_target_busy handoff_nonce run_bounded send_text_tmux handoff_send_once request_handoff \
-          handoff_ask_mark handoff_ask_seen handoff_ask_wait handoff_ask_resend handoff_ask_retype handoff_poll_marks handoff_send_checked; do
+          transcript_mark handoff_ask_mark handoff_ask_seen handoff_ask_wait handoff_ask_resend handoff_ask_retype handoff_poll_marks handoff_send_checked; do
   grep -q "^${fn}()" "$LIB" || setup_failed "could not extract ${fn} from the shipped script"
 done
 # Guards on the extract, not on the product: if these functions ever stop
@@ -351,6 +351,10 @@ check "an uncapped caller still uses its full attempts" "1" \
 export HOME="$FIX/home"
 BASEPATH="/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin"
 mkdir -p "$HOME/.claude/projects/p1" "$HOME/.config/claude-session" || setup_failed "fixture HOME"
+# This suite is about the HANDOFF broadcast, so it runs in handoff mode. The
+# built-in default is compact-resume now; a stored legacy "on" is what an
+# existing install has, and must still mean handoff.
+printf '{"default":"on","sessions":{}}\n' > "$HOME/.config/claude-session/rotate.json"
 command -v tmux >/dev/null 2>&1 || setup_failed "tmux is needed to observe a real broadcast"
 TMUX_TMPDIR="$FIX/tmux-tmp"; mkdir -p "$TMUX_TMPDIR"
 rtmux() { TMUX_TMPDIR="$TMUX_TMPDIR" tmux "$@"; }

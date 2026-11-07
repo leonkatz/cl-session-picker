@@ -103,26 +103,26 @@ cl_nosession() { [ "${1:-}" = stop ] && live_up; ( cd "$FIX" && env -i HOME="$HO
          bash "$CL" "$@" ) ; }
 
 printf 'the default, and changing it\n'
-check "rotation is on with no store at all" "on" "$(cl rotate status | awk '/^default/{print $3}')"
+check "with no store at all the built-in default is compact-resume" "compact-resume" "$(cl rotate status | awk '/^default/{print $3}')"
 check "…and no store file was created by asking" "0" "$([ -e "$ROT" ] && echo 1 || echo 0)"
 cl rotate off >/dev/null
-check "rotate off sets the default" "off" "$(cl rotate status | awk '/^default/{print $3}')"
+check "rotate off sets the default (off = resume)" "resume" "$(cl rotate status | awk '/^default/{print $3}')"
 cl rotate on >/dev/null
-check "rotate on sets it back" "on" "$(cl rotate status | awk '/^default/{print $3}')"
+check "rotate on sets it back (on = handoff)" "handoff" "$(cl rotate status | awk '/^default/{print $3}')"
 out=$(cl rotate off)
 has "…and says what off means" "$out" "will not ask for handoffs"
 
 printf 'a per-session override beats the default, both ways\n'
 cl rotate on Alpha >/dev/null
-check "override on, default off" "on" "$(cl rotate status | awk '/Alpha/{print $3}')"
-check "…and Beta still follows the default" "off" "$(cl --list 2>/dev/null | awk '$2=="Beta"{print $6}')"
+check "override on, default off" "handoff" "$(cl rotate status | awk '/Alpha/{print $3}')"
+check "…and Beta still follows the default" "resume" "$(cl --list 2>/dev/null | awk '$2=="Beta"{print $6}')"
 cl rotate on >/dev/null; cl rotate off Alpha >/dev/null
-check "override off, default on" "off" "$(cl --list 2>/dev/null | awk '$2=="Alpha"{print $6}')"
-check "…Beta follows the default again" "on" "$(cl --list 2>/dev/null | awk '$2=="Beta"{print $6}')"
+check "override off, default on" "resume" "$(cl --list 2>/dev/null | awk '$2=="Alpha"{print $6}')"
+check "…Beta follows the default again" "handoff" "$(cl --list 2>/dev/null | awk '$2=="Beta"{print $6}')"
 out=$(cl rotate status)
 has "status warns overrides spoil a measurement week" "$out" "ambiguous"
 cl rotate clear Alpha >/dev/null
-check "clear removes the override" "on" "$(cl --list 2>/dev/null | awk '$2=="Alpha"{print $6}')"
+check "clear removes the override" "handoff" "$(cl --list 2>/dev/null | awk '$2=="Alpha"{print $6}')"
 out=$(cl rotate status)
 has "…and status says there are none" "$out" "overrides: none"
 
@@ -130,13 +130,13 @@ printf 'a hand-edited store is reported, not obeyed\n'
 # The file is user-editable, so a nonsense value must not silently become policy.
 printf '{"default":"maybe","sessions":{"claude":{"Alpha":"sometimes"}}}\n' > "$ROT"
 out=$(cl rotate status 2>&1)
-check "an unreadable default falls back to on" "on" "$(cl rotate status 2>/dev/null | awk '/^default/{print $3}')"
+check "an unreadable default falls back to the built-in default" "compact-resume" "$(cl rotate status 2>/dev/null | awk '/^default/{print $3}')"
 has "…and says so" "$out" "ignoring unreadable default"
 # A bad per-session value is reported by `rotate status`, not by a listing: `cl`
 # renders one row per session into a chooser and must not emit stray text there.
 out=$(cl rotate status 2>&1)
 has "…and a per-session value is reported by status" "$out" "ignoring unreadable setting"
-check "…with that session falling back to the default" "on" "$(cl --list 2>/dev/null | awk '$2=="Alpha"{print $6}')"
+check "…with that session falling back to the default" "compact" "$(cl --list 2>/dev/null | awk '$2=="Alpha"{print $6}')"
 rm -f "$ROT"
 
 printf 'codex is n/a — a thread that cannot write a handoff is not "off"\n'
@@ -163,21 +163,21 @@ printf 'precedence: flag, then CL_ROTATE, then the stored setting\n'
 # without killing anything or waiting on a handoff.
 cl rotate off >/dev/null
 out=$(cl stop --dry-run 2>&1)
-has "stored off is honoured" "$out" "rotation off"
+has "stored off is honoured" "$out" "rotation resume"
 out=$(CL_ROTATE=1 cl stop --dry-run 2>&1)
-has "CL_ROTATE=1 overrides stored off" "$out" "rotation on"
+has "CL_ROTATE=1 overrides stored off" "$out" "rotation handoff"
 out=$(cl stop --dry-run --require-handoff 2>&1)
-has "a flag overrides stored off" "$out" "rotation on"
+has "a flag overrides stored off" "$out" "rotation handoff"
 cl rotate on >/dev/null
 out=$(CL_ROTATE=0 cl stop --dry-run 2>&1)
-has "CL_ROTATE=0 overrides stored on" "$out" "rotation off"
+has "CL_ROTATE=0 overrides stored on" "$out" "rotation resume"
 out=$(cl stop --dry-run --no-handoff 2>&1)
-has "--no-handoff overrides stored on" "$out" "rotation off"
+has "--no-handoff overrides stored on" "$out" "rotation resume"
 out=$(CL_ROTATE=1 cl stop --dry-run --no-handoff 2>&1)
-has "a flag also outranks CL_ROTATE" "$out" "rotation off"
+has "a flag also outranks CL_ROTATE" "$out" "rotation resume"
 out=$(CL_ROTATE=banana cl stop --dry-run 2>&1)
 has "an unparseable CL_ROTATE is reported" "$out" "ignoring CL_ROTATE"
-has "…and the stored value is used instead" "$out" "rotation on"
+has "…and the stored value is used instead" "$out" "rotation handoff"
 check "…and it is reported exactly once, not per session" "1" \
   "$(printf '%s' "$out" | grep -c 'ignoring CL_ROTATE')"
 # Behaviour right, record wrong is still wrong: an ignored value must not be
@@ -208,7 +208,7 @@ cl stop --keep-tabs >/dev/null 2>&1
 check "a log file is created" "1" "$([ -f "$LOG" ] && echo 1 || echo 0)"
 check "…with exactly one header" "1" "$(grep -c '^timestamp' "$LOG")"
 check "…and one row for the stop" "1" "$(( $(wc -l < "$LOG") - 1 ))"
-check "…recording mode off" "off" "$(awk -F'\t' 'NR==2{print $2}' "$LOG")"
+check "…recording mode off (as resume)" "resume" "$(awk -F'\t' 'NR==2{print $2}' "$LOG")"
 check "…naming the layer that decided" "default" "$(awk -F'\t' 'NR==2{print $3}' "$LOG")"
 check "…counting both sessions" "2" "$(awk -F'\t' 'NR==2{print $4}' "$LOG")"
 check "…with no handoffs obtained" "0" "$(awk -F'\t' 'NR==2{print $5}' "$LOG")"
@@ -239,7 +239,7 @@ for who in Alpha Beta; do
   rm -f "$LOG"; cl rotate on >/dev/null; cl rotate on "$who" >/dev/null
   cl stop --keep-tabs >/dev/null 2>&1
   check "same-mode override on $who is still flagged" "mixed" "$(awk -F'\t' 'NR==2{print $3}' "$LOG")"
-  check "…with the mode itself still plain on" "on" "$(awk -F'\t' 'NR==2{print $2}' "$LOG")"
+  check "…with the mode itself still plain on (handoff)" "handoff" "$(awk -F'\t' 'NR==2{print $2}' "$LOG")"
   out=$(cl rotate stats)
   check "…and stats does not call that week clean" "yes" \
     "$(printf '%s' "$out" | awk 'NR==2{print $6}')"
@@ -465,19 +465,19 @@ has "there is a HANDOFF column" "$out" "HANDOFF"
 # …and a HINT column beside it. These were one unlabelled column, which read as
 # if the context-size advice were the setting.
 has "…and a separate HINT column" "$out" "HINT"
-check "a session with rotation on shows on" "on" "$(printf '%s' "$out" | awk '$2=="Alpha"{print $6}')"
+check "a session with rotation on shows handoff" "handoff" "$(printf '%s' "$out" | awk '$2=="Alpha"{print $6}')"
 # A complete handoff waiting is STATE, not policy, and shows as a marker beside it.
 HR="$HOME/.local/state/claude-session/handoff"
 mkdir -p "$HR" 2>/dev/null
 printf '# notes\n<!-- cl:manual:2026-10-01T09:00:00Z@%s -->\n' "$SID_A" > "$HR/Alpha.md"
 out=$(cl --list 2>/dev/null)
-check "a pending handoff is marked on the row" "on↻" "$(printf '%s' "$out" | awk '$2=="Alpha"{print $6}')"
-check "…and a session without one is not" "on" "$(printf '%s' "$out" | awk '$2=="Beta"{print $6}')"
+check "a pending handoff is marked on the row" "handoff↻" "$(printf '%s' "$out" | awk '$2=="Alpha"{print $6}')"
+check "…and a session without one is not" "handoff" "$(printf '%s' "$out" | awk '$2=="Beta"{print $6}')"
 cl rotate off Alpha >/dev/null
 out=$(cl --list 2>/dev/null)
 # off + pending is a real, visible inconsistency: someone wrote a handoff by hand
 # for a session that will not be asked for one. The next stop clears it.
-check "off with a handoff waiting shows both" "off↻" "$(printf '%s' "$out" | awk '$2=="Alpha"{print $6}')"
+check "off with a handoff waiting shows both" "resume↻" "$(printf '%s' "$out" | awk '$2=="Alpha"{print $6}')"
 rm -f "$HR/Alpha.md"; cl rotate clear Alpha >/dev/null
 
 printf 'asked from inside a session, status answers about THAT session\n'
@@ -486,6 +486,113 @@ has "it leads with this session" "$out" 'this session ("Alpha")'
 has "…and still reports the default" "$out" "default: rotation"
 out=$(cl_nosession rotate status)
 hasnt "outside a session it does not invent one" "$out" "this session"
+
+# ── restart modes: the toggle widened (docs/restart-modes.md) ───────────────
+# The store started as on/off, and a file written then must mean exactly what
+# it meant: on = handoff, off = resume. Only the BUILT-IN default — nothing
+# stored at all — is compact-resume.
+cell() { cl --list 2>/dev/null | awk -v n="$1" '$2==n{print $6}'; }
+printf 'an old on/off file means what it meant\n'
+printf '{"default":"off","sessions":{"claude":{"Alpha":"on"}}}\n' > "$ROT"
+check "a stored on is handoff" "handoff" "$(cell Alpha)"
+check "…and a stored off default is resume" "resume" "$(cell Beta)"
+out=$(cl stop --dry-run 2>&1)
+has "…and a stop treats them so: on asks for a handoff" "$out" 'would ask "Alpha" to write handoff'
+hasnt "…while off is not compacted" "$out" 'pre-compact request'
+printf 'the built-in default applies only when nothing is stored\n'
+rm -f "$ROT"
+check "no store at all: compact (the short form)" "compact" "$(cell Alpha)"
+printf '{"sessions":{}}\n' > "$ROT"
+check "a store with no default: still compact" "compact" "$(cell Alpha)"
+printf '{"default":"on"}\n' > "$ROT"
+check "a stored default wins over the built-in one" "handoff" "$(cell Alpha)"
+rm -f "$ROT"
+# The regression this guards: rotate_write seeded a missing file with
+# "default":"on", so the first per-session setting silently pinned every OTHER
+# session to handoff.
+cl mode Alpha fresh >/dev/null
+check "setting one session into an empty store does not pin a default" "" "$(jq -r '.default // empty' "$ROT")"
+check "…so the others still follow the built-in default" "compact" "$(cell Beta)"
+check "…while that one is fresh" "fresh" "$(cell Alpha)"
+
+printf 'cl mode sets and shows a session'"'"'s mode\n'
+out=$(cl mode Alpha compact)
+has "a short form is accepted" "$out" 'mode is now compact-resume for "Alpha"'
+check "cl mode <name> shows it, with its layer" '"Alpha": compact-resume (session)' "$(cl mode Alpha)"
+check "…and a session without an override shows the default" '"Beta": compact-resume (default)' "$(cl mode Beta)"
+check "an unknown mode is refused" "1" "$(cl mode Alpha sometimes >/dev/null 2>&1; echo $?)"
+check "…and changes nothing" "compact-resume" "$(jq -r '.sessions.claude.Alpha' "$ROT")"
+cl mode --default handoff >/dev/null
+check "--default sets the default" "handoff" "$(cell Beta)"
+cl mode Alpha clear >/dev/null
+check "clear un-sets one session" "handoff" "$(cell Alpha)"
+check "a Codex session cannot be given a mode in this version" "1" "$(cl mode --codex Gamma fresh >/dev/null 2>&1; echo $?)"
+check "…and still shows —" "—" "$(cell Gamma)"
+cl rotate off Alpha >/dev/null
+check "cl rotate off still works, stored as resume" "resume" "$(jq -r '.sessions.claude.Alpha' "$ROT")"
+check "every mode has a cell short enough for the column" "compact handoff fresh resume" \
+  "$(for m in compact-resume handoff fresh resume; do cl mode Alpha "$m" >/dev/null; cell Alpha; done | tr '\n' ' ' | sed 's/ $//')"
+rm -f "$ROT"
+
+printf 'CL_ROTATE and the stop flags speak modes too\n'
+out=$(CL_ROTATE=fresh cl stop --dry-run 2>&1)
+has "CL_ROTATE=fresh is a mode" "$out" "rotation fresh"
+out=$(cl stop --dry-run 2>&1)
+has "the default stop compacts (dry run)" "$out" 'would ask "Alpha" to finish its pre-compact request'
+has "…and says so per session" "$out" "rotation compact-resume"
+
+printf 'a compact-resume stop whose panes cannot be reached falls back, and logs why\n'
+# These stand-in sessions have no pane cl can type into. The pre-compact ask
+# cannot be sent, so each falls back to a handoff, which cannot be sent either,
+# and each is stopped and resumed as-is. The mode logged is still the one ASKED.
+rm -f "$LOG" "$ROT"
+cl stop --keep-tabs >/dev/null 2>&1
+check "the row's mode is the mode asked" "compact-resume" "$(awk -F'\t' 'NR==2{print $2}' "$LOG")"
+check "…the paths taken are in their own column" "resume,resume" "$(awk -F'\t' 'NR==2{print $11}' "$LOG")"
+check "…with why" "unreachable+unreachable,unreachable+unreachable" "$(awk -F'\t' 'NR==2{print $12}' "$LOG")"
+check "…and the saved rows record what was carried out" "resume" \
+  "$(jq -r '.[] | select(.name=="Alpha" and (.agent // "claude")=="claude") | .mode' "$STATE")"
+check "…by agent AND name: the Codex row gets no mode" "" \
+  "$(jq -r '.[] | select(.agent=="codex") | .mode // empty' "$STATE")"
+
+printf 'a log written before restart modes is migrated forward\n'
+V1_HEADER=$(printf 'timestamp\tmode\tsource\tsessions\thandoffs\tresume_only\tkept\tctx_total\tctx_median\tctx_all')
+printf '%s\n2026-09-21T09:00:00Z\ton\tdefault\t2\t2\t0\t0\t200000\t100000\t100000,100000\n' "$V1_HEADER" > "$LOG"
+cl stop --keep-tabs >/dev/null 2>&1
+check "the ten-column header gains the four new columns" "paths reasons pre_tokens post_tokens" \
+  "$(head -1 "$LOG" | awk -F'\t' '{print $11, $12, $13, $14}')"
+check "…and keeps its row" "1" "$(grep -c '^2026-09-21' "$LOG")"
+check "…and still has exactly one header" "1" "$(grep -c '^timestamp' "$LOG")"
+printf '%s\n' "$V1_HEADER" > "$LOG"
+ln -s '999999999:not-a-real-start-token' "$LOG.lock" 2>/dev/null
+out=$(cl stop --keep-tabs 2>&1)
+rm -f "$LOG.lock" "$LOG"
+has "a migration that cannot complete names exactly the missing columns" "$out" "fields (paths, reasons, pre_tokens, post_tokens)"
+
+printf 'stats: a week is mixed only when its modes interleave\n'
+H2=$(printf 'timestamp\tmode\tsource\tsessions\thandoffs\tresume_only\tkept\tctx_total\tctx_median\tctx_all\tpaths\treasons\tpre_tokens\tpost_tokens')
+{
+  printf '%s\n' "$H2"
+  # Week of 2026-09-28: old "on" rows and new "handoff" rows — one arm.
+  printf '2026-09-28T09:00:00Z\ton\tdefault\t1\t1\t0\t0\t100000\t100000\t100000\n'
+  printf '2026-09-29T09:00:00Z\thandoff\tdefault\t1\t1\t0\t0\t100000\t100000\t100000\thandoff\tok\t\t\n'
+  # Week of 2026-10-05: the default changed once, mid-week (an upgrade).
+  printf '2026-10-05T09:00:00Z\ton\tdefault\t1\t1\t0\t0\t100000\t100000\t100000\n'
+  printf '2026-10-07T09:00:00Z\tcompact-resume\tdefault\t1\t0\t1\t0\t900000\t900000\t900000\tcompact-resume\tok\t900000\t20000\n'
+  printf '2026-10-08T09:00:00Z\tcompact-resume\tdefault\t1\t0\t1\t0\t900000\t900000\t900000\thandoff\tno-token+ok\t\t\n'
+  # Week of 2026-10-12: back and forth.
+  printf '2026-10-12T09:00:00Z\toff\tdefault\t1\t0\t1\t0\t1\t1\t1\n'
+  printf '2026-10-13T09:00:00Z\tcompact-resume\tdefault\t1\t0\t1\t0\t1\t1\t1\tcompact-resume\tok\t\t\n'
+  printf '2026-10-14T09:00:00Z\tresume\tdefault\t1\t0\t1\t0\t1\t1\t1\tresume\tok\t\t\n'
+} > "$LOG"
+out=$(cl rotate stats)
+check "old on and new handoff rows are the same arm" "handoff" "$(printf '%s' "$out" | awk '/^2026-09-28/{print $2}')"
+check "one change of default mid-week is a before/after, not mixed" "handoff->compact" \
+  "$(printf '%s' "$out" | awk '/^2026-10-05/{print $2}')"
+check "…and a fallback (the paths column) does not make it mixed either" "3" \
+  "$(printf '%s' "$out" | awk '/^2026-10-05/{print $3}')"
+check "modes that went back and forth are mixed" "mixed" "$(printf '%s' "$out" | awk '/^2026-10-12/{print $2}')"
+rm -f "$LOG"
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ] || exit 1

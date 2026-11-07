@@ -56,14 +56,22 @@
 #                             #   it — the way out when a pane can't be reached.
 #                             #   Pipe the text in, or run it bare to be told
 #                             #   where to write. --path prints just the path.
-#   claude-session rotate     # whether `cl stop` asks for handoffs at all.
+#   claude-session mode       # each session's RESTART MODE — what `cl stop` and
+#                             #   `cl start` do with it: compact-resume (the
+#                             #   default: compact, stop, resume with a first
+#                             #   prompt), handoff, fresh, or resume. See
+#                             #   docs/restart-modes.md. `mode "Name" <mode>`
+#                             #   sets one, `mode "Name"` shows it, `mode "Name"
+#                             #   clear` un-sets it, `mode --default <mode>`.
+#   claude-session rotate     # the older spelling of the same setting:
+#                             #   on = handoff, off = resume.
 #                             #   `rotate` / `rotate status` reports it (run
 #                             #   INSIDE a session and it leads with that one);
 #                             #   `rotate off` / `rotate on` set the default;
 #                             #   `rotate off "Name"` overrides one session and
 #                             #   `rotate clear "Name"` un-overrides it.
 #                             #   Precedence: a stop flag, then CL_ROTATE, then
-#                             #   the stored setting, then on.
+#                             #   the stored setting, then compact-resume.
 #                             #   `rotate stats` summarises the per-stop log
 #                             #   (~/.config/claude-session/rotation-log.tsv) by
 #                             #   week: how many stops ran each way, how much
@@ -1087,35 +1095,64 @@ rotate_unlock() { store_unlock "$ROTATE"; }
 # can have rotation ON and nothing pending, or OFF with a handoff someone wrote
 # by hand, and both are worth seeing.
 
-# A stored value is only ever "on" or "off". Anything else in the file is a hand
-# edit, and is reported rather than guessed at — the same rule model_for follows.
-_rotate_valid() { case "$1" in on|off) return 0 ;; *) return 1 ;; esac; }
+# ── RESTART MODES ──────────────────────────────────────────────────────────
+#
+# What `cl stop` / `cl start` do with a Claude session (docs/restart-modes.md):
+#
+#   compact-resume  pre-compact request, /compact, stop; resume with a first prompt
+#   handoff         ask for a handoff, stop; start fresh from it
+#   fresh           stop with no handoff; start a NEW session under the name
+#   resume          stop; resume as-is
+#
+# The store started life as an on/off toggle, and files written then must keep
+# meaning exactly what they meant: "on" was the handoff rotation and "off" the
+# plain resume. So both are read as aliases, forever. Only the BUILT-IN default
+# — used when nothing is stored at all — is compact-resume.
+CL_MODE_BUILTIN_DEFAULT="compact-resume"
+_mode_normalize() {
+  case "$1" in
+    on|handoff)              printf 'handoff' ;;
+    off|resume)              printf 'resume' ;;
+    compact-resume|compact)  printf 'compact-resume' ;;
+    fresh)                   printf 'fresh' ;;
+    *) return 1 ;;
+  esac
+}
+# The short form for narrow cells: compact-resume is 14 characters.
+_mode_short() { case "$1" in compact-resume) printf 'compact' ;; *) printf '%s' "$1" ;; esac; }
+
+# A stored value is one of the modes or one of the two legacy aliases. Anything
+# else in the file is a hand edit, and is reported rather than guessed at — the
+# same rule model_for follows.
+_rotate_valid() { _mode_normalize "$1" >/dev/null 2>&1; }
 
 rotate_default() {
   local v
-  [ -r "$ROTATE" ] || { printf 'on'; return 0; }
-  command -v jq >/dev/null 2>&1 || { printf 'on'; return 0; }
+  [ -r "$ROTATE" ] || { printf '%s' "$CL_MODE_BUILTIN_DEFAULT"; return 0; }
+  command -v jq >/dev/null 2>&1 || { printf '%s' "$CL_MODE_BUILTIN_DEFAULT"; return 0; }
   v=$(jq -r '.default // empty' "$ROTATE" 2>/dev/null)
   if [ -n "$v" ] && ! _rotate_valid "$v"; then
-    printf 'claude-session: ignoring unreadable default "%s" in %s — treating rotation as on\n' "$v" "$ROTATE" >&2
-    printf 'on'; return 0
+    printf 'claude-session: ignoring unreadable default "%s" in %s — using the built-in default (%s)\n' \
+      "$v" "$ROTATE" "$CL_MODE_BUILTIN_DEFAULT" >&2
+    printf '%s' "$CL_MODE_BUILTIN_DEFAULT"; return 0
   fi
-  printf '%s' "${v:-on}"
+  [ -n "$v" ] || { printf '%s' "$CL_MODE_BUILTIN_DEFAULT"; return 0; }
+  _mode_normalize "$v"
 }
 
-# rotate_for <name> [agent] -> on | off | n/a
+# rotate_for <name> [agent] -> compact-resume | handoff | fresh | resume | n/a
 #
 # n/a for Codex, and that is a fact about the mechanism rather than a setting:
-# rotation needs a handoff, a handoff is a Claude session summarising itself, and
-# a Codex thread has no equivalent. Reporting "off" would imply it could be
-# turned on.
+# compaction and a handoff both need a Claude session acting on itself, and a
+# Codex thread always resumes as itself in this version. Reporting "resume"
+# would imply the others could be chosen for it.
 rotate_for() {
   local name="$1" agent="${2:-claude}" v
   [ "$agent" = "claude" ] || { printf 'n/a'; return 0; }
   if [ -r "$ROTATE" ] && command -v jq >/dev/null 2>&1; then
     v=$(jq -r --arg a "$agent" --arg n "$name" '.sessions[$a][$n] // empty' "$ROTATE" 2>/dev/null)
     if [ -n "$v" ]; then
-      if _rotate_valid "$v"; then printf '%s' "$v"; return 0; fi
+      if _rotate_valid "$v"; then _mode_normalize "$v"; return 0; fi
       printf 'claude-session: ignoring unreadable setting "%s" for "%s" in %s\n' "$v" "$name" "$ROTATE" >&2
     fi
   fi
@@ -1135,7 +1172,10 @@ rotate_source() {
 }
 
 # stop_rotate_resolve <name> <agent> <no_handoff> <require_handoff> <env_rotate>
-#   -> sets _STOP_ROTATE (on|off|n/a) and _STOP_ROTATE_SRC (flag|env|<stored>)
+#   -> sets _STOP_ROTATE (a mode, or n/a) and _STOP_ROTATE_SRC (flag|env|<stored>)
+#
+# --no-handoff is "stop now, resume as-is": it skips compaction too, because a
+# compaction is minutes of model work and that flag is the fast stop.
 #
 # THE ONE precedence order for `cl stop`: an explicit flag outranks everything,
 # then CL_ROTATE for a one-off, then the stored per-session setting.
@@ -1152,14 +1192,17 @@ rotate_source() {
 stop_rotate_resolve() {
   local name="$1" agent="$2" nh="$3" rh="$4" envr="$5"
   if [ "$agent" != "claude" ]; then _STOP_ROTATE="n/a"; _STOP_ROTATE_SRC=""; return 0; fi
-  if [ "$nh" = "1" ]; then _STOP_ROTATE="off"; _STOP_ROTATE_SRC="flag"; return 0; fi
-  if [ "$rh" = "1" ]; then _STOP_ROTATE="on";  _STOP_ROTATE_SRC="flag"; return 0; fi
+  if [ "$nh" = "1" ]; then _STOP_ROTATE="resume";  _STOP_ROTATE_SRC="flag"; return 0; fi
+  if [ "$rh" = "1" ]; then _STOP_ROTATE="handoff"; _STOP_ROTATE_SRC="flag"; return 0; fi
   if [ -n "$envr" ]; then _STOP_ROTATE="$envr"; _STOP_ROTATE_SRC="env"; return 0; fi
   _STOP_ROTATE=$(rotate_for "$name" "$agent")
   _STOP_ROTATE_SRC=$(rotate_source "$name" "$agent")
 }
 
-# rotate_env_value -> on | off | (nothing)
+# rotate_env_value -> a mode | (nothing)
+#
+# The legacy spellings keep their meaning (1/on/yes = handoff, 0/off/no =
+# resume), and a mode name is accepted as itself.
 #
 # The environment layer, validated in ONE place. It has to be separable from
 # rotate_effective because the stop path needs to know whether the environment
@@ -1171,31 +1214,40 @@ stop_rotate_resolve() {
 # session, which is why the complaint does not live here.
 rotate_env_value() {
   case "${CL_ROTATE:-}" in
-    0|off|no) printf 'off' ;;
-    1|on|yes) printf 'on' ;;
+    0|off|no) printf 'resume' ;;
+    1|on|yes) printf 'handoff' ;;
+    compact-resume|compact|handoff|fresh|resume) _mode_normalize "$CL_ROTATE" ;;
   esac
   return 0
 }
 rotate_env_valid() { [ -n "$(rotate_env_value)" ]; }
 
-# rotate_effective <name> <agent> -> on | off
+# rotate_effective <name> <agent> -> a mode
 # Adds the environment layer, for the stop path. A stop FLAG outranks all of
 # this and is applied by do_stop itself, where the flag is in scope.
 rotate_effective() {
   local name="$1" agent="${2:-claude}" v
-  [ "$agent" = "claude" ] || { printf 'off'; return 0; }
+  [ "$agent" = "claude" ] || { printf 'resume'; return 0; }
   v=$(rotate_env_value)
   [ -n "$v" ] && { printf '%s' "$v"; return 0; }
   rotate_for "$name" "$agent"
 }
 
-# rotate_write <on|off|clear> [name] [agent]: update the store under its lock.
+# rotate_write <mode|on|off|clear> [name] [agent]: update the store under its
+# lock. Aliases are written as the mode they stand for, so the file speaks one
+# vocabulary from here on.
 rotate_write() {
   local what="$1" name="${2:-}" agent="${3:-claude}" tmp rc=0
   command -v jq >/dev/null 2>&1 || { echo "claude-session: jq is required to change rotation settings" >&2; return 1; }
+  if [ "$what" != "clear" ]; then
+    what=$(_mode_normalize "$what") || { echo "claude-session: not a mode: '$1' (compact-resume|handoff|fresh|resume)" >&2; return 1; }
+  fi
   mkdir -p "$(dirname "$ROTATE")" 2>/dev/null || { echo "claude-session: cannot create $(dirname "$ROTATE")" >&2; return 1; }
   rotate_lock || return 1
-  [ -s "$ROTATE" ] || printf '{"default":"on","sessions":{}}\n' > "$ROTATE" 2>/dev/null
+  # NO default in the seed. A per-session write into a missing file used to
+  # seed "default":"on", which silently pinned every OTHER session to handoff
+  # the moment one override was set — and the built-in default is no longer on.
+  [ -s "$ROTATE" ] || printf '{"sessions":{}}\n' > "$ROTATE" 2>/dev/null
   tmp="$ROTATE.tmp.$$"
   if [ -z "$name" ]; then
     jq --arg v "$what" '.default = $v | .sessions //= {}' "$ROTATE" > "$tmp" 2>/dev/null || rc=1
@@ -1215,7 +1267,15 @@ rotate_write() {
   return "$rc"
 }
 
-# rotation_log_append <mode> <source> <sessions> <handoffs> <resume_only> <kept> <ctx...>
+# rotation_log_append <mode> <source> <sessions> <handoffs> <resume_only> <kept>
+#                     <paths> <reasons> <pre_tokens> <post_tokens> <ctx...>
+#
+# ONE ROW PER STOP, as before, so `rotate stats` keeps counting stops. The four
+# per-session columns are comma lists in the same session order as each other
+# (not as ctx_all, which is sorted): the path each session actually took, why,
+# and the compaction's preTokens/postTokens (empty where nothing compacted).
+# `mode` stays the mode ASKED; a fallback shows up in `paths`, never as a
+# different mode, which is what keeps a fallback from making a week "mixed".
 #
 # ALWAYS returns 0. This is a measurement, and a measurement must never be able
 # to stop you shutting your machine down — if the log cannot be written, say so
@@ -1223,7 +1283,8 @@ rotate_write() {
 # protects a session; here failing closed would protect nothing and cost a stop.)
 rotation_log_append() {
   local mode="$1" source="$2" sessions="$3" handoffs="$4" ronly="$5" kept="$6"
-  shift 6
+  local paths="$7" reasons="$8" pre_tokens="$9" post_tokens="${10}"
+  shift 10
   local total=0 n=0 med=0 c sorted all=""
   for c in "$@"; do
     case "$c" in ''|*[!0-9]*) continue ;; esac
@@ -1251,16 +1312,22 @@ rotation_log_append() {
   else
     _rotation_log_migrate
   fi
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$mode" "$source" "$sessions" "$handoffs" "$ronly" "$kept" "$total" "$med" "$all" \
+    "$paths" "$reasons" "$pre_tokens" "$post_tokens" \
     >> "$ROTATION_LOG" 2>/dev/null || _rotation_log_warn
   return 0
 }
-_ROTATION_LOG_HEADER='timestamp	mode	source	sessions	handoffs	resume_only	kept	ctx_total	ctx_median	ctx_all'
 # Every header this tool has ever written, exactly. Migration matches against
 # these and nothing else — see _rotation_log_migrate for why a pattern is not
 # good enough. Add a line here when the columns change; never widen the match.
-_ROTATION_LOG_HEADER_V1='timestamp	mode	source	sessions	handoffs	resume_only	kept	ctx_total	ctx_median'
+#   V0  the first release
+#   V1  + ctx_all, so a week's median is a median of sessions
+#   V2  + the path each session took, why, and the compaction's token figures
+_ROTATION_LOG_HEADER_V0='timestamp	mode	source	sessions	handoffs	resume_only	kept	ctx_total	ctx_median'
+_ROTATION_LOG_HEADER_V1='timestamp	mode	source	sessions	handoffs	resume_only	kept	ctx_total	ctx_median	ctx_all'
+_ROTATION_LOG_HEADER_V2='timestamp	mode	source	sessions	handoffs	resume_only	kept	ctx_total	ctx_median	ctx_all	paths	reasons	pre_tokens	post_tokens'
+_ROTATION_LOG_HEADER="$_ROTATION_LOG_HEADER_V2"
 _rotation_log_warn() {
   printf 'claude-session: could not append to %s — this stop is not in the rotation log\n' "$ROTATION_LOG" >&2
 }
@@ -1293,15 +1360,21 @@ _rotation_log_migrate() {
   # not write, and the code did not keep that promise — and the test only
   # exercised a first line that did not start with "timestamp" at all, so nothing
   # caught it. (Codex review, 2026-10-01.)
+  #
+  # V2 added four columns at the END, so an older row reads as empty in each of
+  # them — "not recorded", which is true — and, as with ctx_all, only the header
+  # has to change.
+  local old_header
   case "$first" in
     "$_ROTATION_LOG_HEADER")    return 0 ;;   # already current
-    "$_ROTATION_LOG_HEADER_V1") : ;;          # a header we wrote: migrate it
+    "$_ROTATION_LOG_HEADER_V0"|"$_ROTATION_LOG_HEADER_V1") : ;;   # ours: migrate it
     *)                          return 0 ;;   # anything else is not ours
   esac
+  old_header="$first"
   # Serialised, because this is the one read-modify-write on the log and two
   # stops could reach it together.
   if ! store_lock "$ROTATION_LOG" >/dev/null 2>&1; then
-    _rotation_log_schema_warn; return 0
+    _rotation_log_schema_warn "$old_header"; return 0
   fi
   # Re-read under the lock and repeat the WHOLE classification, not just the
   # already-migrated case. The reason to look again is that the pre-lock evidence
@@ -1314,19 +1387,19 @@ _rotation_log_migrate() {
   first=$(head -1 "$ROTATION_LOG" 2>/dev/null)
   case "$first" in
     "$_ROTATION_LOG_HEADER")    store_unlock "$ROTATION_LOG"; return 0 ;;
-    "$_ROTATION_LOG_HEADER_V1") : ;;
+    "$_ROTATION_LOG_HEADER_V0"|"$_ROTATION_LOG_HEADER_V1") old_header="$first" ;;
     *)                          store_unlock "$ROTATION_LOG"; return 0 ;;
   esac
   tmp="$ROTATION_LOG.mig.$$"
   if ! { printf '%s\n' "$_ROTATION_LOG_HEADER"; tail -n +2 "$ROTATION_LOG"; } > "$tmp" 2>/dev/null \
      || [ ! -s "$tmp" ]; then
-    rm -f "$tmp" 2>/dev/null; store_unlock "$ROTATION_LOG"; _rotation_log_schema_warn; return 0
+    rm -f "$tmp" 2>/dev/null; store_unlock "$ROTATION_LOG"; _rotation_log_schema_warn "$old_header"; return 0
   fi
   # A refused replacement used to be silent, which left exactly the mixed schema
   # this migration exists to prevent and said nothing about it. The stop must
   # continue; it does not have to continue quietly.
   if ! mv "$tmp" "$ROTATION_LOG" 2>/dev/null; then
-    rm -f "$tmp" 2>/dev/null; store_unlock "$ROTATION_LOG"; _rotation_log_schema_warn; return 0
+    rm -f "$tmp" 2>/dev/null; store_unlock "$ROTATION_LOG"; _rotation_log_schema_warn "$old_header"; return 0
   fi
   store_unlock "$ROTATION_LOG"
   return 0
@@ -1334,9 +1407,74 @@ _rotation_log_migrate() {
 # Said whenever a row is about to be appended under a header that does not name
 # all of its fields. Names the consequence and the fix, because "could not
 # migrate" on its own tells someone nothing they can act on.
+# _rotation_log_schema_warn <old-header>: the columns the old header lacks are
+# exactly the current header's fields past its own count, since every version
+# only ever appended.
 _rotation_log_schema_warn() {
-  printf 'claude-session: could not update the column header in %s — the row just added has one field (ctx_all) that the header does not name.\n' "$ROTATION_LOG" >&2
+  local missing
+  missing=$(printf '%s\n%s\n' "${1:-}" "$_ROTATION_LOG_HEADER" \
+    | awk -F'\t' 'NR==1{n=NF; next} {s=""; for(i=n+1;i<=NF;i++) s=s (s==""?"":", ") $i; print s}')
+  printf 'claude-session: could not update the column header in %s — the row just added has fields (%s) that the header does not name.\n' \
+    "$ROTATION_LOG" "${missing:-unknown}" >&2
   printf '  The next cl stop retries; or fix it by hand, replacing the first line with:\n    %s\n' "$_ROTATION_LOG_HEADER" >&2
+}
+
+# _mode_set <mode> [name] [agent]: store a mode as the default (no name) or for
+# one session, and say what it now means. Shared by `cl rotate on|off` and `cl
+# mode`, so the two spellings cannot drift.
+_mode_set() {
+  local mode="$1" target="${2:-}" agent="${3:-claude}"
+  if [ -z "$target" ]; then
+    rotate_write "$mode" || return 1
+    printf 'mode is now %s by default%s\n' "$mode" \
+      "$( [ "$mode" = resume ] && printf ' — `cl stop` will not ask for handoffs' )"
+  else
+    rotate_write "$mode" "$target" "$agent" || return 1
+    printf 'mode is now %s for "%s" (overriding the default, which is %s)\n' "$mode" "$target" "$(rotate_default)"
+  fi
+  return 0
+}
+
+# do_mode: `cl mode` — the restart mode per session.
+#
+#   cl mode                       the same report as `cl rotate status`
+#   cl mode <name>                that session's mode, and which layer decided
+#   cl mode <name> <mode|clear>   set or un-set one session's mode
+#   cl mode --default <mode>      set the default
+#
+# Modes: compact-resume (or compact), handoff, fresh, resume — and the legacy
+# on/off, which mean handoff/resume. Codex sessions always resume in this
+# version, so `--codex` is refused rather than stored and ignored.
+do_mode() {
+  local agent="claude" name="" mode=""
+  while :; do
+    case "${1:-}" in
+      --codex)  echo "claude-session: a Codex session always resumes as itself in this version — there is no mode to set" >&2; return 1 ;;
+      --claude) shift ;;
+      --default)
+        shift
+        [ -n "${1:-}" ] || { echo 'usage: cl mode --default <compact-resume|handoff|fresh|resume>' >&2; return 1; }
+        _mode_normalize "$1" >/dev/null || { echo "claude-session: not a mode: '$1' (compact-resume|handoff|fresh|resume)" >&2; return 1; }
+        _mode_set "$(_mode_normalize "$1")"; return $? ;;
+      -h|--help)
+        printf 'usage: cl mode [<name> [compact-resume|handoff|fresh|resume|clear]] | cl mode --default <mode>\n'
+        return 0 ;;
+      *) break ;;
+    esac
+  done
+  name="${1:-}"; mode="${2:-}"
+  [ -n "$name" ] || { do_rotate status; return $?; }
+  if [ -z "$mode" ]; then
+    printf '"%s": %s (%s)\n' "$name" "$(rotate_for "$name" "$agent")" "$(rotate_source "$name" "$agent")"
+    return 0
+  fi
+  if [ "$mode" = "clear" ]; then
+    rotate_write clear "$name" "$agent" || return 1
+    printf '"%s" follows the default again (%s)\n' "$name" "$(rotate_default)"
+    return 0
+  fi
+  _mode_normalize "$mode" >/dev/null || { echo "claude-session: not a mode: '$mode' (compact-resume|handoff|fresh|resume)" >&2; return 1; }
+  _mode_set "$(_mode_normalize "$mode")" "$name" "$agent"
 }
 
 # do_rotate: read and change the policy, and summarise what the log says.
@@ -1352,15 +1490,9 @@ do_rotate() {
         esac
       fi
       target="${1:-}"
-      if [ -z "$target" ]; then
-        rotate_write "$sub" || return 1
-        printf 'rotation is now %s by default%s\n' "$sub" \
-          "$( [ "$sub" = off ] && printf ' — `cl stop` will not ask for handoffs' )"
-      else
-        rotate_write "$sub" "$target" "$agent" || return 1
-        printf 'rotation is now %s for "%s" (overriding the default, which is %s)\n' "$sub" "$target" "$(rotate_default)"
-      fi
-      return 0 ;;
+      # The legacy toggle, kept as aliases: on = handoff, off = resume.
+      _mode_set "$(_mode_normalize "$sub")" "$target" "$agent"
+      return $? ;;
     clear)
       shift; target="${1:-}"
       [ -n "$target" ] || { echo "claude-session: rotate clear needs a session name" >&2; return 1; }
@@ -1393,7 +1525,7 @@ do_rotate() {
       [ -n "$on" ] || continue
       [ "$shown" = "0" ] && { printf 'per-session overrides:\n'; shown=1; }
       if _rotate_valid "$ov"; then
-        printf '  %s [%s]: %s\n' "$on" "$oa" "$ov"
+        printf '  %s [%s]: %s\n' "$on" "$oa" "$(_mode_normalize "$ov")"
       else
         printf '  %s [%s]: ignoring unreadable setting "%s" — follows the default (%s)\n' \
           "$on" "$oa" "$ov" "$(rotate_default)"
@@ -1419,7 +1551,7 @@ do_rotate() {
 rotate_stats() {
   [ -r "$ROTATION_LOG" ] || { printf 'no rotation log yet (%s) — run a `cl stop` first\n' "$ROTATION_LOG"; return 0; }
   command -v awk >/dev/null 2>&1 || { echo "claude-session: awk is required for stats" >&2; return 1; }
-  printf '%-14s %-8s %7s %9s %11s %10s\n' 'WEEK FROM' MODE CYCLES SESSIONS 'CTX MEDIAN' OVERRIDES
+  printf '%-14s %-16s %7s %9s %11s %10s\n' 'WEEK FROM' MODE CYCLES SESSIONS 'CTX MEDIAN' OVERRIDES
   # Weeks are grouped by the MONDAY they start on, computed exactly.
   #
   # The first version derived a week number from the day of the year, which put a
@@ -1483,8 +1615,23 @@ rotate_stats() {
       # nothing here can tell that from a value typed once, and guessing in the
       # optimistic direction is how a contaminated week gets believed.
       if (src != "default") ovr[key]="yes"
-      if (modes[key]=="") modes[key]=mode
-      else if (modes[key]!=mode) modes[key]="mixed"
+      # ── WHEN IS A WEEK "MIXED"? ──────────────────────────────────────────
+      # Only when its arms are INTERLEAVED. Three things used to make, or would
+      # have made, a week mixed without any experiment being muddled:
+      #   * vocabulary: rows written before restart modes say on/off, which ARE
+      #     handoff/resume, so they are normalised before comparing;
+      #   * fallbacks: a row records the mode ASKED, and a session that fell
+      #     back (no token -> handoff) is in the paths column, not here;
+      #   * a default that changed once, mid-week — upgrading to the
+      #     compact-resume default, or `cl mode --default` on a Wednesday. That
+      #     is a clean before/after, shown as "A->B", not a contaminated sample.
+      # A row that was itself mixed (sessions disagreed), or a week that went
+      # back and forth, is still "mixed".
+      if (mode=="on") mode="handoff"; else if (mode=="off") mode="resume"
+      if (mode=="compact-resume") mode="compact"
+      if (first[key]=="") { first[key]=mode; last[key]=mode; flips[key]=0 }
+      else if (last[key]!=mode) { flips[key]++; last[key]=mode }
+      if (mode=="mixed") hasmixed[key]="yes"
     }
     END {
       n=0; for (k in cycles) keys[n++]=k
@@ -1497,7 +1644,10 @@ rotate_stats() {
           for (a=2; a<=cn; a++) { x=v[a]+0; b=a-1; while (b>0 && v[b]+0>x) { v[b+1]=v[b]; b-- } v[b+1]=x }
           m = v[int((cn+1)/2)] + 0
         }
-        printf "%-14s %-8s %7d %9d %11s %10s\n", k, modes[k], cycles[k], sessions[k],
+        if (hasmixed[k]=="yes" || flips[k] > 1) wm = "mixed"
+        else if (flips[k] == 1) wm = first[k] "->" last[k]
+        else wm = first[k]
+        printf "%-14s %-16s %7d %9d %11s %10s\n", k, wm, cycles[k], sessions[k],
           (m>0 ? sprintf("%s%dk", (approx[k]=="yes" ? "~" : ""), int(m/1000)) : "-"),
           (ovr[k]=="yes" ? "yes" : "-")
       }
@@ -1506,7 +1656,9 @@ rotate_stats() {
   printf 'had grown to, which is the per-call cost rotation removes. A ~ prefix means some\n'
   printf 'rows predate the per-session figures and only their own medians were available.\n'
   printf 'OVERRIDES=yes means per-session settings or a stop flag were in play that week, so\n'
-  printf 'it is not a clean A/B sample. This reports the mechanism, not money.\n'
+  printf 'it is not a clean A/B sample. MODE A->B means the mode changed once that week (a\n'
+  printf 'clean before/after); mixed means the modes were interleaved. on/off rows count as\n'
+  printf 'handoff/resume. This reports the mechanism, not money.\n'
   return 0
 }
 
@@ -1609,13 +1761,31 @@ do_model() {
 # are re-split by the caller.
 # A third argument supplies the session NAME, which is what a remembered model
 # is keyed by; without it the command is built exactly as before.
+# A fourth argument is a FIRST PROMPT (Claude only): claude takes a trailing
+# positional as the first message and sends it on launch. It is how a session
+# resumed after a compaction is told why it is back — passed as an argument,
+# never typed, because typing races the TUI starting up. %q-quoted, as in
+# fresh_cmd, because this string is evaluated by a shell.
 resume_cmd() {
-  local mf=""
+  local mf="" fp=""
   [ -n "${3:-}" ] && mf=$(model_flag "$1" "$(model_for "$3" "$1")")
+  [ -n "${4:-}" ] && fp=" $(printf '%q' "$4")"
   case "$1" in
     codex) printf '%s %s resume %s%s' "$(codex_cmd)" "$(codex_args)" "$(printf '%q' "$2")" "$mf" ;;
-    *)     printf '%s --resume %s --dangerously-skip-permissions%s' "$(claude_cmd)" "$(printf '%q' "$2")" "$mf" ;;
+    *)     printf '%s --resume %s --dangerously-skip-permissions%s%s' "$(claude_cmd)" "$(printf '%q' "$2")" "$mf" "$fp" ;;
   esac
+}
+
+# The first message a session resumed after compaction receives. Yours to
+# change, in a file, for the same reason as the handoff prompt.
+CL_COMPACT_RESUME_PROMPT_FILE="${CL_COMPACT_RESUME_PROMPT_FILE:-$HOME/.config/claude-session/resume-after-compact-prompt.txt}"
+build_compact_resume_prompt() {
+  local tmpl
+  if tmpl=$(read_prompt_file "$CL_COMPACT_RESUME_PROMPT_FILE"); then
+    printf '%s' "$tmpl" | _prompt_flatten
+    return 0
+  fi
+  printf 'You were stopped and restarted by cl after compacting your context. Carry on where you left off.'
 }
 
 # CL_SESSION_NAME tells `cl handoff`, run INSIDE a session, which session it is
@@ -1655,7 +1825,14 @@ _agent_runnable() {
   command -v "$first" >/dev/null 2>&1
 }
 
+# An EMPTY prompt is the `fresh` restart mode: a new session with nothing to
+# read. The positional is then left out entirely rather than passed as '' —
+# an empty first message is not the same thing as none.
 fresh_cmd() {
+  if [ -z "${2:-}" ]; then
+    printf '%s --name %s --dangerously-skip-permissions' "$(claude_cmd)" "$(printf '%q' "$1")"
+    return 0
+  fi
   printf '%s --name %s --dangerously-skip-permissions %s' \
     "$(claude_cmd)" "$(printf '%q' "$1")" "$(printf '%q' "$2")"
 }
@@ -2373,10 +2550,10 @@ end tell
 OSA
 }
 
-launch_session() { # name sid cwd [agent]
+launch_session() { # name sid cwd [agent] [first-prompt]
   local name="$1" sid="$2" cwd="$3" agent="${4:-claude}" t pid cmd
   t=$(tmux_name "$name" "$agent"); [ -d "$cwd" ] || cwd="$HOME"
-  cmd=$(resume_cmd "$agent" "$sid" "$name")
+  cmd=$(resume_cmd "$agent" "$sid" "$name" "${5:-}")
   # Covers the non-tmux exec path; the tmux path prefixes the command instead,
   # because the tmux server's own environment is whatever it was started with.
   export CL_SESSION_NAME="$name" CL_SESSION_ID="$sid"
@@ -2766,8 +2943,14 @@ handoff_target_busy() {
 #      unstamped tmux session, the Desktop app, a --remote client). Reported
 #      and left alone; it is not a failure of THIS stop, which is why it has
 #      its own code (counting it would fail every stop while the app is open)
+#
+# A sixth argument, 1, skips the "looks mid-task, kill it anyway?" prompt. Only
+# the compact-resume stop passes it, and only once the transcript PROVES the
+# session is idle since its compaction (see compact_idle): the busy signal
+# lingers for minutes after a turn, so after a compaction it would ask about
+# every session, while the transcript can say it is done.
 retire_session() {
-  local name="$1" sid="$2" t="$3" close_tabs="$4" agent="${5:-claude}"
+  local name="$1" sid="$2" t="$3" close_tabs="$4" agent="${5:-claude}" idle_proven="${6:-0}"
   local ans pid ptok rrc _ppid _pcomm hint kids surv
   hint=$(agent_hint "$agent")
   if tmux has-session -t "=${t}" 2>/dev/null; then
@@ -2787,7 +2970,7 @@ retire_session() {
       fi
       return 4
     fi
-    if session_busy "$t"; then
+    if [ "$idle_proven" != "1" ] && session_busy "$t"; then
       printf '⏳ "%s" looks mid-task. Kill it anyway? [y/N] ' "$name" >&2
       read -r ans </dev/tty
       case "$ans" in
@@ -2854,7 +3037,7 @@ retire_session() {
     tmux*) printf '⚠ skipping %s — owned by a tmux server not visible here\n' "$name" >&2; return 2 ;;
   esac
 
-  if claude_busy "$pid"; then
+  if [ "$idle_proven" != "1" ] && claude_busy "$pid"; then
     printf '⏳ "%s" (pid %s) looks mid-task. Kill it anyway? [y/N] ' "$name" "$pid" >&2
     read -r ans </dev/tty
     case "$ans" in
@@ -3028,16 +3211,50 @@ build_handoff_prompt() { # root name nonce
 # checks the transcript and the callers re-type once when it did not land.
 handoff_request_path() { printf '%s/%s.request' "$1" "$(name_component "$2")"; }
 
-# build_handoff_ask <root> <name> <nonce>: write the full request and print the
-# line to type. If the file cannot be written the full request is typed as
-# before, because a handoff problem must never prevent a stop.
+# The pre-compact request (compact-resume mode) goes through exactly the same
+# file-plus-pointer route, into <store>/<Name>.precompact.
+precompact_request_path() { printf '%s/%s.precompact' "$1" "$(name_component "$2")"; }
+
+# Optional workflow for the turn before a compaction ("update your session
+# board", say). Yours, in a file; by default there is none.
+CL_PRECOMPACT_PROMPT_FILE="${CL_PRECOMPACT_PROMPT_FILE:-$HOME/.config/claude-session/precompact-prompt.txt}"
+
+# compact_nonce: the reply token for one pre-compact request.
+compact_nonce() { printf 'cl-done:%s-%s-%s%s' "$$" "$(date +%s 2>/dev/null || echo 0)" "$RANDOM" "$RANDOM"; }
+
+# build_precompact_prompt <root> <name> <token>: the full pre-compact request.
+#
+# It ALWAYS ends by asking for the exact token as the last thing written. That
+# token is the only proof the turn has finished — the busy signal lingers for
+# minutes, and the transcript alone cannot tell a pause from an end — so it
+# cannot depend on there being a workflow. A custom file supplies only the
+# workflow; the token sentence is appended whatever it says.
+build_precompact_prompt() {
+  local root="$1" name="$2" token="$3" tmpl work=""
+  if tmpl=$(read_prompt_file "$CL_PRECOMPACT_PROMPT_FILE"); then
+    work="$(_prompt_expand "$tmpl" "" "" "$name" "$root") "
+  fi
+  printf '%sThis session is about to be compacted and restarted by cl. When you have finished, end your turn with a plain reply whose last line is exactly %s and nothing after it, and run no tool after writing it.' \
+    "$work" "$token" | _prompt_flatten
+}
+
+# build_handoff_ask <root> <name> <nonce> [precompact]: write the full request
+# and print the line to type. If the file cannot be written the full request is
+# typed as before, because a handoff problem must never prevent a stop. The
+# fourth argument selects the pre-compact request instead of the handoff one;
+# the route, the pointer shape and the delivery check are the same for both.
 build_handoff_ask() {
-  local root="$1" name="$2" nonce="$3" full rp tmp
-  full=$(build_handoff_prompt "$root" "$name" "$nonce")
-  rp=$(handoff_request_path "$root" "$name")
+  local root="$1" name="$2" nonce="$3" kind="${4:-handoff}" full rp tmp label
+  if [ "$kind" = "precompact" ]; then
+    full=$(build_precompact_prompt "$root" "$name" "$nonce")
+    rp=$(precompact_request_path "$root" "$name"); label="pre-compact request"
+  else
+    full=$(build_handoff_prompt "$root" "$name" "$nonce")
+    rp=$(handoff_request_path "$root" "$name"); label="handoff request"
+  fi
   tmp="$rp.tmp.$$"
   if printf '%s\n' "$full" > "$tmp" 2>/dev/null && mv -f "$tmp" "$rp" 2>/dev/null; then
-    printf 'cl stop: read and follow the handoff request in "%s"' "$rp" | _prompt_flatten
+    printf 'cl stop: read and follow the %s in "%s"' "$label" "$rp" | _prompt_flatten
     return 0
   fi
   rm -f "$tmp" 2>/dev/null
@@ -3045,16 +3262,23 @@ build_handoff_ask() {
   printf '%s' "$full"
 }
 
-# handoff_ask_mark <sid>: "<transcript>\t<size>" before a send, or nothing when
-# there is no transcript to check (an unknown sid, or no jq).
-handoff_ask_mark() {
+# transcript_mark <sid>: "<transcript>\t<size>" now, or nothing when there is no
+# transcript (an unknown sid, or no jq). The byte offset is the "after this"
+# every transcript check below is measured from.
+transcript_mark() {
   local f sz
-  [ "${CL_HANDOFF_VERIFY:-5}" -gt 0 ] 2>/dev/null || return 0
   command -v jq >/dev/null 2>&1 || return 0
   f=$(find "$PROJECTS" -mindepth 2 -maxdepth 2 -name "${1}.jsonl" 2>/dev/null | head -1)
   [ -n "$f" ] && [ -r "$f" ] || return 0
   sz=$(wc -c < "$f" 2>/dev/null | tr -d ' ')
   printf '%s\t%s' "$f" "${sz:-0}"
+}
+
+# handoff_ask_mark <sid>: transcript_mark before a send, or nothing when the
+# delivery check is off.
+handoff_ask_mark() {
+  [ "${CL_HANDOFF_VERIFY:-5}" -gt 0 ] 2>/dev/null || return 0
+  transcript_mark "$1"
 }
 
 # handoff_ask_seen <mark> <line>: 0 once the transcript, past the mark, holds a
@@ -3280,10 +3504,11 @@ handoff_send_once() {
 # session that is working: it queues typed input, so its ask may simply be
 # waiting (see the re-ask rule in request_handoff). Returns 0 sent, 1 the pane
 # became unreachable, 2 left alone because it is busy.
+# An optional fifth argument names the ask in that message ("pre-compact").
 handoff_ask_resend() {
   local mark
   handoff_target_busy "$3" "$2" "$1" && return 2
-  printf '⚠ the handoff ask to "%s" did not arrive whole — typing it again\n' "$1" >&2
+  printf '⚠ the %s ask to "%s" did not arrive whole — typing it again\n' "${5:-handoff}" "$1" >&2
   mark=$(handoff_ask_mark "$2")
   handoff_send_once "$1" "$2" "$3" "$4" || return 1
   printf '%s' "$mark"
@@ -3305,13 +3530,15 @@ handoff_ask_retype() {
 # handoff_poll_marks: one shared CL_HANDOFF_VERIFY window over every pending
 # session of do_stop's arrays (_n, _h_state, _h_mark, _h_line — read through
 # bash's dynamic scope). A session whose line is seen has its mark cleared, so
-# what is still marked afterwards is what never arrived whole.
+# what is still marked afterwards is what never arrived whole. An optional
+# argument names the state to poll (default "pending"), so the pre-compact asks
+# are checked by this same loop rather than by a second copy of it.
 handoff_poll_marks() {
-  local t=0 unseen=1 i
+  local t=0 unseen=1 i want="${1:-pending}"
   while [ "$unseen" -gt 0 ] && [ "$t" -le $(( CL_HANDOFF_VERIFY * 4 )) ]; do
     unseen=0
     for (( i=0; i<_n; i++ )); do
-      [ "${_h_state[$i]}" = "pending" ] && [ -n "${_h_mark[$i]:-}" ] || continue
+      [ "${_h_state[$i]}" = "$want" ] && [ -n "${_h_mark[$i]:-}" ] || continue
       if handoff_ask_seen "${_h_mark[$i]}" "${_h_line[$i]}"; then _h_mark[$i]=""; else unseen=$((unseen+1)); fi
     done
     [ "$unseen" -gt 0 ] && { sleep 0.25; t=$((t+1)); }
@@ -3328,6 +3555,148 @@ handoff_send_checked() {
   [ -n "$mark" ] || return 0
   handoff_ask_wait "$CL_HANDOFF_VERIFY" "$mark" "$4" && return 0
   handoff_ask_retype "$1" "$2" "$3" "$4"
+}
+
+# --- compact-resume: reading the transcript ----------------------------------
+#
+# cl cannot read a Claude pane (the TUI is on the alternate screen), so every
+# step of a compaction is confirmed from the TRANSCRIPT, measured from a byte
+# mark taken beforehand. Four questions, four functions, each narrow on purpose:
+#
+#   compact_token_seen     did the pre-compact turn FINISH?
+#   compact_boundary_after did a compaction happen (optionally: a manual one)?
+#   compact_output_after   did /compact report "Compacted"?
+#   compact_idle           is the session at rest since its compaction?
+#
+# How long all of it may take, for every compacting session at once. Measured:
+# 88-137s for ~1M -> 20k tokens, plus a pre-compact turn at ~1M context. Kept
+# apart from CL_HANDOFF_BUDGET, so a stop's worst case is the sum of the two.
+CL_COMPACT_TIMEOUT="${CL_COMPACT_TIMEOUT:-600}"
+
+# _tail_records <mark>: the records written after the mark, one per line. A
+# record that was half-written when the mark was taken is a fragment here and
+# is dropped by `fromjson?`, which is the right answer: it predates the mark.
+_tail_records() {
+  local f="${1%%$'\t'*}" off="${1##*$'\t'}"
+  [ -n "$1" ] && [ -r "$f" ] || return 1
+  tail -c +"$((off + 1))" "$f" 2>/dev/null | jq -c -R 'fromjson? // empty' 2>/dev/null
+}
+
+# _mark_size <mark>: the transcript's size now.
+_mark_size() { wc -c < "${1%%$'\t'*}" 2>/dev/null | tr -d ' '; }
+
+# compact_token_seen <mark> <token>: 0 when the pre-compact turn has ended with
+# the token.
+#
+# The match is deliberately narrow, because the cheap one is wrong: the request
+# FILE contains the token, so the moment the session reads it, the token sits
+# in a tool_result — a `user` record — and a plain search would "confirm" a turn
+# that has only just begun. (That is why handoff_ask_seen, which matches user
+# records, is not reused here.) So the token counts only:
+#   * in an ASSISTANT TEXT block, after the mark;
+#   * in the LAST conversation record (user/assistant — metadata records such
+#     as system notes are not turns and do not move "last");
+#   * with no tool_use after that text block, since a tool call means the turn
+#     is still going.
+# The caller adds the fourth condition: the size stable across two polls.
+compact_token_seen() {
+  _tail_records "$1" | jq -s -e --arg tok "$2" '
+    map(select(.type == "user" or .type == "assistant")) | last
+    | select(. != null and .type == "assistant")
+    | (.message.content // [])
+    | (if type == "string" then [{type: "text", text: .}] elif type == "array" then . else [] end)
+    | to_entries
+    | ([.[] | select(.value.type == "tool_use") | .key] | max) as $tu
+    | ([.[] | select(.value.type == "text" and ((.value.text // "") | contains($tok))) | .key] | max) as $tx
+    | $tx != null and ($tu == null or $tx > $tu)' >/dev/null 2>&1
+}
+
+# compact_boundary_after <mark> [trigger]: print "<uuid>|<trigger>|<pre>|<post>"
+# for the LAST compact_boundary after the mark (only one with that trigger,
+# when given). Non-zero when there is none. "|" and not a tab: a tab is IFS
+# whitespace to `read`, so an empty uuid would shift every later field.
+#
+# The trigger matters both ways. A pre-compact turn at ~1M tokens can set off an
+# AUTO compaction: counted as confirmation of /compact it would pass instantly,
+# kill mid-compaction, or lead to compacting a 20k summary a second time. So
+# after /compact only "manual" confirms, and an auto one before /compact means
+# /compact is not typed at all.
+compact_boundary_after() {
+  local out
+  out=$(_tail_records "$1" | jq -s -r --arg want "${2:-}" '
+    map(select(.type == "system" and .subtype == "compact_boundary"
+               and ($want == "" or ((.compactMetadata.trigger // "") == $want)))) | last
+    | select(. != null)
+    | [(.uuid // ""), (.compactMetadata.trigger // ""),
+       ((.compactMetadata.preTokens // "") | tostring), ((.compactMetadata.postTokens // "") | tostring)]
+    | join("|")' 2>/dev/null)
+  [ -n "$out" ] || return 1
+  printf '%s' "$out"
+}
+
+# "Compacted", as Claude Code actually records it: a USER record whose content
+# is a STRING, the command's stdout wrapped in <local-command-stdout>, and the
+# word itself styled with ANSI SGR escapes:
+#   "<local-command-stdout>\u001b[2mCompacted (ctrl+o …)\u001b[22m</local-command-stdout>"
+# A plain contains("<local-command-stdout>Compacted") never matches that. And
+# it is anchored to the start of a string-content user record ONLY: a
+# tool_result is array content, so a session that reads this script, or a
+# transcript, after compacting cannot be taken for the command's own output.
+_CL_JQ_COMPACTED='def compacted_output:
+  .type == "user" and ((.message.content? // null) | type) == "string"
+  and (.message.content | test("^<local-command-stdout>(\u001b\\[[0-9;]*m)*Compacted"));'
+
+# compact_output_after <mark>: 0 when /compact has reported "Compacted" after
+# the mark — the second accepted confirmation, for a version that writes the
+# command's output but a boundary this check does not recognise.
+compact_output_after() {
+  _tail_records "$1" | jq -s -e "$_CL_JQ_COMPACTED"' map(select(compacted_output)) | length > 0' >/dev/null 2>&1
+}
+
+# compact_idle_record <mark> [token]: 0 when the session is at rest after its
+# compaction, judged by the LAST CONVERSATION record (user/assistant) after the
+# mark — exactly as compact_token_seen judges a turn's end.
+#
+# Not the last record of any kind: after a manual compaction Claude Code writes
+# the Compacted output, then attachment records (the SessionStart:compact hook
+# among them), then a batch of metadata (file-history-snapshot, last-prompt,
+# custom-title, permission-mode…); a finished turn is followed by
+# stop_hook_summary, turn_duration and more. A bare `last` lands on metadata,
+# never passes, and sends every compacted session to the kill prompt — which,
+# unattended, is answered "no" and fails the stop.
+#
+# Idle means that record is the Compacted output — or, with a token (a session
+# that compacted on its own and then finished its turn), the assistant reply
+# carrying it. Deliberately NOT any free-text mention of "SessionStart" and
+# "compact": a tool_result can contain both, and matching it would skip the
+# prompt for a session that is busy.
+compact_idle_record() {
+  _tail_records "$1" | jq -s -e --arg tok "${2:-}" "$_CL_JQ_COMPACTED"'
+    map(select(.type == "user" or .type == "assistant")) | last | select(. != null)
+    | compacted_output
+      or ($tok != "" and .type == "assistant"
+          and ([(.message.content // []) | if type == "array" then .[] else empty end
+                | select(.type == "text") | (.text // "") | contains($tok)] | any))' >/dev/null 2>&1
+}
+
+# compact_preflight <sid> <boundary-uuid>: before `cl start` resumes a session
+# with a first prompt, check it is still the session the stop compacted: the
+# transcript exists, and its LAST boundary is the one recorded on the row.
+# Anything else — gone, compacted again since, never compacted — is resumed
+# plainly by the caller, never rotated: no handoff was asked for this cycle, so
+# any handoff present predates it.
+#
+# grep first, then jq on the hits only: a transcript that needed compacting is
+# tens of megabytes, and this runs once per session on every start.
+compact_preflight() {
+  local f last want="${2:-}"
+  [ "$want" = "-" ] && want=""
+  f=$(find "$PROJECTS" -mindepth 2 -maxdepth 2 -name "${1}.jsonl" 2>/dev/null | head -1)
+  [ -n "$f" ] && [ -r "$f" ] || return 1
+  last=$(grep -F '"compact_boundary"' "$f" 2>/dev/null \
+    | jq -c 'select(.type == "system" and .subtype == "compact_boundary")' 2>/dev/null | tail -1)
+  [ -n "$last" ] || return 1
+  [ "$(printf '%s' "$last" | jq -r '.uuid // ""' 2>/dev/null)" = "$want" ]
 }
 
 # request_handoff <name> <sid> <cwd> <tmux_name> [--dry-run]: try to get the
@@ -3628,6 +3997,232 @@ save_state() {
   fi
 }
 
+# _c_fallback <i> <reason> <message>: a compacting session that will be asked
+# for a handoff instead. It then goes through the handoff phase like any other
+# handoff session — including honouring a handoff written by hand.
+_c_fallback() {
+  _h_rot[$1]="handoff"; _h_state[$1]="idle"; _h_cstate[$1]=""; _h_mark[$1]=""; _h_why[$1]="$2"
+  _c_clear_request "$1"
+  printf '%s\n' "$3" >&2
+}
+
+# _c_clear_request <i>: the pre-compact request has been answered one way or
+# the other, so its file goes, as a handoff request's does once it lands.
+_c_clear_request() {
+  [ -n "$_CL_STOP_ROOT" ] && rm -f "$(precompact_request_path "$_CL_STOP_ROOT" "${_h_name[$1]}")" 2>/dev/null
+  return 0
+}
+
+# _c_compacted <i> <boundary-tsv> <reason>: record a confirmed compaction.
+_c_compacted() {
+  local b_id b_trig b_pre b_post
+  IFS='|' read -r b_id b_trig b_pre b_post <<< "$2"
+  _h_cstate[$1]="compacted"; _h_state[$1]="cdone"; _h_taken[$1]="compact-resume"; _h_why[$1]="$3"
+  _h_cbid[$1]="$b_id"; _h_cpre[$1]="$b_pre"; _h_cpost[$1]="$b_post"
+  _c_clear_request "$1"
+}
+
+# _stop_compact_phase: steps 2-5 of compact-resume for every compacting session
+# of do_stop's arrays at once (read and written through bash's dynamic scope,
+# as handoff_poll_marks does).
+#
+# Every outcome is one of the spec's fallback table, and nothing else:
+#   compacted          -> stop it; resume with a first prompt
+#   a boundary before /compact -> /compact skipped; treated as compacted
+#   no token in time   -> skip /compact; fall back to a handoff
+#   no MANUAL boundary in time after /compact -> resume as-is. NOT a handoff:
+#                         an ask would queue behind the compaction and be
+#                         written from the 20k summary.
+# Two more the table leaves open, decided here: a session with no transcript to
+# watch, or no pane to type into, falls back to a handoff — the one route that
+# can still be answered without the pane (`cl handoff` by hand) — and one whose
+# /compact could not be typed after the token resumes as-is.
+_stop_compact_phase() {
+  local i c_count=0 c_pending=0 tok prompt m rrc resent=0 deadline now sz b
+  for (( i=0; i<_n; i++ )); do
+    [ "${_h_rot[$i]}" = "compact-resume" ] && c_count=$((c_count+1))
+  done
+  [ "$c_count" -gt 0 ] || return 0
+
+  # The same announcement shape as the handoff broadcast, said up front: how
+  # many will be asked, and how long the phase may take. A dry run says how
+  # many WOULD be asked, and promises no wait.
+  if [ -n "$dry_run" ]; then
+    printf '⏳ asking %s session(s) to finish up, then /compact (dry run: nothing is sent, nothing is waited for)\n' "$c_count" >&2
+  else
+    printf '⏳ asking %s session(s) to finish up, then /compact, all at once — up to %ss\n' "$c_count" "$CL_COMPACT_TIMEOUT" >&2
+  fi
+  if [ -n "$dry_run" ]; then
+    for (( i=0; i<_n; i++ )); do
+      [ "${_h_rot[$i]}" = "compact-resume" ] || continue
+      printf '[dry-run] would ask "%s" to finish its pre-compact request, type /compact once it replies, and stop it once compacted (up to %ss)\n' \
+        "${_h_name[$i]}" "$CL_COMPACT_TIMEOUT" >&2
+    done
+    return 0
+  fi
+
+  # ── step 1 and 2: baseline, then the pre-compact request ──
+  for (( i=0; i<_n; i++ )); do
+    [ "${_h_rot[$i]}" = "compact-resume" ] || continue
+    if [ -z "$_CL_STOP_ROOT" ]; then
+      _c_fallback "$i" "no-store" "ℹ no durable location for the pre-compact request of \"${_h_name[$i]}\" — treating it as a handoff session"
+      continue
+    fi
+    _h_cbase[$i]=$(transcript_mark "${_h_sid[$i]}")
+    if [ -z "${_h_cbase[$i]}" ]; then
+      _c_fallback "$i" "no-transcript" "ℹ no transcript to watch for \"${_h_name[$i]}\", so a compaction could not be confirmed — asking it for a handoff instead"
+      continue
+    fi
+    tok=$(compact_nonce); _h_ctok[$i]="$tok"
+    prompt=$(build_handoff_ask "$_CL_STOP_ROOT" "${_h_name[$i]}" "$tok" precompact)
+    _h_mark[$i]=$(handoff_ask_mark "${_h_sid[$i]}"); _h_line[$i]="$prompt"
+    if handoff_send_once "${_h_name[$i]}" "${_h_sid[$i]}" "${_h_tmux[$i]}" "$prompt"; then
+      _h_state[$i]="cask"; _h_cstate[$i]="await_token"; c_pending=$((c_pending+1))
+      printf '  → asked "%s" to finish up before /compact\n' "${_h_name[$i]}" >&2
+    else
+      _c_fallback "$i" "unreachable" "ℹ no reachable pane to compact \"${_h_name[$i]}\" (not tmux, not a tagged iTerm tab) — treating it as a handoff session"
+    fi
+  done
+
+  # ── did each pre-compact ask arrive whole? The same check as the handoff asks ──
+  if [ "$c_pending" -gt 0 ]; then
+    handoff_poll_marks cask
+    for (( i=0; i<_n; i++ )); do
+      [ "${_h_state[$i]}" = "cask" ] && [ -n "${_h_mark[$i]:-}" ] || continue
+      m=$(handoff_ask_resend "${_h_name[$i]}" "${_h_sid[$i]}" "${_h_tmux[$i]}" "${_h_line[$i]}" "pre-compact"); rrc=$?
+      case "$rrc" in
+        0) _h_mark[$i]="$m"; resent=$((resent+1)) ;;
+        1) c_pending=$((c_pending-1))
+           _c_fallback "$i" "unreachable" "ℹ \"${_h_name[$i]}\" became unreachable before it could compact — treating it as a handoff session" ;;
+        *) _h_mark[$i]="" ;;   # busy: queued, not lost
+      esac
+    done
+    if [ "$resent" -gt 0 ]; then
+      handoff_poll_marks cask
+      for (( i=0; i<_n; i++ )); do
+        [ "${_h_state[$i]}" = "cask" ] && [ -n "${_h_mark[$i]:-}" ] || continue
+        printf '⚠ could not confirm that "%s" received the pre-compact ask — waiting for its reply anyway\n' "${_h_name[$i]}" >&2
+        _h_mark[$i]=""
+      done
+    fi
+  fi
+
+  # ── steps 3-5: one shared wait ──
+  # The window starts AFTER dispatch, as the handoff budget does: asking every
+  # session is the point, and a slow dispatch is bounded by the send timeout.
+  deadline=$(( $(date +%s) + CL_COMPACT_TIMEOUT ))
+  while [ "$c_pending" -gt 0 ]; do
+    now=$(date +%s); [ "$now" -lt "$deadline" ] || break
+    for (( i=0; i<_n; i++ )); do
+      [ "${_h_state[$i]}" = "cask" ] || continue
+      case "${_h_cstate[$i]}" in
+        await_token)
+          # A boundary since the baseline, BEFORE /compact: the goal is already
+          # met, so /compact is never typed — compacting a 20k summary again is
+          # the hazard. The turn is still let finish (the token is still the
+          # proof it ended), so it is not killed mid-turn.
+          if [ "${_h_cauto[$i]}" != "1" ] && b=$(compact_boundary_after "${_h_cbase[$i]}"); then
+            _h_cauto[$i]=1
+            IFS='|' read -r _h_cbid[$i] _ _h_cpre[$i] _h_cpost[$i] <<< "$b"
+            printf 'ℹ "%s" compacted on its own before /compact — not compacting it again\n' "${_h_name[$i]}" >&2
+          fi
+          sz=$(_mark_size "${_h_cbase[$i]}")
+          if compact_token_seen "${_h_cbase[$i]}" "${_h_ctok[$i]}" && [ "$sz" = "${_h_clastsz[$i]}" ]; then
+            if [ "${_h_cauto[$i]}" = "1" ]; then
+              _c_compacted "$i" "$(compact_boundary_after "${_h_cbase[$i]}")" "boundary-before-compact"
+              c_pending=$((c_pending-1))
+              printf '✓ "%s" finished its pre-compact turn, already compacted\n' "${_h_name[$i]}" >&2
+            else
+              # Step 4: /compact, ONCE, with no busy gate — claude_busy stays
+              # true for minutes after a turn, and the token already proves the
+              # turn ended. The mark is taken just before typing.
+              _h_cmark[$i]=$(transcript_mark "${_h_sid[$i]}")
+              if handoff_send_once "${_h_name[$i]}" "${_h_sid[$i]}" "${_h_tmux[$i]}" "/compact"; then
+                _h_cstate[$i]="await_boundary"
+                printf '  → "%s" replied; typed /compact\n' "${_h_name[$i]}" >&2
+              else
+                _h_cstate[$i]="resume"; _h_state[$i]="cdone"; _h_taken[$i]="resume"; _h_why[$i]="compact-unsent"
+                _c_clear_request "$i"
+                c_pending=$((c_pending-1))
+                printf '⚠ could not type /compact into "%s" — it will resume as-is\n' "${_h_name[$i]}" >&2
+              fi
+            fi
+          fi
+          _h_clastsz[$i]="$sz"
+          ;;
+        await_boundary)
+          # Step 5: only a MANUAL boundary after the mark confirms, or the
+          # "Compacted" output. An auto one here is not this /compact.
+          if b=$(compact_boundary_after "${_h_cmark[$i]}" manual); then
+            _c_compacted "$i" "$b" "ok"
+          elif compact_output_after "${_h_cmark[$i]}"; then
+            _c_compacted "$i" "$(compact_boundary_after "${_h_cmark[$i]}" manual || compact_boundary_after "${_h_cmark[$i]}")" "ok"
+          fi
+          if [ "${_h_cstate[$i]}" = "compacted" ]; then
+            c_pending=$((c_pending-1))
+            printf '✓ "%s" compacted%s\n' "${_h_name[$i]}" \
+              "$( [ -n "${_h_cpre[$i]}" ] && printf ' (%s → %s tokens)' "${_h_cpre[$i]}" "${_h_cpost[$i]:-?}" )" >&2
+          fi
+          ;;
+      esac
+    done
+    [ "$c_pending" -gt 0 ] && sleep 1
+  done
+
+  # ── what the window left unfinished ──
+  for (( i=0; i<_n; i++ )); do
+    [ "${_h_state[$i]}" = "cask" ] || continue
+    case "${_h_cstate[$i]}" in
+      await_token)
+        if [ "${_h_cauto[$i]}" = "1" ]; then
+          # Compacted already; only the turn's end was never confirmed, so it
+          # is not proven at rest and the ordinary mid-task prompt applies.
+          _c_compacted "$i" "$(compact_boundary_after "${_h_cbase[$i]}")" "boundary-no-token"
+        else
+          _c_fallback "$i" "no-token" "⚠ no cl-done reply from \"${_h_name[$i]}\" within ${CL_COMPACT_TIMEOUT}s — not compacting it; asking it for a handoff instead"
+        fi ;;
+      await_boundary)
+        _h_cstate[$i]="resume"; _h_state[$i]="cdone"; _h_taken[$i]="resume"; _h_why[$i]="no-boundary"
+        _c_clear_request "$i"
+        printf '⚠ "%s" did not confirm a compaction within %ss of /compact — it will resume as-is (a handoff now would queue behind the compaction)\n' \
+          "${_h_name[$i]}" "$CL_COMPACT_TIMEOUT" >&2 ;;
+    esac
+  done
+  return 0
+}
+
+# mark_row_modes <lines of agent\tname\tmode\tboundary>: record on each SAVED
+# ROW the mode this stop actually carried out, and for compact-resume the uuid
+# of the boundary it confirmed (which `cl start` preflights against).
+#
+# Matched by agent AND name. mark_resume_only matches by name alone, which is
+# harmless for a flag a Codex row ignores, but a mode is read by `cl start` for
+# whichever row it lands on, and a Claude session's mode must not end up on a
+# Codex thread that shares its name.
+mark_row_modes() {
+  local lines="$1" tmp
+  [ -n "${lines//[[:space:]]/}" ] || return 0
+  [ -r "$STATE" ] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  tmp="$STATE.mode.$$"
+  if printf '%s' "$lines" | sed '/^$/d' \
+      | jq -R -s --slurpfile all "$STATE" '
+          split("\n") | map(select(length > 0) | split("\t")
+            | {agent: .[0], name: .[1], mode: .[2], boundary: (if (.[3] // "-") == "-" then "" else .[3] end)}) as $m
+          | $all[0] | map(. as $r
+              | ([$m[] | select(.agent == ($r.agent // "claude") and .name == $r.name)] | last) as $hit
+              | if $hit == null then .
+                else .mode = $hit.mode
+                  | if $hit.mode == "compact-resume" then .compact_boundary = $hit.boundary else del(.compact_boundary) end
+                end)' \
+        > "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
+    mv "$tmp" "$STATE" 2>/dev/null || rm -f "$tmp"
+  else
+    rm -f "$tmp"
+    printf '⚠ could not record each session'"'"'s restart mode on the saved rows — `cl start` will fall back to the older rules\n' >&2
+  fi
+}
+
 # do_stop: snapshot live sessions, then kill them — but ask before killing any
 # that look mid-task, and leave those running. Re-run `cl stop` to catch them
 # once they go idle.
@@ -3684,7 +4279,7 @@ do_stop() {
   # row would bury the sessions it sits between.
   local env_rotate; env_rotate=$(rotate_env_value)
   if [ -n "${CL_ROTATE:-}" ] && [ -z "$env_rotate" ]; then
-    printf 'claude-session: ignoring CL_ROTATE="%s" (expected 0/1, on/off, no/yes) — using the stored setting\n' "$CL_ROTATE" >&2
+    printf 'claude-session: ignoring CL_ROTATE="%s" (expected 0/1, on/off, no/yes, or a mode: compact-resume, handoff, fresh, resume) — using the stored setting\n' "$CL_ROTATE" >&2
   fi
   # The serial stop divided one budget BETWEEN sessions; this one shares a
   # window between them, so a per-session floor has nothing left to describe.
@@ -3738,6 +4333,18 @@ do_stop() {
   # indexed arrays rather than one associative array because macOS ships bash
   # 3.2, which has no `declare -A`.
   local -a _h_name _h_sid _h_cwd _h_tmux _h_agent _h_rot _h_state _h_path _h_nonce _h_mark _h_line
+  # The compact-resume slots, and the outcome every session ends with:
+  #   _h_taken  the path actually taken (compact-resume|handoff|fresh|resume|kept)
+  #   _h_why    a short reason code for the log
+  #   _h_cbase  the baseline transcript mark (PASS 1's "byte size")
+  #   _h_ctok   this cycle's cl-done token
+  #   _h_cstate await_token | await_boundary | compacted | resume
+  #   _h_cauto  1 once a boundary appeared before /compact was typed
+  #   _h_cmark  the mark taken just before typing /compact
+  #   _h_clastsz the size seen on the previous poll (the stability check)
+  #   _h_cbid/_h_cpre/_h_cpost  the confirming boundary's uuid and token figures
+  #   _h_cidle  1 once the transcript proves the session at rest since then
+  local -a _h_taken _h_why _h_cbase _h_ctok _h_cstate _h_cauto _h_cmark _h_clastsz _h_cbid _h_cpre _h_cpost _h_cidle
   # SEPARATE COUNTERS, because one number cannot answer three questions and the
   # transcript was mixing them (Codex, PR #19): _eligible is every rotation-on
   # session, _manual those already answered by hand, _to_ask what will actually
@@ -3793,26 +4400,40 @@ do_stop() {
       if [ -z "$log_mode" ]; then log_mode="$_STOP_ROTATE"
       elif [ "$log_mode" != "$_STOP_ROTATE" ]; then log_mode="mixed"; fi
     fi
-    if [ "$_STOP_ROTATE" = "on" ]; then
-      _eligible=$(( _eligible + 1 ))
-      # A HAND-WRITTEN HANDOFF IS ALREADY AN ANSWER, and it is discovered HERE
-      # rather than mid-dispatch so the count announced below is true. It is how
-      # you satisfy this when the pane cannot be reached at all (`cl handoff`,
-      # run inside the session). Its AGE is printed prominently, because the one
-      # real hazard is acting on something written weeks ago and forgotten.
-      if [ -z "$dry_run" ] && [ -n "$_CL_STOP_ROOT" ]; then
-        _h_path[$_n]="$(handoff_path "$_CL_STOP_ROOT" "$name")"
-        if handoff_is_manual "${_h_path[$_n]}"; then
-          printf '✓ using the handoff you wrote by hand for "%s" — written %s ago (%s)\n' \
-            "$name" "$(handoff_age_human "${_h_path[$_n]}")" "${_h_path[$_n]}" >&2
-          _h_state[$_n]="manual"; _manual=$(( _manual + 1 ))
-        fi
-      fi
-    fi
+    _h_taken[$_n]=""; _h_why[$_n]=""; _h_cbase[$_n]=""; _h_ctok[$_n]=""; _h_cstate[$_n]=""
+    _h_cauto[$_n]=0; _h_cmark[$_n]=""; _h_clastsz[$_n]=""; _h_cbid[$_n]=""; _h_cpre[$_n]=""; _h_cpost[$_n]=""
+    _h_cidle[$_n]=0
     _n=$((_n+1))
   done <<< "$_rows"
   # Said once, so a session the operator expected back is not a silent surprise.
   [ -n "$_notlive" ] && printf 'not running, so left as they are (reopen with `cl "<name>"`): %s\n\n' "$_notlive" >&2
+
+  # ── PASS C: COMPACT (compact-resume sessions) ───────────────────────────────
+  # Spec steps 2-5 of docs/restart-modes.md, for every compacting session at
+  # once under ONE CL_COMPACT_TIMEOUT window. It runs BEFORE the handoff
+  # broadcast because one of its outcomes — no token in time — is a fallback to
+  # a handoff, and those sessions then join that broadcast like any other.
+  _stop_compact_phase
+
+  # A HAND-WRITTEN HANDOFF IS ALREADY AN ANSWER, and it is discovered HERE —
+  # after the compact phase, so a session that fell back to a handoff is counted
+  # too, and before any handoff is asked for, so the count announced below is
+  # true. It is how you satisfy this when the pane cannot be reached at all
+  # (`cl handoff`, run inside the session). Its AGE is printed prominently,
+  # because the one real hazard is acting on something written weeks ago and
+  # forgotten.
+  for (( i=0; i<_n; i++ )); do
+    [ "${_h_rot[$i]}" = "handoff" ] || continue
+    _eligible=$(( _eligible + 1 ))
+    if [ -z "$dry_run" ] && [ -n "$_CL_STOP_ROOT" ]; then
+      _h_path[$i]="$(handoff_path "$_CL_STOP_ROOT" "${_h_name[$i]}")"
+      if handoff_is_manual "${_h_path[$i]}"; then
+        printf '✓ using the handoff you wrote by hand for "%s" — written %s ago (%s)\n' \
+          "${_h_name[$i]}" "$(handoff_age_human "${_h_path[$i]}")" "${_h_path[$i]}" >&2
+        _h_state[$i]="manual"; _manual=$(( _manual + 1 ))
+      fi
+    fi
+  done
   _to_ask=$(( _eligible - _manual ))
 
   # ── PASS 2: BROADCAST ───────────────────────────────────────────────────────
@@ -3844,7 +4465,7 @@ do_stop() {
     fi
   fi
   for (( i=0; i<_n; i++ )); do
-    [ "${_h_rot[$i]}" = "on" ] || continue
+    [ "${_h_rot[$i]}" = "handoff" ] || continue
     if [ -n "$dry_run" ]; then
       # Preview ONLY, via the read-only resolver: resolving the real root means
       # mkdir + a write probe, and a dry run must do neither. (Found in Codex
@@ -4005,11 +4626,47 @@ do_stop() {
     printf '.\n' >&2
   fi
 
+  # ── PASS C2: IS EACH COMPACTED SESSION AT REST? ─────────────────────────────
+  # Spec step 6. Checked here, right before the kills rather than when the
+  # compaction was confirmed, because the handoff phase may have taken minutes
+  # since. One shared pause for the size-stability half, not one per session.
+  if [ -z "$dry_run" ]; then
+    local -a _c_sz1=()
+    local _c_any=0
+    for (( i=0; i<_n; i++ )); do
+      [ "${_h_taken[$i]}" = "compact-resume" ] || continue
+      _c_sz1[$i]=$(_mark_size "${_h_cbase[$i]}"); _c_any=1
+    done
+    if [ "$_c_any" = "1" ]; then
+      sleep "${CL_COMPACT_IDLE_POLL:-1}"
+      for (( i=0; i<_n; i++ )); do
+        [ "${_h_taken[$i]}" = "compact-resume" ] || continue
+        [ "$(_mark_size "${_h_cbase[$i]}")" = "${_c_sz1[$i]}" ] || continue
+        # A session that compacted on its own is at rest once its turn has
+        # ended with the token; one that ran /compact, once "Compacted" (or the
+        # compaction's SessionStart hook) is the last thing it wrote.
+        if [ "${_h_cauto[$i]}" = "1" ]; then
+          compact_idle_record "${_h_cbase[$i]}" "${_h_ctok[$i]}" && _h_cidle[$i]=1
+        else
+          compact_idle_record "${_h_cmark[$i]}" && _h_cidle[$i]=1
+        fi
+      done
+    fi
+  fi
+
   # ── PASS 4: CONFIRM, THEN CLOSE ─────────────────────────────────────────────
-  local sid_i _unreach_n
+  local sid_i _unreach_n mode_rows="" log_paths="" log_whys="" log_pre="" log_post="" _idle _lp_sep=""
+  # _log_session <i>: append one session to the log's per-session lists. An
+  # empty figure stays an empty field — never dropped — so position N in every
+  # list is the same session.
+  _log_session() {
+    log_paths="${log_paths}${_lp_sep}${_h_taken[$1]}"; log_whys="${log_whys}${_lp_sep}${_h_why[$1]}"
+    log_pre="${log_pre}${_lp_sep}${_h_cpre[$1]}"; log_post="${log_post}${_lp_sep}${_h_cpost[$1]}"
+    _lp_sep=","
+  }
   for (( i=0; i<_n; i++ )); do
     name="${_h_name[$i]}"; sid_i="${_h_sid[$i]}"; t="${_h_tmux[$i]}"
-    agent="${_h_agent[$i]}"; sess_rotate="${_h_rot[$i]}"
+    agent="${_h_agent[$i]}"; sess_rotate="${_h_rot[$i]}"; _idle=0
     if [ -n "$dry_run" ]; then
       printf '[dry-run] would evaluate and, if not left running, kill "%s" (rotation %s)\n' "$name" "$sess_rotate" >&2
       continue
@@ -4018,26 +4675,41 @@ do_stop() {
       # Read BEFORE the session is killed: afterwards the transcript stops
       # growing, but this is the figure that matters — what this session had
       # grown to, i.e. what each further call would have carried on a resume.
+      # After a compaction it is still the PRE-compaction figure (no call has
+      # run since), which is why the log takes pre/postTokens from the boundary.
       ctxs="$ctxs $(context_size "$sid_i" "$agent")"
     fi
     # Rotation is a Claude mechanism: a Codex row is stopped and resumed as
     # itself, so it skips the whole handoff block rather than being asked for
     # something it has no way to produce.
-    if [ "$sess_rotate" = "n/a" ]; then
-      :
-    elif [ "$sess_rotate" = "off" ]; then
-      # A skip has to be DURABLE, not inferred from absence. An earlier
-      # handoff may still be sitting there from a previous cycle, and leaving
-      # it would make the next `cl start` rotate — the exact opposite of what
-      # "stop it as-is" promises. Clear it so the promise is true.
-      if [ -n "$_CL_STOP_ROOT" ] && [ -f "$(handoff_path "$_CL_STOP_ROOT" "$name")" ]; then
-        consume_handoff "$_CL_STOP_ROOT" "$name" "rotation is off for this session" >/dev/null
-      fi
-      # Recorded on the row as well, so a clear that failed cannot quietly turn
-      # an explicit skip back into a rotation.
-      resume_only="${resume_only}${name}"$'\n'
-      n_ronly=$((n_ronly+1))
-    else
+    #
+    # EVERY mode is named here. This used to be `n/a | off | else`, and with the
+    # vocabulary widened an unmapped value would have fallen into the handoff
+    # branch and been reported as a failed handoff.
+    case "$sess_rotate" in
+      n/a) : ;;
+      resume|fresh|compact-resume)
+        # A skip has to be DURABLE, not inferred from absence. An earlier
+        # handoff may still be sitting there from a previous cycle, and leaving
+        # it would make the next `cl start` rotate — the exact opposite of what
+        # every one of these modes promises. Clear it so the promise is true.
+        if [ -n "$_CL_STOP_ROOT" ] && [ -f "$(handoff_path "$_CL_STOP_ROOT" "$name")" ]; then
+          consume_handoff "$_CL_STOP_ROOT" "$name" "this session's mode is $sess_rotate, so it does not rotate" >/dev/null
+        fi
+        if [ "$sess_rotate" = "fresh" ]; then
+          _h_taken[$i]="fresh"; [ -n "${_h_why[$i]}" ] || _h_why[$i]="ok"
+        else
+          # Recorded on the row as well, so a clear that failed cannot quietly
+          # turn an explicit skip back into a rotation. A compacted session is
+          # resume-only too: it comes back by --resume, with a first prompt.
+          resume_only="${resume_only}${name}"$'\n'
+          n_ronly=$((n_ronly+1))
+          [ -n "${_h_taken[$i]}" ] || _h_taken[$i]="resume"
+          [ -n "${_h_why[$i]}" ] || _h_why[$i]="ok"
+          [ "${_h_taken[$i]}" = "compact-resume" ] && [ "${_h_cidle[$i]}" = "1" ] && _idle=1
+        fi
+        ;;
+      handoff)
       # The handoff is an OPTIMISATION and the plain resume is the floor, so a
       # failed handoff is loud, not fatal: `cl stop` still stops. Refusing
       # instead would redefine the one command you run before a reboot, and
@@ -4048,12 +4720,20 @@ do_stop() {
         unreachable) hrc=1 ;;
         *)           hrc=2 ;;
       esac
+      local _why_h
+      case "${_h_state[$i]}" in
+        done) _why_h="ok" ;; manual) _why_h="manual" ;; unreachable) _why_h="unreachable" ;; *) _why_h="no-handoff" ;;
+      esac
+      # A fallback from compact-resume keeps its first reason in front.
+      _h_why[$i]="${_h_why[$i]:+${_h_why[$i]}+}${_why_h}"
       if [ "$hrc" -ne 0 ]; then
         if [ "$require_handoff" = "1" ]; then
           printf '✋ leaving "%s" running — --require-handoff was given and no handoff arrived.\n' "$name" >&2
           printf '   · run `cl handoff` INSIDE that session, then `cl stop` again\n' >&2
           printf '   · or plain `cl stop` to stop it and resume it as-is next time\n' >&2
           kept=$((kept+1)); kept_names="${kept_names}${name}"$'\n'
+          _h_taken[$i]="kept"
+          _log_session "$i"
           continue
         fi
         printf '⚠ no handoff from "%s" — stopping it anyway; `cl start` will RESUME it, not rotate it\n' "$name" >&2
@@ -4062,10 +4742,27 @@ do_stop() {
         # just printed.
         resume_only="${resume_only}${name}"$'\n'
         nohandoff=$((nohandoff+1)); n_ronly=$((n_ronly+1))
+        _h_taken[$i]="resume"
       else
         n_handoffs=$((n_handoffs+1))
+        _h_taken[$i]="handoff"
       fi
+      ;;
+      *)
+        # Unreachable while _mode_normalize is the only way a mode gets here;
+        # said out loud rather than guessed at if that ever stops being true.
+        printf '⚠ "%s" has an unknown mode "%s" — stopping it and resuming it as-is\n' "$name" "$sess_rotate" >&2
+        resume_only="${resume_only}${name}"$'\n'; n_ronly=$((n_ronly+1))
+        _h_taken[$i]="resume"; _h_why[$i]="unknown-mode"
+        ;;
+    esac
+    # The mode actually carried out goes on the saved row, by agent AND name,
+    # so `cl start` does what this stop did rather than re-deriving it.
+    # (A session left running is not recorded: its stop carried nothing out.)
+    if [ "$agent" = "claude" ] && [ "${_h_taken[$i]}" != "kept" ]; then
+      mode_rows="${mode_rows}${agent}"$'\t'"${name}"$'\t'"${_h_taken[$i]}"$'\t'"${_h_cbid[$i]:--}"$'\n'
     fi
+    [ "$sess_rotate" != "n/a" ] && _log_session "$i"
     # retire_session covers both branches (tmux-hosted and bare process)
     # with the busy-check-and-prompt, tab/surface cleanup, the hidden-tmux
     # ownership guard, and the Codex ownership rules — do_stop just runs it and
@@ -4074,7 +4771,9 @@ do_stop() {
     # owner cl cannot tie to a session — fails the stop, so a script can trust
     # exit 0 to mean "everything cl manages is stopped" (owner decision, 2026-11-03).
     # Code 4 is the one exception: not cl's to stop, so not this stop's failure.
-    rrc=0; retire_session "$name" "$sid_i" "$t" "$close_tabs" "$agent" || rrc=$?
+    # $_idle is 1 only for a compacted session the transcript shows at rest —
+    # the one case where the mid-task prompt would be asking about nothing.
+    rrc=0; retire_session "$name" "$sid_i" "$t" "$close_tabs" "$agent" "$_idle" || rrc=$?
     case "$rrc" in
       3)   unresolved_names="${unresolved_names}${name}"$'\n' ;;
       1|2) left_names="${left_names}${name}"$'\n' ;;
@@ -4083,6 +4782,7 @@ do_stop() {
 
   [ -n "$dry_run" ] && return 0
   mark_resume_only "$resume_only"
+  mark_row_modes "$mode_rows"
   # Logged whatever happened, including a stop that rotated nothing: a week of
   # "off" cycles is half the measurement, and a gap in the log would read as a
   # week with no work rather than a week without rotation.
@@ -4093,7 +4793,8 @@ do_stop() {
   # guards, because the cost of this one being wrong is a machine that will not
   # shut down cleanly over a log file.
   { [ "$n_sessions" -gt 0 ] && rotation_log_append \
-      "${log_mode:-off}" "${log_src:-default}" "$n_sessions" "$n_handoffs" "$n_ronly" "$kept" $ctxs; } || :
+      "${log_mode:-resume}" "${log_src:-default}" "$n_sessions" "$n_handoffs" "$n_ronly" "$kept" \
+      "$log_paths" "$log_whys" "$log_pre" "$log_post" $ctxs; } || :
   printf '\nstate saved. Run cl start to bring these back.\n' >&2
   if [ "$nohandoff" -gt 0 ]; then
     printf '\n%s session(s) stopped WITHOUT a handoff — `cl start` will resume those as they were\n' "$nohandoff" >&2
@@ -4305,9 +5006,9 @@ do_start() {
   # consumed handoff through to the tab, and a Codex row has to carry --codex —
   # so the command is built in the same place those are decided, rather than
   # reconstructed from the name later. (It also means STATE is read once.)
-  local name sid cwd agent ronly t i=0 claim cmd rsid_env kept=""
-  local -a tab_cmds=()
-  while IFS=$'\t' read -r name sid cwd agent ronly; do
+  local name sid cwd agent ronly rmode rbid t i=0 claim cmd rsid_env kept="" cfresh ccompact
+  local -a tab_cmds=() _cr_t=() _cr_name=() _cr_sid=() _cr_cwd=()
+  while IFS=$'\t' read -r name sid cwd agent ronly rmode rbid; do
     agent="${agent:-claude}"
     t=$(tmux_name "$name" "$agent")
     [ -d "$cwd" ] || cwd="$HOME"
@@ -4335,6 +5036,18 @@ do_start() {
       # still there and a re-run does the right thing.
       if [ "$agent" != "claude" ]; then
         tab_cmds+=("$(tab_cmd "$agent" "$name")")
+      elif [ "$rmode" = "compact-resume" ]; then
+        # The MODE travels in the tab command, as --rotate-from does: the tab
+        # is the process that launches, so it is the one that preflights. No
+        # handoff is touched here, whatever sits in the store — none was asked
+        # for this cycle (see compact_preflight).
+        tab_cmds+=("$(tab_cmd "$agent" "$name") --restart-mode compact-resume $(printf '%q' "$rbid")")
+        printf '⟳ %s will resume from its compaction\n' "$name"
+      elif [ "$rmode" = "fresh" ]; then
+        [ -n "$root" ] && [ -f "$(handoff_path "$root" "$name")" ] \
+          && consume_handoff "$root" "$name" "this cycle was recorded as fresh" >/dev/null
+        tab_cmds+=("$(tab_cmd "$agent" "$name") --restart-mode fresh")
+        printf '✦ %s will start as a new session\n' "$name"
       elif [ "$ronly" = "true" ]; then
         [ -n "$root" ] && [ -f "$(handoff_path "$root" "$name")" ] \
           && consume_handoff "$root" "$name" "this cycle was recorded resume-only" >/dev/null
@@ -4358,9 +5071,27 @@ do_start() {
     # tmux path: `tmux new-session -d` either creates the session or it does
     # not, and this process sees which — so the claim can be committed or
     # rolled back right here, against real acceptance.
-    claim=""; rsid_env=""
+    claim=""; rsid_env=""; cfresh=0; ccompact=0
     if [ "$agent" != "claude" ]; then
       rsid_env="$sid"; cmd=$(resume_cmd "$agent" "$sid" "$name")
+    elif [ "$rmode" = "compact-resume" ]; then
+      # Never a rotation, whatever the preflight says: no handoff was asked for
+      # this cycle, so a handoff in the store predates it — the stale case
+      # mark_resume_only guards against. A failed preflight resumes plainly.
+      rsid_env="$sid"
+      if compact_preflight "$sid" "$rbid"; then
+        cmd=$(resume_cmd claude "$sid" "$name" "$(build_compact_resume_prompt)"); ccompact=1
+      else
+        printf '⚠ "%s" is not the session its stop compacted (transcript missing, or compacted again since) — resuming it plainly\n' "$name" >&2
+        cmd=$(resume_cmd claude "$sid" "$name")
+      fi
+    elif [ "$rmode" = "fresh" ]; then
+      # A NEW session under the name, with nothing to read: the fresh-start
+      # machinery with an empty first prompt. A handoff left in the store is
+      # filed, so it cannot rotate a later start.
+      [ -n "$root" ] && [ -f "$(handoff_path "$root" "$name")" ] \
+        && consume_handoff "$root" "$name" "this cycle was recorded as fresh" >/dev/null
+      cmd=$(fresh_cmd "$name" ""); cfresh=1
     elif [ "$ronly" = "true" ]; then
       [ -n "$root" ] && [ -f "$(handoff_path "$root" "$name")" ] \
         && consume_handoff "$root" "$name" "this cycle was recorded resume-only" >/dev/null
@@ -4379,6 +5110,12 @@ do_start() {
         record_fresh_history "$name" "$sid" "$cwd"
         commit_claim "$root" "$name" "$claim" "rotating on start"
         printf '↻ prepared %s fresh from its handoff  (%s)\n' "$name" "$cwd"
+      elif [ "$cfresh" = "1" ]; then
+        record_fresh_history "$name" "$sid" "$cwd"
+        printf '✦ prepared %s as a new session  (%s)\n' "$name" "$cwd"
+      elif [ "$ccompact" = "1" ]; then
+        _cr_t+=("$t"); _cr_name+=("$name"); _cr_sid+=("$sid"); _cr_cwd+=("$cwd")
+        printf '⟳ prepared %s from its compaction  (%s)\n' "$name" "$cwd"
       else
         printf '✓ prepared %s  (%s)\n' "$name" "$cwd"
       fi
@@ -4388,7 +5125,33 @@ do_start() {
       printf '✗ could not prepare %s — leaving it in the restart list\n' "$name" >&2
       kept="${kept}${agent}"$'\t'"${name}"$'\n'
     fi
-  done < <(jq -r '.[] | [.name, .sid, .cwd, (.agent // "claude"), (.resume_only // false)] | @tsv' "$STATE")
+  # mode and boundary use "-" for "none": tab is IFS whitespace to `read`, so an
+  # empty field in the middle would shift the ones after it.
+  done < <(jq -r '.[] | [.name, .sid, .cwd, (.agent // "claude"), (.resume_only // false),
+                         (if (.mode // "") == "" then "-" else .mode end),
+                         (if (.compact_boundary // "") == "" then "-" else .compact_boundary end)] | @tsv' "$STATE")
+
+  # ── DID EACH RESUME-WITH-A-PROMPT STAY UP? ──────────────────────────────────
+  # A first prompt is a new argument on a command that never carried one, so a
+  # claude that refuses it must not cost the session. Polled once for all of
+  # them, about CL_RESUME_CHECK seconds after launch; one that is gone is
+  # resumed plainly and said so. Never rotated: no handoff was asked for.
+  if [ "${#_cr_t[@]}" -gt 0 ]; then
+    local _w=0 _j
+    while [ "$_w" -lt "$(( ${CL_RESUME_CHECK:-5} * 4 ))" ]; do sleep 0.25; _w=$((_w+1)); done
+    for (( _j=0; _j<${#_cr_t[@]}; _j++ )); do
+      tmux has-session -t "=${_cr_t[$_j]}" 2>/dev/null && continue
+      printf '⚠ "%s" did not stay up when resumed with its first prompt — resuming it plainly\n' "${_cr_name[$_j]}" >&2
+      if tmux new-session -d -s "${_cr_t[$_j]}" -c "${_cr_cwd[$_j]}" \
+           "$(env_prefix "${_cr_name[$_j]}" "${_cr_sid[$_j]}")$(resume_cmd claude "${_cr_sid[$_j]}" "${_cr_name[$_j]}")"; then
+        tmux_claim "${_cr_t[$_j]}" claude "${_cr_sid[$_j]}"
+        printf '✓ prepared %s (plain resume)\n' "${_cr_name[$_j]}"
+      else
+        printf '✗ could not prepare %s — leaving it in the restart list\n' "${_cr_name[$_j]}" >&2
+        kept="${kept}claude"$'\t'"${_cr_name[$_j]}"$'\n'
+      fi
+    done
+  fi
 
   # Snapshot consumed: archive a copy first (so a failed relaunch never loses
   # the list — restore from STATE_HISTORY_DIR), then keep exactly the rows this
@@ -4784,13 +5547,17 @@ agent_tag() { [ "$1" = "claude" ] && printf '%-6s' '' || printf '%-6s' "$1"; }
 # POLICY and STATE in one narrow column, because they answer different questions
 # and seeing only one of them is misleading:
 #
-#   on      will be asked for a handoff at the next `cl stop`
-#   on↻     …and a complete handoff is already waiting (next start rotates)
-#   off     will not be asked
-#   off↻    will not be asked, but a handoff IS waiting — someone wrote one by
-#           hand, and the next stop will clear it. Worth seeing rather than
-#           silently reconciling.
-#   —       Codex: no handoff mechanism at all, so nothing to enable
+#   compact   compacted at the next `cl stop`, then resumed
+#   handoff   will be asked for a handoff at the next `cl stop`
+#   handoff↻  …and a complete handoff is already waiting (next start rotates)
+#   fresh     stopped with no handoff and restarted as a new session
+#   resume    will not be asked; resumes as-is
+#   resume↻   will not be asked, but a handoff IS waiting — someone wrote one by
+#             hand, and the next stop will clear it. Worth seeing rather than
+#             silently reconciling. (Any mode but handoff can show this.)
+#   —         Codex: always resumes as itself, so nothing to choose
+#
+# Short forms, because compact-resume (14 characters) would not fit the column.
 #
 # The root is passed in because resolving the handoff store per row would re-run
 # its directory checks once per session.
@@ -4799,7 +5566,7 @@ rotate_cell() {
   [ "$agent" = "claude" ] || { printf '—'; return 0; }
   v=$(rotate_for "$name" "$agent" 2>/dev/null)
   [ -n "$root" ] && handoff_is_complete "$(handoff_path "$root" "$name")" 2>/dev/null && pending='↻'
-  printf '%s%s' "$v" "$pending"
+  printf '%s%s' "$(_mode_short "$v")" "$pending"
 }
 
 # fzf rows: "<display>\tNAME\tSID\tCWD\tAGENT"  (display shown; rest carried for the action)
@@ -4814,7 +5581,7 @@ rows() {
   local _root=""
   handoff_root >/dev/null 2>&1 && _root="$_CL_HANDOFF_ROOT"
   discover | while IFS=$'\t' read -r name sid cwd epoch agent; do
-    printf '%s %-22s %s %-8s %-5s %s\t%s\t%s\t%s\t%s\n' "$(live_dot "$name" "$sid" "$agent")" "$name" "$(agent_tag "$agent")" "$(reltime "$epoch")" "$(rotate_cell "$name" "$agent" "$_root")" "$cwd" "$name" "$sid" "$cwd" "$agent"
+    printf '%s %-22s %s %-8s %-8s %s\t%s\t%s\t%s\t%s\n' "$(live_dot "$name" "$sid" "$agent")" "$name" "$(agent_tag "$agent")" "$(reltime "$epoch")" "$(rotate_cell "$name" "$agent" "$_root")" "$cwd" "$name" "$sid" "$cwd" "$agent"
   done
 }
 
@@ -4822,21 +5589,25 @@ rows() {
 # short and one flag per line; the reasoning lives in the header comment above.
 print_stop_help() {
   cat <<'EOF'
-cl stop [flags]   request handoffs from eligible Claude sessions (rotation on),
-                  then save running sessions and stop each one it can safely
-                  retire. Codex sessions are never asked; they resume as they
-                  were. Anything cl manages that is left running is named and
-                  the exit is non-zero; a Codex thread cl did not launch is
+cl stop [flags]   prepare each Claude session by its mode (`cl mode`):
+                  compact-resume compacts it first, handoff asks for a
+                  handoff, fresh and resume ask nothing. Then save running
+                  sessions and stop each one it can safely retire. Codex
+                  sessions are never asked; they resume as they were.
+                  Anything cl manages that is left running is named and the
+                  exit is non-zero; a Codex thread cl did not launch is
                   reported and left alone.
 
-  --no-handoff        stop without asking for handoffs; `cl start` resumes
+  --no-handoff        stop now: no compaction, no handoff; `cl start` resumes
                       each session as it was (and clears any pending handoff)
-  --require-handoff   fail closed: exit non-zero if a session is left running
-                      without a handoff (alias: --rotate)
+  --require-handoff   ask every Claude session for a handoff, and fail closed:
+                      exit non-zero if one is left running without a handoff
+                      (alias: --rotate)
   --keep-tabs         leave the iTerm tabs open
   --dry-run           show what would happen; change nothing
   -h, --help          this help
 
+  Compaction wait: CL_COMPACT_TIMEOUT for all sessions at once (600s).
   Handoff wait: CL_HANDOFF_TIMEOUT per round (180s), CL_HANDOFF_BUDGET in
   total (300s). Asks before killing a session that is still mid-task.
 EOF
@@ -4863,8 +5634,11 @@ cl — pick, launch and resume named Claude Code and Codex sessions
   cl restore [--list]         restore the saved set from an earlier snapshot
 
   cl handoff [--path]         write THIS session's handoff by hand
+  cl mode ["Name" [compact-resume|handoff|fresh|resume|clear]]
+                              how each session is stopped and started again
+                              (`cl mode --default <mode>` sets the default)
   cl rotate [status|on|off|clear|stats] ["Name"]
-                              whether `cl stop` asks for handoffs
+                              the same setting: on = handoff, off = resume
   cl model [--codex|--claude] [<name> <model-id>|<name> -]
                               the model remembered per session
 
@@ -4893,6 +5667,7 @@ case "${1:-}" in
     exit $? ;;
   handoff) shift; do_handoff "$@"; exit 0 ;;
   rotate)  shift; do_rotate "$@"; exit $? ;;
+  mode)    shift; do_mode "$@"; exit $? ;;
   restore) do_restore "${2:-}"; exit 0 ;;
   --discover)  # raw TSV (name sid cwd epoch agent) — for scripts and tests
     discover; exit 0 ;;
@@ -4900,12 +5675,12 @@ case "${1:-}" in
     # HANDOFF is the POLICY (plus ↻ when one is already waiting); HINT is ADVICE
     # from the context size. They were one unlabelled column before, which read as
     # if the advice were the setting — two different questions, two headings.
-    printf '%-2s %-22s %-6s %-8s %-6s %-6s %-6s %s\n' '' NAME AGENT 'ACTIVE' CTX HANDOFF HINT DIR
+    printf '%-2s %-22s %-6s %-8s %-6s %-8s %-6s %s\n' '' NAME AGENT 'ACTIVE' CTX HANDOFF HINT DIR
     _lroot=""; handoff_root >/dev/null 2>&1 && _lroot="$_CL_HANDOFF_ROOT"
     discover | while IFS=$'\t' read -r name sid cwd epoch agent; do
       [ -z "$AGENT_FILTER" ] || [ "$agent" = "$AGENT_FILTER" ] || continue
       ctx=$(context_size "$sid" "$agent")
-      printf '%-2s %-22s %s %-8s %-6s %-6s %-6s %s\n' "$(live_dot "$name" "$sid" "$agent")" "$name" "$(agent_tag "$agent")" "$(reltime "$epoch")" "$(fmt_ctx "$ctx")" "$(rotate_cell "$name" "$agent" "$_lroot")" "$(rotate_hint "$ctx" "$epoch" "$agent")" "$cwd"
+      printf '%-2s %-22s %s %-8s %-6s %-8s %-6s %s\n' "$(live_dot "$name" "$sid" "$agent")" "$name" "$(agent_tag "$agent")" "$(reltime "$epoch")" "$(fmt_ctx "$ctx")" "$(rotate_cell "$name" "$agent" "$_lroot")" "$(rotate_hint "$ctx" "$epoch" "$agent")" "$cwd"
     done
     exit 0 ;;
   -h|--help) print_help; exit 0 ;;
@@ -4953,6 +5728,31 @@ case "${1:-}" in
       # never happened would be a lie.
       [ -n "$rsid" ] && record_fresh_history "$1" "$rsid" "$rcwd"
       launch_fresh "$1" "$rcwd" "$(build_resume_prompt "$rclaim")" "$rroot" "$rclaim" "$rsid"
+      exit 0
+    fi
+    # `cl <name> --restart-mode <mode> [<boundary>]`: internal, emitted by `cl
+    # start` in the no-tmux shape for a Claude row whose stop recorded a mode,
+    # the way --rotate-from is. This tab is the process that launches, so it is
+    # the one that preflights (compact-resume) or retires the old id (fresh).
+    if [ "${2:-}" = "--restart-mode" ]; then
+      rrow=$(discover | awk -F'\t' -v n="$1" '$1==n && $5=="claude" {print; exit}')
+      [ -n "$rrow" ] || { echo "claude-session: no claude session named '$1' (try --list)" >&2; exit 1; }
+      rcwd=$(printf '%s' "$rrow" | cut -f3); rsid=$(printf '%s' "$rrow" | cut -f2)
+      case "${3:-}" in
+        compact-resume)
+          # A failed preflight resumes PLAINLY and is reported; it never falls
+          # through to a handoff, because none was requested this cycle.
+          if compact_preflight "$rsid" "${4:--}"; then
+            launch_session "$1" "$rsid" "$rcwd" claude "$(build_compact_resume_prompt)"
+          else
+            printf '⚠ "%s" is not the session its stop compacted (transcript missing, or compacted again since) — resuming it plainly\n' "$1" >&2
+            launch_session "$1" "$rsid" "$rcwd" claude
+          fi ;;
+        fresh)
+          record_fresh_history "$1" "$rsid" "$rcwd"
+          launch_fresh "$1" "$rcwd" "" "" "" "$rsid" ;;
+        *) echo "claude-session: --restart-mode: unknown mode '${3:-}'" >&2; exit 1 ;;
+      esac
       exit 0
     fi
     # direct launch by name. A name held by BOTH agents is refused unless

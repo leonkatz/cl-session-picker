@@ -418,16 +418,25 @@ about how someone works, not one this design can settle, so the policy is
 switchable and each stop records which way it ran.
 
 ```sh
-cl rotate                 # policy, plus whether a handoff is already waiting
-cl rotate off             # sessions are stopped and resumed as-is
-cl rotate off "Review"    # one session; cl rotate clear "Review" undoes it
+cl mode                   # policy, plus whether a handoff is already waiting
+cl mode "Review" handoff  # this session rotates through a handoff
+cl rotate off             # the old toggle: off = resume, on = handoff
+cl mode "Review" clear    # back to the default
 cl rotate stats           # the per-stop log, by week
 ```
 
-Resolved per session, highest first: a flag on the stop (`--no-handoff`,
-`--require-handoff`), then `CL_ROTATE=0|1`, then the stored setting in
-`rotate.json`, then on. Off skips the **request**, not merely its use: asking and
-discarding would pay rotation's cost while measuring its absence.
+The handoff is one of four restart modes (see
+[restart-modes.md](restart-modes.md)); the default is now `compact-resume`,
+which compacts a session instead of rotating it, and falls back to a handoff
+only when the session never confirms its pre-compact turn. A `rotate.json`
+written before modes existed keeps its meaning: `on` is `handoff`, `off` is
+`resume`.
+
+Resolved per session, highest first: a flag on the stop (`--no-handoff` forces
+`resume`, `--require-handoff` forces `handoff`), then `CL_ROTATE` (`0|1`, or a
+mode name), then the stored setting in `rotate.json`, then `compact-resume`.
+`resume` skips the **request**, not merely its use: asking and discarding would
+pay rotation's cost while measuring its absence.
 
 `rotation-log.tsv` gets one line per stop — mode, which layer decided, sessions,
 handoffs obtained, and **every session's context size at stop time**. That last
