@@ -474,7 +474,16 @@ and never resumes the archived old one. The row is settled (mode `resume`) only
 once the launch is verified as codex running on the new id: a `cl`-stamped
 tmux session with that process inside its pane, or `cl`'s launch record in the
 iTerm shape (checked by the next `cl start`, since the tab's own process has
-become the agent). The old id is kept in `fresh-history.json` the moment it is
+become the agent). "Codex" is checked on the command line's tokens, not a
+substring, and the journal is kept until the row's settling is written. An
+archive is judged by where the old rollout ended up, not by the command's exit
+status; when that cannot be told, the run stops without discarding anything. A
+retry after a crash in the moment between a thread being made and its id
+being saved recovers that thread when exactly one candidate matches, and stops
+when more than one does — so this is not exactly-once, but it never guesses.
+A verified launch does not prove a coordination lane has moved to the new
+thread; with a re-arm helper installed, `cl` says so rather than reporting it
+done. The old id is kept in `fresh-history.json` the moment it is
 archived, with the command to bring it back (`codex unarchive <id> && codex
 resume <id>`); unarchiving is never automatic. `CL_CODEX_RPC_TIMEOUT` (default
 20s) bounds each app-server request.

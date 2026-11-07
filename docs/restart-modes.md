@@ -224,17 +224,51 @@ are re-offered to the new thread by the watcher's own re-send.
   the old thread resumed plainly. From `archived` on it only rolls forward — a
   failed row write launches nothing and leaves the transaction for the next
   start, which resumes the same new thread. Unarchive is never automatic; it is
-  the printed way back. A crash between thread/start answering and `created`
-  being written leaves an unnamed thread nobody has the id of; unnamed threads
-  are not listed, and the retry starts over from `begun`.
+  the printed way back. The archive is judged by its postcondition, not the
+  command's exit status: a reply lost after the side effect still counts as
+  archived (roll forward); still listed means it did not happen (roll back);
+  neither listed nor in `archived_sessions/` stops the run as
+  `archive-uncertain`, discarding nothing and launching nothing. A rollback
+  also refuses unless the old thread is still listed.
+- **Not exactly-once.** A run that dies after thread/start takes effect but
+  before `created` is written leaves a thread whose id was never saved. A
+  retry at `begun` reconciles from local storage first: exactly one unnamed
+  thread in that cwd, created since `begun` and known to no transaction, is
+  adopted (then named like any `created` retry); more than one stops the run
+  as ambiguous; none means nothing persisted, and creation starts over. A
+  thread another name's transaction is creating in the same cwd at that moment
+  could be counted, which can only make it stop.
+- **Probed against Codex 0.163.0** (throwaway `CODEX_HOME`, no credentials):
+  `thread/start` alone, with the app-server closed before naming, wrote no
+  rollout, and a second app-server then refused both `thread/name/set` ("no
+  rollout found") and `thread/read` ("thread not loaded"). Once a thread was
+  named, a second app-server could rename it and read the name back. So a
+  `created` retry works for a named rollout, and fails closed — a rollback,
+  the old thread untouched — when there is none. `thread/list` returned no
+  threads in that setup, so reconciliation reads local storage instead.
 - **Serialised.** The whole sequence runs under a per-name claim taken before
   any thread is made; the row is read again inside it. A second `cl start`
-  waits up to `CL_FRESH_CLAIM_WAIT` (10s) and then leaves it to the first. A
-  claim whose holder has died is taken over.
+  waits up to `CL_FRESH_CLAIM_WAIT` (10s) and then leaves it to the first. The
+  claim is a symlink made with `ln -sn`; anything else at its path (a
+  directory, a file) is refused. A claim whose holder has died is taken over
+  under a separate takeover mutex, so the unlink can only remove the dead
+  holder's claim, never a successor's. The one residual window is a taker
+  dying mid-takeover and two others racing to clear its mutex, which can only
+  cost a refused start.
 - **Launch acceptance.** The row stays mode `fresh` with `fresh_pending` = the
   cycle until the launch is verified as codex on the new id: a tmux session
-  stamped for that id whose pane runs `codex … resume <id>`, or cl's launch
-  record for that name and id. Unverified, the transaction stays at
+  stamped for that id whose pane runs Codex resuming that id, or cl's launch
+  record for that name and id, running the same. "Runs Codex" is read from
+  the command line as tokens — the executable (or the script a node wrapper
+  runs) is `codex`, and the first word after its options is `resume <id>` —
+  never as a substring, which a foreign process could carry in any argument.
+  The journal is removed only once the row's move to `resume` has been
+  written and read back; if it cannot be, the journal and the pending row
+  both stay.
+- **Coordination is reported, not claimed.** A verified launch does not show
+  which thread a configured lane now elects: that moves on the new thread's
+  first SessionStart, which cl cannot see. With a re-arm helper installed, cl
+  says the lane is not verified; without one, there is no lane to wait for. Unverified, the transaction stays at
   `launching` and the row is kept; the next start (or stop) verifies and
   settles it, or relaunches the same thread. A session left unstamped by a
   start killed mid-launch is adopted only when its pane runs exactly the

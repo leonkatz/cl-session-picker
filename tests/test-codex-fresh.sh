@@ -88,6 +88,12 @@ mkdir -p "$STATEDIR" "$CODEX_HOME/sessions/2026/01/01" "$HOME/.claude/projects/p
 # leader's pid is in $FAKE_CRASH_PGID_FILE) on receiving thread/name/set, on
 # receiving thread/read, or just after moving the old rollout — a crash at
 # that boundary, with nothing left to clean up after itself.
+# FAKE_CRASH_AT=start-early|start-created: the crash at thread/start, before
+# the thread is written, or after it is written and before the reply — the
+# window in which cl cannot have recorded the new id.
+# FAKE_ARCHIVE_LIES=<id>: archive moves it, then reports failure (a lost reply).
+# FAKE_ARCHIVE_VANISH=<id>: archive removes it from sessions/ without putting
+# it in archived_sessions/, and reports failure — a result nobody can read.
 # FAKE_SLOW_START=<s>: thread/start answers after that long.
 cat > "$FIX/fakecodex.py" <<'PYEOF'
 import json, os, sys, glob, shutil, time, signal
@@ -153,10 +159,12 @@ if cmd == "app-server":
                                              "params": {"threadId": "x"}}) + "\n"); sys.stdout.flush()
                 time.sleep(0.5)
             tid = os.environ.get("FAKE_NEW_ID") or open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "new_id")).read().strip()
+            crash("start-early")
             if failure != "norollout":
                 d = os.path.join(home, "sessions", "2026", "02", "02"); os.makedirs(d, exist_ok=True)
                 with open(os.path.join(d, "rollout-2026-02-02T00-00-00-%s.jsonl" % tid), "w") as fh:
                     fh.write(json.dumps({"type": "session_meta", "payload": {"id": tid, "cwd": params.get("cwd", "")}}, separators=(",", ":")) + "\n")
+            crash("start-created")
             reply(mid, {"thread": {"id": tid, "name": None, "cwd": params.get("cwd")}})
         elif method == "thread/name/set":
             if failure == "name":
@@ -197,7 +205,11 @@ if cmd in ("archive", "unarchive"):
         dest = os.path.join(home, "archived_sessions"); os.makedirs(dest, exist_ok=True)
     else:
         dest = os.path.join(home, "sessions", "2026", "01", "01")
+    if cmd == "archive" and os.environ.get("FAKE_ARCHIVE_VANISH") == tid:
+        os.remove(src); sys.exit(1)
     shutil.move(src, os.path.join(dest, os.path.basename(src)))
+    if cmd == "archive" and os.environ.get("FAKE_ARCHIVE_LIES") == tid:
+        sys.stderr.write("Error: timed out\n"); sys.exit(1)
     if cmd == "archive" and tid == os.environ.get("FAKE_CRASH_ARCHIVE_ID"):
         crash("archive")
     sys.exit(0)
@@ -284,6 +296,8 @@ active() { [ -n "$(find "$CODEX_HOME/sessions" -name "rollout-*-$1.jsonl" 2>/dev
 snapshot_sid() { jq -r '.[] | select(.name=="Gamma") | .sid' "$(ls -1t "$STATEDIR"/history/state-*.json 2>/dev/null | head -1)" 2>/dev/null; }
 # The id the restored pane was started with, and so the one its CL_SESSION_ID
 # and `codex resume` name.
+# poll_until <tenths> <shell-condition>: wait for a milestone, generously.
+poll_until() { local n=0; until eval "$2" || [ "$n" -ge "$1" ]; do sleep 0.1; n=$((n+1)); done; }
 pane_sid() { rtmux list-panes -t "=codex_Gamma:" -F '#{pane_start_command}' 2>/dev/null | grep -oE 'CL_SESSION_ID=[0-9a-f-]+' | head -1 | cut -d= -f2; }
 
 # ── mode storage and the CLI ────────────────────────────────────────────────
@@ -541,7 +555,11 @@ check "…and archives nothing" "active" "$(active "$OLD")"
 check "…and keeps the row on the old id" "$OLD" "$(jq -r '.[0].sid' "$STATE")"
 tab() { ( cd "$FIX" && env -i HOME="$HOME" CODEX_HOME="$CODEX_HOME" PATH="$NOTMUXPATH:/usr/bin:/bin" \
             FAKE_CALLS="$FIX/calls" CL_CODEX_RPC_TIMEOUT=2 "$@" ) >"$FIX/tab.out" 2>&1 & }
-tab bash "$CL" --codex Gamma --restart-mode fresh "$OLD"; tp=$!; sleep 3; kill "$tp" 2>/dev/null; wait "$tp" 2>/dev/null
+# Polled for its milestone, never a fixed sleep: the launcher's speed varies
+# by machine, and killing it early is what the assertions would then measure.
+tab bash "$CL" --codex Gamma --restart-mode fresh "$OLD"; tp=$!
+poll_until 300 "grep -q 'resume $NEW' '$FIX/calls' 2>/dev/null && [ \"\$(jq -r .phase '$STATEDIR'/codex-fresh/*.json 2>/dev/null)\" = launching ]"
+kill "$tp" 2>/dev/null; wait "$tp" 2>/dev/null
 contains "the tab resumes the new thread with its first prompt" "$(cat "$FIX/calls")" "resume $NEW | cl started you"
 check "…having archived the old one" "archived" "$(active "$OLD")"
 check "…and its row is NOT consumed: exec cannot see the agent start" "$NEW" "$(jq -r '.[0].sid' "$STATE" 2>/dev/null)"
@@ -554,7 +572,9 @@ check "…and consuming the row" "0" "$([ -f "$STATE" ] && jq length "$STATE" ||
 pkill -f '^codex resume [0-9a-f-]+ 59\.123$' 2>/dev/null
 echo "bare tab: a tab that runs after the name has moved on resumes, never replaces"
 rm -f "$FIX/calls"
-tab bash "$CL" --codex Gamma --restart-mode fresh "$OLD"; tp=$!; sleep 2; kill "$tp" 2>/dev/null; wait "$tp" 2>/dev/null
+tab bash "$CL" --codex Gamma --restart-mode fresh "$OLD"; tp=$!
+poll_until 300 "grep -q 'no longer names' '$FIX/tab.out' 2>/dev/null && grep -q 'resume $NEW' '$FIX/calls' 2>/dev/null"
+kill "$tp" 2>/dev/null; wait "$tp" 2>/dev/null
 pkill -f '^codex resume [0-9a-f-]+ 59\.123$' 2>/dev/null
 contains "it says so" "$(cat "$FIX/tab.out")" "no longer names thread $OLD"
 check "no second thread is made" "0" "$(line_of 'app-server')"
@@ -602,6 +622,27 @@ check "the new id was written down before the crash" "$NEW" "$(jq -r '.new_sid' 
 check "…at phase created" "created" "$(txn_phase)"
 check "…with the old thread untouched" "active" "$(active "$OLD")"
 retry_finishes "after create"
+
+echo "…and a retry whose naming fails rolls back, the old thread untouched"
+reset; write_row fresh
+crash_start FAKE_CRASH_AT=name
+out=$(run FAKE_FAIL=name -- start); sleep 0.3
+contains "it says it is resuming plainly" "$out" "resuming it plainly"
+check "the unnamed new thread is discarded" "archived" "$(active "$NEW")"
+check "the old thread is still listed" "active" "$(active "$OLD")"
+contains "…and resumed" "$(cat "$FIX/calls")" "resume $OLD"
+check "the journal is gone" "" "$(txn_phase)"
+
+echo "…but not when the old thread is no longer listed: nothing is discarded"
+reset; write_row fresh
+crash_start FAKE_CRASH_AT=name
+mkdir -p "$CODEX_HOME/archived_sessions"
+mv "$CODEX_HOME/sessions/2026/01/01/rollout-2026-01-01T00-00-00-$OLD.jsonl" "$CODEX_HOME/archived_sessions/"
+out=$(run FAKE_FAIL=name -- start); sleep 0.3
+contains "it refuses to roll back" "$out" "not rolling back"
+check "the new thread is kept" "active" "$(active "$NEW")"
+not_contains "nothing is launched" "$(cat "$FIX/calls")" "resume "
+check "the journal stays" "created" "$(txn_phase)"
 
 echo "crash after name (at the read-back), then a retry"
 reset; write_row fresh
@@ -709,6 +750,147 @@ check "the other thread in the repo is untouched" "active" "$(active "$DELTA")"
 check "only the row's thread was archived" "1" "$(grep -c '^archive ' "$FIX/calls")"
 check "the name discovers the new thread" "$NEW" "$(disc_sid)"
 check "Delta is still discovered as itself" "$DELTA" "$(run -- --discover | awk -F'\t' '$1=="Delta"{print $2}')"
+
+# ── archive results that cannot be taken at their word ──────────────────────
+echo "an archive that happened but reported failure rolls forward"
+reset; write_row fresh
+out=$(run FAKE_ARCHIVE_LIES="$OLD" -- start); sleep 0.3
+check "the old thread is archived" "archived" "$(active "$OLD")"
+check "…and the new one is NOT discarded" "active" "$(active "$NEW")"
+contains "…and is run" "$(cat "$FIX/calls")" "resume $NEW | cl started you"
+not_contains "…never the old one" "$(cat "$FIX/calls")" "resume $OLD"
+check "…the replacement is finished" "" "$(txn_phase)"
+
+echo "an archive whose result cannot be read stops, discarding nothing"
+reset; write_row fresh
+out=$(run FAKE_ARCHIVE_VANISH="$OLD" -- start); sleep 0.3
+contains "it says it is stopping" "$out" "neither listed nor archived"
+check "the new thread is not discarded" "active" "$(active "$NEW")"
+not_contains "nothing is launched" "$(cat "$FIX/calls")" "resume "
+check "the replacement is kept, marked uncertain" "archive-uncertain" "$(txn_phase)"
+check "the row is kept on the old id" "$OLD" "$(jq -r '.[0].sid' "$STATE")"
+# Once the old thread is found archived, the same transaction rolls forward.
+mkdir -p "$CODEX_HOME/archived_sessions"
+printf '{"type":"session_meta","payload":{"id":"%s","cwd":"%s"}}\n' "$OLD" "$FIX/work" \
+  > "$CODEX_HOME/archived_sessions/rollout-2026-01-01T00-00-00-$OLD.jsonl"
+out=$(run -- start); sleep 0.3
+check "the re-run makes no second thread" "1" "$(grep -c 'app-server thread/start' "$FIX/calls")"
+contains "…and runs the new thread" "$(cat "$FIX/calls")" "resume $NEW | cl started you"
+check "…and finishes" "" "$(txn_phase)"
+
+# ── the journal outlives a row it could not settle ─────────────────────────
+echo "a verified launch whose row cannot be settled keeps the journal"
+reset; write_row fresh
+crash_start FAKE_TMUX_CRASH=after
+: > "$STATE.acklock"
+out=$(run -- start); sleep 0.3
+rm -f "$STATE.acklock"
+contains "it says the replacement stays pending" "$out" "could not settle its restart row"
+check "the journal is kept" "rewritten" "$(txn_phase)"
+check "the row is still pending" "fresh" "$(jq -r '.[0].mode' "$STATE")"
+out=$(run -- start); sleep 0.3
+contains "the next start settles it" "$out" "Gamma is running on its new Codex thread $NEW"
+check "…journal gone" "" "$(txn_phase)"
+
+# ── the claim excludes ──────────────────────────────────────────────────────
+echo "something that is not a claim at the claim path fails closed"
+reset; write_row fresh
+mkdir -p "$STATEDIR/codex-fresh/$key.json.lock"
+out=$(run -- start); sleep 0.3
+rmdir "$STATEDIR/codex-fresh/$key.json.lock"
+contains "it refuses, saying why" "$out" "is not a claim"
+check "no thread is made" "0" "$(line_of 'app-server')"
+check "the old thread is untouched" "active" "$(active "$OLD")"
+
+echo "a takeover in progress by a live taker is not raced"
+reset; write_row fresh
+mkdir -p "$STATEDIR/codex-fresh"
+ln -s "999999:not-a-real-start-token" "$STATEDIR/codex-fresh/$key.json.lock"
+mkdir "$STATEDIR/codex-fresh/$key.json.lock.takeover"
+printf '%s:%s\n' "$$" "$(ps -o lstart= -p $$ | tr -s ' ' | tr ' ' '_')" > "$STATEDIR/codex-fresh/$key.json.lock.takeover/owner"
+out=$(run CL_FRESH_CLAIM_WAIT=1 -- start); sleep 0.3
+contains "it leaves it to the other taker" "$out" "another cl start"
+check "no thread is made" "0" "$(line_of 'app-server')"
+printf '999998:also-not-real\n' > "$STATEDIR/codex-fresh/$key.json.lock.takeover/owner"
+out=$(run -- start); sleep 0.3
+contains "a dead taker's mutex is cleared and the claim taken" "$out" "as a new Codex thread $NEW"
+
+# ── a foreign process is not codex ──────────────────────────────────────────
+impostor_pane() { # <stamp?> [command]: a pane named like the session, running something codex-looking
+  rtmux new-session -d -s codex_Gamma -c "$FIX" "${2:-python3 -c 'import time; time.sleep(60)' 'codex helper resume $NEW'}"
+  if [ "$1" = "stamp" ]; then
+    rtmux set-option -t "=codex_Gamma:" @cl_agent codex; rtmux set-option -t "=codex_Gamma:" @cl_sid "$NEW"
+  fi
+  sleep 0.3
+}
+echo "a stamped pane running a codex-looking python is not taken for codex"
+reset; write_row fresh
+crash_start FAKE_TMUX_CRASH=before
+check "fixture: the replacement is pending" "rewritten" "$(txn_phase)"
+impostor_pane stamp
+out=$(run -- start); sleep 0.3
+not_contains "it is not settled" "$out" "is running on its new Codex thread"
+check "…the journal stays" "rewritten" "$(txn_phase)"
+# Two more shapes, one per rule: an executable that is not codex, and a codex
+# whose first word is a subcommand other than resume.
+for imp in "exec -a 'helper resume $NEW' sleep 60" "exec -a 'codex helper resume $NEW' sleep 60"; do
+  rtmux kill-server >/dev/null 2>&1
+  impostor_pane stamp "$imp"
+  out=$(run -- start); sleep 0.3
+  not_contains "[$imp] is not taken for codex" "$out" "is running on its new Codex thread"
+  check "[$imp] …the journal stays" "rewritten" "$(txn_phase)"
+done
+echo "…nor adopted when unstamped"
+rtmux kill-server >/dev/null 2>&1
+impostor_pane nostamp
+out=$(run -- start); sleep 0.3
+not_contains "it is not adopted" "$out" "adopting"
+check "…and stays unstamped" "" "$(rtmux show-option -qv -t "=codex_Gamma:" @cl_agent 2>/dev/null)"
+check "…the journal stays" "rewritten" "$(txn_phase)"
+rtmux kill-server >/dev/null 2>&1
+
+# ── the window before the new id is written down ────────────────────────────
+echo "a crash after thread/start took effect, before the id was saved: recovered, not doubled"
+reset; write_row fresh
+crash_start FAKE_CRASH_AT=start-created
+check "fixture: it crashed with the id unsaved" "begun" "$(txn_phase)"
+check "fixture: …and the thread exists" "active" "$(active "$NEW")"
+out=$(run -- start); sleep 0.3
+contains "the retry recovers that thread" "$out" "recovered the thread an interrupted run made ($NEW)"
+check "…making no second one" "1" "$(grep -c 'app-server thread/start' "$FIX/calls")"
+contains "…and runs it" "$(cat "$FIX/calls")" "resume $NEW | cl started you"
+check "…finished" "" "$(txn_phase)"
+
+echo "…and two candidates are ambiguous: it stops"
+reset; write_row fresh
+crash_start FAKE_CRASH_AT=start-created
+STRAY=01dddddd-0000-7000-8000-$RUN_TAG
+printf '{"type":"session_meta","payload":{"id":"%s","cwd":"%s"}}\n' "$STRAY" "$FIX/work" \
+  > "$CODEX_HOME/sessions/2026/01/01/rollout-2026-01-01T00-00-00-$STRAY.jsonl"
+out=$(run -- start); sleep 0.3
+contains "it stops, naming them" "$out" "candidates match"
+check "no second thread is made" "1" "$(grep -c 'app-server thread/start' "$FIX/calls")"
+check "nothing is archived" "active" "$(active "$OLD")"
+not_contains "nothing is launched" "$(cat "$FIX/calls")" "resume "
+check "the journal stays at begun" "begun" "$(txn_phase)"
+
+echo "a crash before anything persisted: the retry simply makes the thread"
+reset; write_row fresh
+crash_start FAKE_CRASH_AT=start-early
+out=$(run -- start); sleep 0.3
+check "two thread/starts, one thread" "2" "$(grep -c 'app-server thread/start' "$FIX/calls")"
+contains "the new thread is run" "$(cat "$FIX/calls")" "resume $NEW | cl started you"
+check "finished" "" "$(txn_phase)"
+
+# ── coordination is reported pending, never done ────────────────────────────
+echo "with a coordination helper installed, the lane is reported unverified"
+reset; write_row fresh
+out=$(run -- start); sleep 0.3
+contains "it says coordination is not verified" "$out" 'coordination for "Gamma" is NOT verified'
+echo "…and without one, nothing is said"
+reset; write_row fresh
+out=$(run CL_COORD_REARM="$FIX/not-installed.sh" -- start); sleep 0.3
+not_contains "no coordination line" "$out" "coordination for"
 
 # ── phase-1 Claude behaviour beside it ──────────────────────────────────────
 echo "a Claude row in the same start is untouched by any of this"
