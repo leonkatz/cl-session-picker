@@ -13,7 +13,8 @@ check() { if [ "$2" = "$3" ]; then pass=$((pass+1)); printf '  ok   %s\n' "$1"; 
 REAL_TMUX=$(command -v tmux) || { printf 'SKIP: tmux not installed\n\n0 passed, 0 failed\n'; exit 0; }
 FIX=$(mktemp -d "${TMPDIR:-/tmp}/cl-tmux-real.XXXXXX") || exit 2
 SOCK="cl-test-$$"
-cleanup() { "$REAL_TMUX" -L "$SOCK" kill-server 2>/dev/null; rm -rf "$FIX"; }
+# kill-server leaves its socket file behind, so it is removed by hand.
+cleanup() { "$REAL_TMUX" -L "$SOCK" kill-server 2>/dev/null; rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$SOCK"; rm -rf "$FIX"; }
 trap cleanup EXIT
 
 # Every tmux the functions run goes to the private server, never the user's.
@@ -41,8 +42,11 @@ run tmux_owned cl-probe codex sid-1;  check "not for another agent" "1" "$?"
 run tmux_owned cl-probe claude sid-2; check "not for another thread" "1" "$?"
 
 printf 'exact names only\n'
-# "=" is what stops "cl-probe" from prefix-matching "cl-probe-other".
-run tmux_owned cl-probe-other claude sid-1; check "a session whose name extends a stamped one is not owned" "1" "$?"
+# Without "=", tmux matches a name that does not exist as a prefix of one that
+# does, so a gone session would answer with its longer neighbour's stamp.
+run tmux_claim cl-probe-other claude sid-1
+"$REAL_TMUX" -L "$SOCK" kill-session -t "=cl-probe" || exit 2
+run tmux_owned cl-probe claude sid-1; check "a gone session is not owned through a longer name's stamp" "1" "$?"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
