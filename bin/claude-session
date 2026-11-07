@@ -2459,8 +2459,8 @@ proc_identity() {
 
 # _codex_argv_resumes <pid> <id>: the process IS Codex resuming <id>, by its
 # real identity (proc_identity): the executable is named codex, or it is node
-# and an argv element is (or resolves to) the Codex launcher script
-# (…/@openai/codex/bin/codex.js);
+# whose argv[1] — the entry script, with no node options before it — resolves
+# to the Codex launcher script (…/@openai/codex/bin/codex.js);
 # and, as real argv elements after that, the first word past the options is
 # `resume`, immediately followed by <id>. No python3, no identity: not Codex.
 _codex_argv_resumes() {
@@ -2479,16 +2479,16 @@ _codex_argv_resumes() {
   case "$base" in
     codex) i=1 ;;
     node|nodejs)
-      i=0
-      # The npm launcher is usually invoked through a symlink (`node
-      # /opt/homebrew/bin/codex …`), so the element is resolved first.
-      while [ "$i" -lt "$n" ]; do
-        case "${av[$i]}" in */@openai/codex/bin/codex.js) break ;; esac
-        case "$(realpath "${av[$i]}" 2>/dev/null)" in */@openai/codex/bin/codex.js) break ;; esac
-        i=$((i+1))
-      done
-      [ "$i" -lt "$n" ] || return 1
-      i=$((i+1)) ;;
+      # The entry script must be argv[1] exactly: no node options before it,
+      # and argv[1] not an option itself. Anything else lets node run other
+      # code (`-e`, `-p`, `--require x`) with a codex.js-shaped path sitting
+      # later in argv as mere data. A real shebang launcher runs as `node
+      # <script> …` (the npm one as `node /opt/homebrew/bin/codex …`, a
+      # symlink), so argv[1] is resolved and must be the Codex launcher.
+      [ "$n" -ge 2 ] || return 1
+      case "${av[1]}" in -*) return 1 ;; esac
+      case "$(realpath "${av[1]}" 2>/dev/null)" in */@openai/codex/bin/codex.js) ;; *) return 1 ;; esac
+      i=2 ;;
     *) return 1 ;;
   esac
   while [ "$i" -lt "$n" ]; do

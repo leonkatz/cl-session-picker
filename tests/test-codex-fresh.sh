@@ -859,13 +859,23 @@ not_contains "it is not settled" "$out" "is running on its new Codex thread"
 check "…the journal stays" "rewritten" "$(txn_phase)"
 # Two more shapes, one per rule: an executable that is not codex, and a codex
 # whose first word is a subcommand other than resume.
+mkdir -p "$FIX/nm/@openai/codex/bin" "$FIX/nbin"
+printf 'setTimeout(function(){}, 59000);\n' > "$FIX/nm/@openai/codex/bin/codex.js"
+printf 'setTimeout(function(){}, 59000);\n' > "$FIX/nm/hold.js"
+# The node impostors (the review's `node -e … -- <codex.js> resume <id>`, and
+# -p, --require x <codex.js>) put a real codex.js in argv, but not as the
+# entry script: node runs other code. Only `node <codex.js> …` is Codex.
 # The review's shape (one argv[0] of "codex resume <id>" on /bin/sleep), an
 # executable that is not codex, and a genuine codex executable whose first
 # word is a subcommand other than resume.
 for imp in "exec -a 'codex resume $NEW' /bin/sleep 60" "exec -a 'helper resume $NEW' sleep 60" \
            "exec -a codex '$FIX/stub/codex' helper resume $NEW" \
            "exec python3 -c 'import time; time.sleep(60)' resume $NEW" \
-           "exec node -e 'setTimeout(function(){},59000)' resume $NEW"; do
+           "exec node -e 'setTimeout(function(){},59000)' resume $NEW" \
+           "exec node -e 'setTimeout(()=>{},59000)' -- '$FIX/nm/@openai/codex/bin/codex.js' resume $NEW" \
+           "exec node -p 'setTimeout(()=>{},59000)' '$FIX/nm/@openai/codex/bin/codex.js' resume $NEW" \
+           "exec node --require '$FIX/nm/hold.js' '$FIX/nm/@openai/codex/bin/codex.js' resume $NEW" \
+           "exec node '$FIX/nm/hold.js' resume $NEW"; do
   case "$imp" in *node*) command -v node >/dev/null 2>&1 || continue ;; esac
   rtmux kill-server >/dev/null 2>&1
   impostor_pane stamp "$imp"

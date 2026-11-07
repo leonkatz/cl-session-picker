@@ -270,9 +270,11 @@ are re-offered to the new thread by the watcher's own re-send.
   the kernel, not `ps`: `proc_identity` (shared with the Claude side) gives
   the executing image's path (libproc `proc_pidpath`) and argv with its real
   boundaries (`KERN_PROCARGS2`), through `python3 -I`. The executable must be
-  named `codex`, or be `node` with an argv element that is (or resolves to)
-  `…/@openai/codex/bin/codex.js`; then the first argv element past the options
-  must be `resume`, followed by the id. `ps -o command=` would split one
+  named `codex`, or be `node` whose argv[1] — the entry script, with no node
+  options before it and not itself an option — resolves to
+  `…/@openai/codex/bin/codex.js` (`node -e …`, `-p`, `--require x` would run
+  other code with that path as mere data); then the first argv element past
+  the options must be `resume`, followed by the id. `ps -o command=` would split one
   argv[0] of `codex resume <id>` into three words, and `ps -o comm=` follows
   `exec -a`. An identity that cannot be read — no python3, a failed read, a
   process gone — is no evidence.
