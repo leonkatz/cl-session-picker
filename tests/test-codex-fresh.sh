@@ -4,9 +4,11 @@
 # A fresh Codex session comes back as a NEW thread under the same name, and it
 # must come back as one cl can still own: made through `codex app-server`
 # (thread/start, thread/name/set, the name read back), the old thread archived
-# BEFORE anything re-arms the coordination lane, the restart row moved onto the
-# new id, and then the ordinary `codex resume <new> "<first prompt>"`
-# (docs/restart-modes.md, "fresh, for Codex").
+# — on the tmux path, BEFORE anything re-arms the coordination lane; in the
+# bare-iTerm shape the re-arm comes first and the election heals on the new
+# thread's first SessionStart — the restart row moved onto the new id, and then
+# the ordinary `codex resume <new> "<first prompt>"` (docs/restart-modes.md,
+# "fresh, for Codex").
 #
 # Every failure in the first three steps has to land in the same place: the old
 # thread resumed plainly, still discoverable under its name, and no row or
@@ -72,6 +74,10 @@ mkdir -p "$STATEDIR" "$CODEX_HOME/sessions/2026/01/01" "$HOME/.claude/projects/p
 #   readback  thread/read reports a different name
 # FAKE_ARCHIVE_FAIL / FAKE_UNARCHIVE_FAIL name one id whose (un)archive fails;
 # FAKE_ARCHIVE_NOOP one whose archive reports success and moves nothing.
+# FAKE_STUBBORN=1: the app-server ignores SIGTERM and outlives EOF on stdin.
+# FAKE_COLLIDE=1: before answering thread/start, the server sends a REQUEST of
+# its own that happens to carry the same id.
+# Each app-server writes its pid to $FAKE_SERVER_PIDS.
 cat > "$FIX/fakecodex.py" <<'PYEOF'
 import json, os, sys, glob, shutil, time
 home = os.environ["CODEX_HOME"]
@@ -88,6 +94,11 @@ while args and args[0].startswith("-"):
     args = args[1:]
 cmd = args[0] if args else ""
 if cmd == "app-server":
+    import signal
+    with open(os.environ.get("FAKE_SERVER_PIDS", os.devnull), "a") as fh:
+        fh.write("%d\n" % os.getpid())
+    if os.environ.get("FAKE_STUBBORN"):
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
     names = {}
     def reply(mid, result=None, error=None):
         msg = {"jsonrpc": "2.0", "id": mid}
@@ -113,6 +124,10 @@ if cmd == "app-server":
                 reply(mid, error="no threads today"); continue
             if failure == "noreply":
                 continue
+            if os.environ.get("FAKE_COLLIDE"):
+                sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": mid, "method": "item/tool/requestUserInput",
+                                             "params": {"threadId": "x"}}) + "\n"); sys.stdout.flush()
+                time.sleep(0.5)
             tid = os.environ.get("FAKE_NEW_ID", "01eeeeee-0000-7000-8000-0000000000ee")
             if failure != "norollout":
                 d = os.path.join(home, "sessions", "2026", "02", "02"); os.makedirs(d, exist_ok=True)
@@ -134,6 +149,9 @@ if cmd == "app-server":
             reply(mid, {"thread": {"id": params["threadId"], "name": name}})
         else:
             reply(mid, error="unknown method " + method)
+    if os.environ.get("FAKE_STUBBORN"):
+        while True:
+            time.sleep(1)
     sys.exit(0)
 if cmd in ("archive", "unarchive"):
     tid = args[1]
@@ -159,7 +177,15 @@ PYEOF
 printf '#!/bin/sh\nexec python3 "%s" "$@"\n' "$FIX/fakecodex.py" > "$FIX/bin/codex"
 chmod +x "$FIX/bin/codex" || setup_failed chmod
 ln -sf "$(command -v jq)" "$FIX/bin/jq"
-ln -sf "$(command -v tmux)" "$FIX/bin/tmux"
+# tmux itself, except that FAKE_TMUX_REFUSE makes new-session fail: the one
+# way to reach "steps 1-3 done, then the launch refused".
+REALTMUX="$(command -v tmux)"
+cat > "$FIX/bin/tmux" <<TMUXEOF
+#!/bin/sh
+[ -n "\${FAKE_TMUX_REFUSE:-}" ] && [ "\$1" = "new-session" ] && exit 1
+exec "$REALTMUX" "\$@"
+TMUXEOF
+chmod +x "$FIX/bin/tmux"
 ln -sf "$(command -v python3)" "$FIX/bin/python3"
 # The coordination re-arm helper, as a recorder: its line in the call log is
 # what "archived BEFORE anything re-arms" is measured against.
@@ -307,6 +333,65 @@ printf 'New thread. Read your board.\n' > "$STATEDIR/codex-fresh-prompt.txt"
 run -- start >/dev/null; sleep 0.3
 contains "the configured prompt is passed" "$(cat "$FIX/calls")" "resume $NEW | New thread. Read your board."
 rm -f "$STATEDIR/codex-fresh-prompt.txt"
+
+echo "after a fresh start the row is resume, so a re-run resumes NEW and makes no third thread"
+reset; write_row fresh
+out=$(run FAKE_TMUX_REFUSE=1 -- start); sleep 0.3
+contains "the refused launch is reported" "$out" "could not prepare Gamma"
+check "the kept row names the new thread" "$NEW" "$(jq -r '.[0].sid' "$STATE" 2>/dev/null)"
+check "…as resume" "resume" "$(jq -r '.[0].mode' "$STATE" 2>/dev/null)"
+check "…keeping the old id as fresh_from" "$OLD" "$(jq -r '.[0].fresh_from' "$STATE" 2>/dev/null)"
+contains "the old id's way back is printed" "$out" "codex unarchive $OLD"
+check "…and recorded" "codex" \
+  "$(jq -r --arg s "$OLD" '.[] | select(.old_sid==$s) | .agent' "$STATEDIR/fresh-history.json" 2>/dev/null)"
+rm -f "$FIX/calls"
+out=$(run -- start); sleep 0.3
+check "the re-run makes no thread" "0" "$(line_of 'app-server')"
+check "…archives nothing" "0" "$(line_of '^archive')"
+check "…leaves the new thread listed" "active" "$(active "$NEW")"
+contains "…and resumes the new thread" "$(cat "$FIX/calls")" "resume $NEW"
+not_contains "…plainly" "$(cat "$FIX/calls")" "resume $NEW |"
+
+echo "an app-server that ignores TERM and outlives EOF cannot hang the start"
+reset; write_row fresh; rm -f "$FIX/server.pids"
+( run FAKE_STUBBORN=1 FAKE_SERVER_PIDS="$FIX/server.pids" -- start > "$FIX/stub.out" ) &
+sp=$!; w=0
+while kill -0 "$sp" 2>/dev/null && [ "$w" -lt 150 ]; do sleep 0.1; w=$((w+1)); done
+check "the start finished within 15s" "done" "$(kill -0 "$sp" 2>/dev/null && echo hung || echo done)"
+kill "$sp" 2>/dev/null; wait "$sp" 2>/dev/null
+contains "…and still made the new thread" "$(cat "$FIX/stub.out")" "as a new Codex thread $NEW"
+spid=$(head -1 "$FIX/server.pids" 2>/dev/null)
+[ -n "$spid" ] || setup_failed "the stubborn server recorded no pid"
+check "…and the server was killed" "gone" "$(kill -0 "$spid" 2>/dev/null && echo alive || echo gone)"
+kill -9 "$spid" 2>/dev/null
+
+echo "a server request that reuses a pending id is not taken for the reply"
+reset; write_row fresh
+out=$(run FAKE_COLLIDE=1 -- start); sleep 0.3
+contains "thread/start is still learned" "$out" "as a new Codex thread $NEW"
+check "…and the old thread is archived" "archived" "$(active "$OLD")"
+
+echo "an interrupt while the app-server is open leaves no clrpc directory"
+reset; write_row fresh; rm -f "$FIX/server.pids"
+mkdir -p "$FIX/tmpdir"
+set -m
+( cd "$FIX" && exec env -i HOME="$HOME" CODEX_HOME="$CODEX_HOME" PATH="$FIX/bin:/usr/bin:/bin" TMUX_TMPDIR="$TMUX_TMPDIR" \
+    TMPDIR="$FIX/tmpdir" FAKE_CALLS="$FIX/calls" FAKE_FAIL=noreply FAKE_SERVER_PIDS="$FIX/server.pids" \
+    CL_COORD_REARM="$FIX/rearm.sh" CL_CODEX_RPC_TIMEOUT=30 bash "$CL" start ) >/dev/null 2>&1 &
+ip=$!
+set +m
+disown "$ip" 2>/dev/null || true
+w=0; until ls "$FIX/tmpdir" 2>/dev/null | grep -q '^clrpc\.' || [ "$w" -ge 100 ]; do sleep 0.1; w=$((w+1)); done
+check "fixture: the app-server directory exists while it is open" "1" "$(ls "$FIX/tmpdir" | grep -c '^clrpc\.')"
+sleep 0.5
+kill -TERM -- -"$ip" 2>/dev/null
+w=0; while kill -0 "$ip" 2>/dev/null && [ "$w" -lt 50 ]; do sleep 0.1; w=$((w+1)); done
+sleep 1
+check "the directory is removed" "0" "$(ls "$FIX/tmpdir" | grep -c '^clrpc\.')"
+spid=$(head -1 "$FIX/server.pids" 2>/dev/null)
+check "…and the server is gone" "gone" "$( [ -n "$spid" ] && kill -0 "$spid" 2>/dev/null && echo alive || echo gone)"
+check "…and nothing was archived" "active" "$(active "$OLD")"
+kill -9 "$spid" -- -"$ip" 2>/dev/null
 
 echo "a resume-mode Codex row is resumed as itself, with no app-server at all"
 reset; write_row resume

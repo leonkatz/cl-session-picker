@@ -88,7 +88,8 @@
 #                             #   handoff is already waiting.
 #   claude-session start      # relaunch every session from the last stop, each as
 #                             #   the agent it was saved under. Rotation is a CLAUDE
-#                             #   mechanism: a Codex row always resumes as itself.
+#                             #   mechanism: a Codex row resumes as itself, or, in
+#                             #   fresh mode, as a new thread under its name.
 #                             #   Per Claude session: a COMPLETE unconsumed handoff means
 #                             #   START FRESH under the same name, seeded with it.
 #                             #   No handoff -- or one with no valid marker on its
@@ -1959,8 +1960,10 @@ _crpc_call() {
   _crpc_send "$req" || { _crpc_fail "codex app-server is not accepting requests"; return 1; }
   while [ "$ticks" -lt "$limit" ]; do
     # Line by line with fromjson?, so a half-written last line is skipped
-    # rather than failing the whole read.
-    line=$(jq -R -c --argjson id "$id" 'fromjson? | select(type == "object" and .id == $id)' \
+    # rather than failing the whole read. A REPLY has no method: the server
+    # numbers its own requests to us independently, and one of those carrying
+    # this id is not the answer to this request.
+    line=$(jq -R -c --argjson id "$id" 'fromjson? | select(type == "object" and .id == $id and (has("method") | not))' \
              "$_CRPC_DIR/out" 2>/dev/null | head -1)
     if [ -n "$line" ]; then
       if printf '%s' "$line" | jq -e 'has("error")' >/dev/null 2>&1; then
@@ -1979,13 +1982,21 @@ _crpc_call() {
   _crpc_fail "no answer to $2 within ${CL_CODEX_RPC_TIMEOUT}s"
   return 1
 }
-# _crpc_close: EOF to the server, a moment to exit on its own, then no choice.
+# _crpc_close: EOF to the server, a moment to exit on its own, then TERM, then
+# KILL — the escalation run_bounded uses. A bare `wait` after TERM alone hung
+# `cl start` for good on a server that ignores TERM and outlives EOF; every
+# wait here is bounded, so the one after KILL is only the reaping.
 _crpc_close() {
   local w=0
   exec 7>&-
   if [ -n "${_CRPC_PID:-}" ]; then
     while kill -0 "$_CRPC_PID" 2>/dev/null && [ "$w" -lt 30 ]; do sleep 0.1; w=$((w+1)); done
-    kill "$_CRPC_PID" 2>/dev/null
+    if kill -0 "$_CRPC_PID" 2>/dev/null; then
+      kill -TERM "$_CRPC_PID" 2>/dev/null
+      w=0
+      while kill -0 "$_CRPC_PID" 2>/dev/null && [ "$w" -lt 20 ]; do sleep 0.1; w=$((w+1)); done
+      kill -0 "$_CRPC_PID" 2>/dev/null && kill -KILL "$_CRPC_PID" 2>/dev/null
+    fi
     wait "$_CRPC_PID" 2>/dev/null
   fi
   [ -n "${_CRPC_DIR:-}" ] && rm -rf "$_CRPC_DIR"
@@ -2054,7 +2065,15 @@ codex_fresh_thread() {
     return 1
   }
   # ── 1. a new thread, named, and the name read back ──
+  # An interrupt while the app-server is open would leave its clrpc.* FIFO
+  # directory behind, and the server itself. Trapped for exactly that window
+  # (open to close, the directory's whole life), then the previous traps are
+  # put back. Steps 2-3 make no temporary files; a signal there is the same as
+  # one at any other moment of a start.
+  local _prev_traps; _prev_traps=$(trap -p INT TERM HUP)
+  trap '_crpc_close; exit 130' INT TERM HUP
   if ! _crpc_open "$cwd"; then
+    trap - INT TERM HUP; eval "$_prev_traps"
     printf '⚠ "%s": could not start codex app-server — resuming it plainly\n' "$name" >&2
     return 1
   fi
@@ -2080,6 +2099,7 @@ codex_fresh_thread() {
     fi
   fi
   _crpc_close
+  trap - INT TERM HUP; eval "$_prev_traps"
   # Discovery has to find the new thread by name, or `cl --codex "<name>"` and
   # the listing would not.
   [ -z "$why" ] && [ -n "$new" ] && ! _codex_rollout_active "$new" && why="the new thread has no rollout in $CODEX_SESSIONS"
@@ -5504,6 +5524,13 @@ do_start() {
       tab_cmds+=("$(tab_cmd "$agent" "$name")")
     else
       [ -n "$claim" ] && rollback_claim "$root" "$name" "$claim"
+      # Steps 1-3 already happened: the old thread is archived and the row
+      # names the new one (mode resume, so a re-run resumes it rather than
+      # making a third). The old id still needs its way back recorded and said.
+      if [ "$cxfresh" = "1" ]; then
+        record_fresh_history "$name" "$osid" "$cwd" codex
+        printf '  (%s now names the new Codex thread %s; its old thread %s is archived)\n' "$name" "$sid" "$osid" >&2
+      fi
       printf '✗ could not prepare %s — leaving it in the restart list\n' "$name" >&2
       kept="${kept}${agent}"$'\t'"${name}"$'\n'
     fi
