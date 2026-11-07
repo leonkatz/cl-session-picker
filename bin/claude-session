@@ -3309,9 +3309,10 @@ handoff_target_busy() {
 #      and left alone; it is not a failure of THIS stop, which is why it has
 #      its own code (counting it would fail every stop while the app is open)
 #
-# A sixth argument, "ask", ALWAYS asks, whatever the busy signal says: the stop
-# typed /compact and never saw it confirmed, so the session may be compacting
-# quietly, with no wake-lock or CPU for the busy check to see. Unattended, that
+# A sixth argument, "ask", ALWAYS asks, whatever the busy signal says, with the
+# seventh as the reason shown: the stop has evidence the session may be working
+# that the busy check cannot see (a /compact never confirmed, or input since its
+# idle proof), and a quiet turn has no wake-lock or CPU. Unattended, that
 # question is declined and the session is left running.
 #
 # A sixth argument, 1, skips the "looks mid-task, kill it anyway?" prompt. Only
@@ -3321,6 +3322,7 @@ handoff_target_busy() {
 # every session, while the transcript can say it is done.
 retire_session() {
   local name="$1" sid="$2" t="$3" close_tabs="$4" agent="${5:-claude}" idle_proven="${6:-0}"
+  local ask_why="${7:-it may still be compacting (/compact was never confirmed)}"
   local ans pid ptok rrc _ppid _pcomm hint kids surv
   hint=$(agent_hint "$agent")
   if tmux has-session -t "=${t}" 2>/dev/null; then
@@ -3341,7 +3343,7 @@ retire_session() {
       return 4
     fi
     if [ "$idle_proven" = "ask" ]; then
-      printf '⏳ "%s" may still be compacting (/compact was never confirmed). Kill it anyway? [y/N] ' "$name" >&2
+      printf '⏳ "%s": %s. Kill it anyway? [y/N] ' "$name" "$ask_why" >&2
       read -r ans </dev/tty
       case "$ans" in
         y|Y) : ;;
@@ -3415,7 +3417,7 @@ retire_session() {
   esac
 
   if [ "$idle_proven" = "ask" ]; then
-    printf '⏳ "%s" (pid %s) may still be compacting (/compact was never confirmed). Kill it anyway? [y/N] ' "$name" "$pid" >&2
+    printf '⏳ "%s" (pid %s): %s. Kill it anyway? [y/N] ' "$name" "$pid" "$ask_why" >&2
     read -r ans </dev/tty
     case "$ans" in
       y|Y) : ;;
@@ -4068,7 +4070,8 @@ compact_idle_record() {
 # the time PASS 4 reaches a session, and a lane note or a message typed meanwhile
 # starts a turn that the skipped prompt would kill unasked. Nothing
 # conversational (user, assistant, queue-operation) may follow the size the
-# proof was taken at, and the idle record must still hold. An unreadable
+# proof was taken at, no queue-operation may follow the idle record itself, and
+# the idle record must still hold. An unreadable
 # transcript is not at rest: doubt keeps the prompt.
 compact_still_at_rest() {
   local i="$1" base="${_h_cbase[$1]}" f
@@ -4076,6 +4079,12 @@ compact_still_at_rest() {
   [ -n "${_h_cidsz[$i]:-}" ] && [ -r "$f" ] || return 1
   _tail_records "$f"$'\t'"${_h_cidsz[$i]}" \
     | jq -s -e 'map(select(.type == "user" or .type == "assistant" or .type == "queue-operation")) | length == 0' >/dev/null 2>&1 \
+    || return 1
+  # Input queued after the idle record but before the proof's size mark is
+  # inside the proof, not after it — and a queued item is work not yet done.
+  _tail_records "$([ "${_h_cauto[$i]}" = "1" ] && printf '%s' "$base" || printf '%s' "${_h_cmark[$i]}")" \
+    | jq -s -e '(map(.type == "user" or .type == "assistant") | rindex(true)) as $k
+                | $k != null and ([.[($k + 1):][] | select(.type == "queue-operation")] | length == 0)' >/dev/null 2>&1 \
     || return 1
   if [ "${_h_cauto[$i]}" = "1" ]; then
     compact_idle_record "$base" "${_h_ctok[$i]}"
@@ -5074,7 +5083,7 @@ do_stop() {
   done
 
   # ── PASS 4: CONFIRM, THEN CLOSE ─────────────────────────────────────────────
-  local sid_i _unreach_n mode_rows="" log_paths="" log_whys="" log_pre="" log_post="" _idle _lp_sep=""
+  local sid_i _unreach_n mode_rows="" log_paths="" log_whys="" log_pre="" log_post="" _idle _ask_why _lp_sep=""
   # _log_session <i>: append one session to the log's per-session lists. An
   # empty figure stays an empty field — never dropped — so position N in every
   # list is the same session.
@@ -5197,17 +5206,27 @@ do_stop() {
     # Code 4 is the one exception: not cl's to stop, so not this stop's failure.
     # $_idle is 1 only for a compacted session the transcript shows at rest —
     # the one case where the mid-task prompt would be asking about nothing.
+    # Evidence the session may be working, which the busy heuristic cannot see
+    # (a quiet turn has no wake-lock or CPU), forces the question rather than
+    # handing the decision back to that heuristic.
+    _ask_why=""
     if [ "$_idle" = "1" ] && ! compact_still_at_rest "$i"; then
-      _idle=0
-      printf '  %s: written to since it compacted, so asking before stopping it\n' "$name" >&2
+      _idle="ask"; _ask_why="it was written to after it compacted, so it may be working"
     fi
     # /compact was typed and never confirmed: it may be running now, quietly.
     # "Resume as-is" is what the next start does, not a licence to kill now.
-    [ "${_h_why[$i]}" = "no-boundary" ] && _idle="ask"
-    rrc=0; retire_session "$name" "$sid_i" "$t" "$close_tabs" "$agent" "$_idle" || rrc=$?
+    if [ "${_h_why[$i]}" = "no-boundary" ]; then
+      _idle="ask"; _ask_why="it may still be compacting (/compact was never confirmed)"
+    fi
+    rrc=0; retire_session "$name" "$sid_i" "$t" "$close_tabs" "$agent" "$_idle" "$_ask_why" || rrc=$?
     # Logged AFTER the kill, so a session the stop could not retire is not
-    # recorded as a clean stop: its path stays, its reason says what happened.
-    case "$rrc" in 1|2|3) _h_why[$i]="${_h_why[$i]:+${_h_why[$i]}+}left-running" ;; esac
+    # recorded as a clean stop: its path stays (what the next start will do),
+    # its reason says what this stop did, and it counts as kept.
+    case "$rrc" in
+      1|2) _h_why[$i]="${_h_why[$i]:+${_h_why[$i]}+}left-running" ;;
+      3)   _h_why[$i]="${_h_why[$i]:+${_h_why[$i]}+}unresolved-owner" ;;
+    esac
+    case "$rrc" in 1|2|3) [ "${_h_taken[$i]}" = "kept" ] || kept=$((kept+1)) ;; esac
     [ "$sess_rotate" != "n/a" ] && _log_session "$i"
     case "$rrc" in
       3)   unresolved_names="${unresolved_names}${name}"$'\n' ;;

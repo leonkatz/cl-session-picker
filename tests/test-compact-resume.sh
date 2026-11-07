@@ -217,12 +217,17 @@ try:
                 after_compact()
                 continue
             after_compact()
-            if mode == "wakes":
+            if mode in ("wakes", "wakes-user"):
                 # At rest after compacting, then a queued lane note is delivered
                 # and starts a new turn: the stop must see it before the kill.
                 time.sleep(float(os.environ.get("AGENT_WAKE", "2.5")))
-                rec({"type": "queue-operation", "operation": "enqueue", "content": "lane note"})
+                if mode == "wakes":
+                    rec({"type": "queue-operation", "operation": "enqueue", "content": "lane note"})
                 rec({"type": "user", "message": {"role": "user", "content": "lane note"}})
+            if mode == "queued":
+                # A note queued the moment the compaction ended, inside the idle
+                # proof's size mark and never yet a conversation record.
+                rec({"type": "queue-operation", "operation": "enqueue", "content": "lane note"})
 finally:
     termios.tcsetattr(fd, termios.TCSADRAIN, old)
 PYEOF
@@ -335,21 +340,25 @@ check "…declined unattended, so the session is left running" "1" "$(rtmux list
 check "…and the stop says so by exiting non-zero" "1" "$(cat "$FIX/reader.out.rc")"
 reset
 
-echo "…and one that is written to after its idle proof, before the kill, is asked about"
+echo "…and one written to after its idle proof is asked about, busy-looking or not"
 # The proof is taken in the compact phase; the kill comes later. A lane note
-# delivered in between starts a turn the skipped prompt would kill unasked.
-reset
-AGENT_BUSY=1 AGENT_WAKE=2.5 mk_agent Woken sid-wk wakes
-sleep 0.5
-stop_run "$FIX/woken.out" CL_COMPACT_IDLE_POLL=0.3 CL_COMPACT_SETTLE=5
-woken="$(cat "$FIX/woken.out")"
-contains "the compaction is confirmed" "$woken" '✓ "Woken" compacted'
-check "the premise: the new turn came after the Compacted output" "user" \
-  "$(tail -1 "$PROJ/sid-wk.jsonl" | jq -r .type)"
-contains "the stop says it was written to since" "$woken" 'Woken: written to since it compacted'
-contains "the mid-task prompt is shown" "$woken" '"Woken" looks mid-task'
-check "…declined unattended, so the session is left running" "1" "$(rtmux list-sessions 2>/dev/null | grep -c '^Woken')"
-check "…and the stop exits non-zero" "1" "$(cat "$FIX/woken.out.rc")"
+# delivered in between starts a turn the skipped prompt would kill unasked —
+# and a quiet turn has no wake-lock or CPU, so the busy check must not decide.
+for case_ in "Woken:1:wakes" "QuietWoken:0:wakes" "UserOnly:0:wakes-user" "Queued:0:queued"; do
+  cname=${case_%%:*}; rest=${case_#*:}; cbusy=${rest%%:*}; cmode=${rest#*:}
+  reset
+  AGENT_BUSY=$cbusy AGENT_WAKE=2.5 mk_agent "$cname" "sid-$cname" "$cmode"
+  sleep 0.5
+  stop_run "$FIX/$cname.out" CL_COMPACT_IDLE_POLL=0.3 CL_COMPACT_SETTLE=5
+  cout="$(cat "$FIX/$cname.out")"
+  contains "$cname: the compaction is confirmed" "$cout" "✓ \"$cname\" compacted"
+  contains "$cname: it is asked about, with the reason" "$cout" "\"$cname\": it was written to after it compacted"
+  check "$cname: …declined unattended, so it is left running" "1" "$(rtmux list-sessions 2>/dev/null | grep -c "^$cname")"
+  check "$cname: …and the stop exits non-zero" "1" "$(cat "$FIX/$cname.out.rc")"
+  check "$cname: …and the log counts it as kept" "1" "$(log_field kept)"
+done
+check "the premise: Queued's enqueue is inside its proof, not after it" "queue-operation" \
+  "$(jq -r 'select(.type == "user" or .type == "assistant" or .type == "queue-operation") | .type' "$PROJ/sid-Queued.jsonl" | tail -1)"
 reset
 
 echo "retire_session skips its prompt only on the idle-proven argument"
@@ -442,9 +451,10 @@ check "…with the reason, and that it was left running" "no-boundary+left-runni
 not_contains "…and no handoff is asked for (it would queue behind the compaction)" "$autopost" "handoff request"
 # /compact was typed and never confirmed, so it may be compacting quietly —
 # no wake-lock, no CPU. The busy check cannot see that; the stop must ask.
-contains "it is asked about, though nothing about it looks busy" "$autopost" '"AutoPost" may still be compacting'
+contains "it is asked about, though nothing about it looks busy" "$autopost" '"AutoPost": it may still be compacting'
 check "…declined unattended, so it is left running" "1" "$(rtmux list-sessions 2>/dev/null | grep -c '^AutoPost')"
 check "…and the stop exits non-zero" "1" "$(cat "$FIX/autopost.out.rc")"
+check "…and the log counts it as kept" "1" "$(log_field kept)"
 
 # ── the token in the wrong place ────────────────────────────────────────────
 echo "the token inside a tool_result is not the end of the turn"
