@@ -862,6 +862,13 @@ check "…the journal stays" "rewritten" "$(txn_phase)"
 mkdir -p "$FIX/nm/@openai/codex/bin" "$FIX/nbin"
 printf 'setTimeout(function(){}, 59000);\n' > "$FIX/nm/@openai/codex/bin/codex.js"
 printf 'setTimeout(function(){}, 59000);\n' > "$FIX/nm/hold.js"
+# Codex's two-directory case: a node started in a FOREIGN directory on its own
+# ./entry (not the launcher), while cl's own working directory — where the
+# check runs — has an ./entry that IS a symlink to the launcher. Resolved in
+# the checker's directory, the foreign process would pass.
+mkdir -p "$FIX/foreign"
+printf 'setTimeout(function(){}, 59000);\n' > "$FIX/foreign/entry"
+ln -sf "$FIX/nm/@openai/codex/bin/codex.js" "$FIX/entry"
 # The node impostors (the review's `node -e … -- <codex.js> resume <id>`, and
 # -p, --require x <codex.js>) put a real codex.js in argv, but not as the
 # entry script: node runs other code. Only `node <codex.js> …` is Codex.
@@ -875,7 +882,8 @@ for imp in "exec -a 'codex resume $NEW' /bin/sleep 60" "exec -a 'helper resume $
            "exec node -e 'setTimeout(()=>{},59000)' -- '$FIX/nm/@openai/codex/bin/codex.js' resume $NEW" \
            "exec node -p 'setTimeout(()=>{},59000)' '$FIX/nm/@openai/codex/bin/codex.js' resume $NEW" \
            "exec node --require '$FIX/nm/hold.js' '$FIX/nm/@openai/codex/bin/codex.js' resume $NEW" \
-           "exec node '$FIX/nm/hold.js' resume $NEW"; do
+           "exec node '$FIX/nm/hold.js' resume $NEW" \
+           "cd '$FIX/foreign' && exec node ./entry resume $NEW"; do
   case "$imp" in *node*) command -v node >/dev/null 2>&1 || continue ;; esac
   rtmux kill-server >/dev/null 2>&1
   impostor_pane stamp "$imp"

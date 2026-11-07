@@ -2485,8 +2485,13 @@ _codex_argv_resumes() {
       # later in argv as mere data. A real shebang launcher runs as `node
       # <script> …` (the npm one as `node /opt/homebrew/bin/codex …`, a
       # symlink), so argv[1] is resolved and must be the Codex launcher.
+      # It must also be ABSOLUTE: a relative one (`node ./entry`) names a file
+      # in the launch's own directory, and resolving it here would read this
+      # process's directory instead — an unrelated node started elsewhere
+      # could match. Shebang launchers always pass the absolute path.
       [ "$n" -ge 2 ] || return 1
       case "${av[1]}" in -*) return 1 ;; esac
+      case "${av[1]}" in /*) ;; *) return 1 ;; esac
       case "$(realpath "${av[1]}" 2>/dev/null)" in */@openai/codex/bin/codex.js) ;; *) return 1 ;; esac
       i=2 ;;
     *) return 1 ;;

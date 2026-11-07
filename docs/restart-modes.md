@@ -271,7 +271,8 @@ are re-offered to the new thread by the watcher's own re-send.
   the executing image's path (libproc `proc_pidpath`) and argv with its real
   boundaries (`KERN_PROCARGS2`), through `python3 -I`. The executable must be
   named `codex`, or be `node` whose argv[1] — the entry script, with no node
-  options before it and not itself an option — resolves to
+  options before it, not itself an option, and an absolute path (a relative
+  one would be resolved in cl's directory, not the launch's) — resolves to
   `…/@openai/codex/bin/codex.js` (`node -e …`, `-p`, `--require x` would run
   other code with that path as mere data); then the first argv element past
   the options must be `resume`, followed by the id. `ps -o command=` would split one
