@@ -105,7 +105,7 @@ def after_compact():
 if os.environ.get("AGENT_BUSY") == "1":
     import subprocess
     # argv[0] "caffeinate": what claude_busy looks for among the pane's children.
-    subprocess.Popen(["caffeinate", "6061"], executable="/bin/sleep",
+    subprocess.Popen(["caffeinate", os.environ.get("AGENT_BUSY_TAG", "6061")], executable="/bin/sleep",
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 def boundary(trigger, pre, post):
     rec({"type": "system", "subtype": "compact_boundary",
@@ -217,6 +217,12 @@ try:
                 after_compact()
                 continue
             after_compact()
+            if mode == "wakes":
+                # At rest after compacting, then a queued lane note is delivered
+                # and starts a new turn: the stop must see it before the kill.
+                time.sleep(float(os.environ.get("AGENT_WAKE", "2.5")))
+                rec({"type": "queue-operation", "operation": "enqueue", "content": "lane note"})
+                rec({"type": "user", "message": {"role": "user", "content": "lane note"}})
 finally:
     termios.tcsetattr(fd, termios.TCSADRAIN, old)
 PYEOF
@@ -226,10 +232,13 @@ mk_agent() { # <name> <sid> <mode> [delay] [chars lost from the first arrival]
   # process's children for caffeinate. AGENT_BUSY comes from the caller's env.
   printf '{"cwd":"%s"}\n{"customTitle":"%s"}\n' "$FIX/work" "$1" > "$PROJ/$2.jsonl"
   rtmux new-session -d -s "$1" -c "$FIX" \
-    "AGENT_BUSY='${AGENT_BUSY:-0}' AGENT_MODE='$3' AGENT_DELAY='${4:-0.5}' AGENT_DROP='${5:-0}' AGENT_TRANSCRIPT='$PROJ/$2.jsonl' AGENT_RECV='$FIX/recv-$1.txt' exec python3 '$AGENT'" 2>/dev/null \
+    "AGENT_BUSY='${AGENT_BUSY:-0}' AGENT_BUSY_TAG='$BUSY_TAG' AGENT_MODE='$3' AGENT_DELAY='${4:-0.5}' AGENT_DROP='${5:-0}' AGENT_TRANSCRIPT='$PROJ/$2.jsonl' AGENT_RECV='$FIX/recv-$1.txt' exec python3 '$AGENT'" 2>/dev/null \
     || setup_failed "could not start the agent for $1"
 }
-reset() { rtmux kill-server >/dev/null 2>&1; pkill -f '^caffeinate 6061$' 2>/dev/null; rm -f "$PROJ"/*.jsonl "$FIX"/recv-*.txt "$STATEDIR/state.json" "$STATEDIR/rotation-log.tsv"; }
+# Per run, so a suite running beside this one cannot kill its busy stand-ins
+# (or have them killed): every reset pkills the tag.
+BUSY_TAG=$((7000 + $$ % 2000))
+reset() { rtmux kill-server >/dev/null 2>&1; pkill -f "^caffeinate $BUSY_TAG\$" 2>/dev/null; rm -f "$PROJ"/*.jsonl "$FIX"/recv-*.txt "$STATEDIR/state.json" "$STATEDIR/rotation-log.tsv"; }
 stop_run() { # <out-file> [extra env...] -- [stop flags...]
   local out="$1"; shift
   local -a envs=() flags=()
@@ -302,7 +311,7 @@ sleep 0.5
 # claude_busy reads as mid-task (the Reader case below shows the prompt fire).
 rest_pane=$(rtmux list-panes -t =Rest -F '#{pane_pid}' 2>/dev/null | head -1)
 check "the premise: the pane's process has a caffeinate child" "1" \
-  "$(pgrep -P "$rest_pane" -f '^caffeinate 6061$' >/dev/null 2>&1 && echo 1 || echo 0)"
+  "$(pgrep -P "$rest_pane" -f "^caffeinate $BUSY_TAG\$" >/dev/null 2>&1 && echo 1 || echo 0)"
 stop_run "$FIX/rest.out"
 rest="$(cat "$FIX/rest.out")"
 contains "the ESC-styled Compacted output confirms the compaction" "$rest" '✓ "Rest" compacted'
@@ -324,6 +333,23 @@ check "the premise: a tool_result names SessionStart and compact" "1" \
 contains "the mid-task prompt is shown" "$reader" '"Reader" looks mid-task'
 check "…declined unattended, so the session is left running" "1" "$(rtmux list-sessions 2>/dev/null | grep -c '^Reader')"
 check "…and the stop says so by exiting non-zero" "1" "$(cat "$FIX/reader.out.rc")"
+reset
+
+echo "…and one that is written to after its idle proof, before the kill, is asked about"
+# The proof is taken in the compact phase; the kill comes later. A lane note
+# delivered in between starts a turn the skipped prompt would kill unasked.
+reset
+AGENT_BUSY=1 AGENT_WAKE=2.5 mk_agent Woken sid-wk wakes
+sleep 0.5
+stop_run "$FIX/woken.out" CL_COMPACT_IDLE_POLL=0.3 CL_COMPACT_SETTLE=5
+woken="$(cat "$FIX/woken.out")"
+contains "the compaction is confirmed" "$woken" '✓ "Woken" compacted'
+check "the premise: the new turn came after the Compacted output" "user" \
+  "$(tail -1 "$PROJ/sid-wk.jsonl" | jq -r .type)"
+contains "the stop says it was written to since" "$woken" 'Woken: written to since it compacted'
+contains "the mid-task prompt is shown" "$woken" '"Woken" looks mid-task'
+check "…declined unattended, so the session is left running" "1" "$(rtmux list-sessions 2>/dev/null | grep -c '^Woken')"
+check "…and the stop exits non-zero" "1" "$(cat "$FIX/woken.out.rc")"
 reset
 
 echo "retire_session skips its prompt only on the idle-proven argument"
@@ -412,8 +438,13 @@ check "the premise: an auto boundary really did land after it" "1" "$(boundaries
 not_contains "…and it is NOT reported as this compaction" "$autopost" '✓ "AutoPost" compacted'
 contains "the session resumes as-is when no manual boundary comes" "$autopost" '"AutoPost" did not confirm a compaction'
 check "…recorded as resume, not compact-resume" "resume" "$(row_field AutoPost mode)"
-check "…with the reason" "no-boundary" "$(log_field reasons)"
+check "…with the reason, and that it was left running" "no-boundary+left-running" "$(log_field reasons)"
 not_contains "…and no handoff is asked for (it would queue behind the compaction)" "$autopost" "handoff request"
+# /compact was typed and never confirmed, so it may be compacting quietly —
+# no wake-lock, no CPU. The busy check cannot see that; the stop must ask.
+contains "it is asked about, though nothing about it looks busy" "$autopost" '"AutoPost" may still be compacting'
+check "…declined unattended, so it is left running" "1" "$(rtmux list-sessions 2>/dev/null | grep -c '^AutoPost')"
+check "…and the stop exits non-zero" "1" "$(cat "$FIX/autopost.out.rc")"
 
 # ── the token in the wrong place ────────────────────────────────────────────
 echo "the token inside a tool_result is not the end of the turn"
