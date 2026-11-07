@@ -1,7 +1,25 @@
-# Restart modes — design (not yet built)
+# Restart modes — design
 
-Status: proposal, revised after design review (2026-11-06). Nothing here is
-implemented yet. The review's findings are folded in and marked **(R)**.
+Status: phase 1 implemented — the four modes for Claude, mode storage and
+migration, and compact-resume end to end. Codex `fresh` (below) is phase 2 and
+not built yet; Codex sessions still always resume. The design review's
+findings are folded in and marked **(R)**.
+
+Where phase 1 settles something this page leaves open:
+
+- **Log rows.** The rotation log stays one row per stop, so `rotate stats` keeps
+  counting stops. The per-session facts — path taken, reason, `preTokens`,
+  `postTokens` — are four comma-list columns in the same session order.
+- **"Mixed" weeks.** The row's mode is the mode *asked*; fallbacks go in the
+  paths column. `on`/`off` rows read as `handoff`/`resume`. A week whose mode
+  changed once is shown as `A->B`, and only interleaved modes are `mixed`.
+- **"The last record"** for the token means the last *conversation* record
+  (user or assistant): Claude also writes metadata records after a turn.
+- **Unreachable or unwatchable sessions.** No pane to type into, or no
+  transcript to watch: fall back to `handoff`, the route `cl handoff` can still
+  answer by hand. `/compact` that cannot be typed after the token: resume as-is.
+- **A failed resume at start** leaves any handoff in the store untouched — it is
+  neither rotated from nor consumed.
 
 ## What it is for
 

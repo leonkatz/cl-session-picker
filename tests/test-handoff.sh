@@ -44,6 +44,11 @@ not_contains() { case "$2" in *"$3"*) bad "$1" "expected output NOT to contain [
 export HOME="$FIX/home"
 BASEPATH="/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin"
 mkdir -p "$HOME/.claude/projects/p1" "$FIX/work1" "$FIX/work2"
+# The handoff rotation is what this suite covers, so it runs in handoff mode:
+# a stored legacy "on", which must keep meaning handoff now that the built-in
+# default is compact-resume.
+mkdir -p "$HOME/.config/claude-session"
+printf '{"default":"on","sessions":{}}\n' > "$HOME/.config/claude-session/rotate.json"
 
 usage_line() { # input cache_read cache_creation
   printf '{"type":"assistant","message":{"usage":{"input_tokens":%s,"cache_read_input_tokens":%s,"cache_creation_input_tokens":%s}}}\n' "$1" "$2" "$3"

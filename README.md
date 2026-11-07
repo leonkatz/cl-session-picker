@@ -87,8 +87,9 @@ session state. Open a new terminal afterward so the `cl` alias stops resolving.
 - `cl new --codex "Name" [dir|-d]` — start a fresh Codex CLI session (see [Codex CLI sessions](#codex-cli-sessions))
 - `cl --list` — print discovered sessions (`--codex` / `--claude` first to filter)
 - `cl --codex "Name"` — resume a Codex session when the same name exists for both agents
-- `cl stop` — ask each Claude session for a handoff, then snapshot live sessions, kill them, and close their iTerm tabs. A session whose handoff never lands is stopped anyway and resumes instead of rotating (`--require-handoff` to fail closed, `--keep-tabs` to leave tabs open, `--no-handoff` to skip the request and clear any pending handoff, `--dry-run` to preview)
-- `cl start` — relaunch every session from the last `stop`; any session with a **complete** waiting handoff starts **fresh** under the same name, seeded with it, instead of resuming (see [Handoff and rotation](docs/handoff.md))
+- `cl stop` — prepare each Claude session by its **restart mode** (by default: compact it), then snapshot live sessions, kill them, and close their iTerm tabs. A session whose compaction or handoff does not land is stopped anyway and comes back by resuming (`--require-handoff` to ask everyone for a handoff and fail closed, `--keep-tabs` to leave tabs open, `--no-handoff` for the fast stop — no compaction, no handoff, clears any pending handoff — `--dry-run` to preview)
+- `cl start` — relaunch every session from the last `stop`, the way its stop recorded: resumed after its compaction with a first prompt, started **fresh** from a **complete** handoff, started as a new session, or resumed as-is (see [Restart modes](#restart-modes) and [Handoff and rotation](docs/handoff.md))
+- `cl mode "Name" <compact-resume|handoff|fresh|resume>` — choose how that session is stopped and started again (`cl mode "Name"` shows it)
 - `cl handoff` — run inside a session to write its handoff by hand (stamped with that session's id, so a late write is never adopted by its replacement)
 - `cl start --fresh "Name" [--dry-run]` — rotate one **live** session now, without stopping anything else
 - The handoff instruction is replaceable: put your own in `~/.config/claude-session/handoff-prompt.txt`
@@ -268,10 +269,12 @@ This file is yours and is never read from or written to the repository.
 reboot, or to pick up a new Claude version (a running session keeps the version
 it launched with; only a fresh launch upgrades).
 
-- **`cl stop`** first asks each live Claude session, in its own pane, to write
-  a handoff (`<handoff dir>/<Name>.md`) — see
-  [Handoff and rotation](docs/handoff.md) for the mechanism, how to replace
-  the instruction with your own, and the fallback path. `--no-handoff` skips that step;
+- **`cl stop`** first prepares each live Claude session by its
+  [restart mode](#restart-modes): by default it compacts it; in `handoff` mode
+  it asks it, in its own pane, to write a handoff (`<handoff dir>/<Name>.md`) —
+  see [Handoff and rotation](docs/handoff.md) for the mechanism, how to replace
+  the instruction with your own, and the fallback path. `--no-handoff` skips
+  both, for the fast stop;
   `--dry-run` previews everything without sending, killing, or writing
   anything. **A session whose handoff never lands is still stopped** — it comes
   back by resuming rather than rotating, and says so loudly. Pass
@@ -303,8 +306,12 @@ it launched with; only a fresh launch upgrades).
     to leave all tabs open.
 - **`cl start`** reads the state file and, for each session, reattaches if it's
   already live, as the agent it was saved under. Rotation is a Claude
-  mechanism, so a Codex row always resumes as itself; for a Claude session
-  **the handoff decides how it comes back**: if a
+  mechanism, so a Codex row always resumes as itself. For a Claude session the
+  **mode its stop recorded** comes first: a compacted session is resumed by id
+  with a first prompt (after checking it is still the session that was
+  compacted — if not, it resumes plainly and says so, and never rotates from a
+  handoff nobody asked for), and a `fresh` one starts as a new session under
+  the name. Otherwise **the handoff decides how it comes back**: if a
   *complete* one is waiting, that session starts *fresh* under the same name and
   directory, told to read the handoff and continue; otherwise it resumes the
   pinned conversation by id, exactly as before. A handoff counts as complete
@@ -391,29 +398,65 @@ clients on one transcript.
 life means skip. A false positive costs a tab you reopen by hand; a false
 negative starts a second client on a live transcript.
 
-### Turning rotation off, and measuring whether it pays
+### Restart modes
 
-Rotation is a **trade**, not a free win: every `cl stop` spends one handoff
-request per session (a real call), and in exchange every later call carries a
-short seeded context instead of a long transcript. Which side wins depends on how
-you actually work, so `cl` can run both ways and record which way it ran.
+A long-lived session carrying most of a million tokens makes every turn
+expensive, and `cl stop` / `cl start` is the moment to do something about it.
+Each Claude session has a **mode** that says what:
+
+| mode | on `cl stop` | on `cl start` |
+|---|---|---|
+| `compact-resume` (default) | a short pre-compact request, then `/compact`, then stop | resume by id, with a first prompt |
+| `handoff` | ask for a handoff, then stop | a fresh session that reads the handoff |
+| `fresh` | stop; no handoff | a new session under the same name |
+| `resume` | stop | resume as-is |
 
 ```sh
-cl rotate                 # what is the policy, and what is pending?
-cl rotate off             # stop asking for handoffs (sessions resume as-is)
-cl rotate on              # back to rotating
-cl rotate off "Review"    # just that session; cl rotate clear "Review" undoes it
-cl rotate stats           # what the log says, by week
+cl mode                       # the default, overrides, and what is pending
+cl mode "Review"              # that session's mode, and which layer decided it
+cl mode "Review" handoff      # set it (compact-resume, handoff, fresh, resume)
+cl mode "Review" clear        # back to the default
+cl mode --default resume      # change the default
+cl rotate stats               # what the log says, by week
 ```
 
-Precedence, highest first: a flag on the command (`--no-handoff` /
-`--require-handoff`), then `CL_ROTATE=0|1` for a one-off, then the stored
-setting, then on. Turning rotation off skips the handoff **request**, not just
-its use — otherwise you would pay rotation's cost while measuring its absence.
+`cl rotate on|off` still works: `on` means `handoff` and `off` means `resume`,
+and a `rotate.json` written before modes existed means exactly what it meant.
+Only the built-in default — used when nothing is stored — is `compact-resume`.
+
+**compact-resume, step by step.** Every compacting session at once: a short
+pointer to `<handoff dir>/<Name>.precompact` is typed (checked for arrival like
+the handoff ask), asking the session to finish and reply with an exact
+`cl-done:` token. Only that token in the session's final reply counts — not the
+token sitting in the file it read. Then `/compact` is typed once, and the stop
+waits for the transcript to record a *manual* compaction. An optional workflow
+for that last turn goes in `~/.config/claude-session/precompact-prompt.txt`; the
+first message on resume comes from
+`~/.config/claude-session/resume-after-compact-prompt.txt` or a one-line
+default. `CL_COMPACT_TIMEOUT` (default 600s) bounds the whole phase, for all
+sessions at once. If no token arrives in time the session is asked for a
+handoff instead; if a session compacts on its own before `/compact`, it is not
+compacted twice; if no compaction is confirmed after `/compact`, it resumes
+as-is. Codex sessions always resume as themselves in this version.
+
+### Measuring whether it pays
+
+Every mode is a **trade**, not a free win: a handoff or a compaction is a real
+call per session at every `cl stop`, and in exchange every later call carries a
+short context instead of a long transcript. Which side wins depends on how you
+actually work, so `cl` can run every way and record which way it ran.
+
+Precedence, highest first: a flag on the command (`--no-handoff` forces
+`resume`, `--require-handoff` forces `handoff`), then `CL_ROTATE` for a one-off
+(`0|1` as before, or a mode name), then the stored setting, then
+`compact-resume`. `resume` skips the handoff **request**, not just its use —
+otherwise you would pay its cost while measuring its absence.
 
 Every `cl stop` appends one line to
-`~/.config/claude-session/rotation-log.tsv`: how the stop ran, which layer
-decided, how many sessions, how many handoffs landed, and **every session's
+`~/.config/claude-session/rotation-log.tsv`: the mode asked, which layer
+decided, how many sessions, how many handoffs landed, the **path each session
+actually took and why** (a fallback shows up there, not as a different mode),
+the compaction's `preTokens` / `postTokens`, and **every session's
 context size at stop time** — the per-call cost rotation removes. Keeping each
 size, rather than just a per-stop summary, is what lets the weekly figure be a
 real median across sessions instead of an average of per-stop averages (which
@@ -422,10 +465,15 @@ would also weight a one-session stop like a ten-session one).
 `cl rotate stats` groups by the Monday each week starts on:
 
 ```
-WEEK FROM      MODE      CYCLES  SESSIONS  CTX MEDIAN  OVERRIDES
-2026-09-28     on             5        30         62k          -
-2026-10-05     off            5        30        181k          -
+WEEK FROM      MODE              CYCLES  SESSIONS  CTX MEDIAN  OVERRIDES
+2026-09-28     handoff                5        30         62k          -
+2026-10-05     resume                 5        30        181k          -
+2026-10-12     resume->compact        5        30         24k          -
 ```
+
+Rows written as `on` / `off` count as `handoff` / `resume`. A week whose mode
+changed **once** (an upgrade, or `cl mode --default` mid-week) shows as `A->B` —
+a clean before/after — and only a week whose modes interleave is `mixed`.
 
 `CTX MEDIAN` is the median across every session stopped that week. A `~` prefix
 means some rows predate the per-session figures, so only their own medians were
@@ -441,14 +489,14 @@ A week counts as clean **only when the stored policy decided every stop in it**.
 Anything else sets `OVERRIDES=yes` — a per-session override, a `--no-handoff` or
 `--require-handoff` on the command line, or a `CL_ROTATE` in the environment —
 even when every session still rotated the same way, because the *decision* was no
-longer uniform. So set an arm for a week with `cl rotate off`, and keep flags and
-`CL_ROTATE` for one-offs you do not mind excluding.
+longer uniform. So set an arm for a week with `cl mode --default`, and keep flags
+and `CL_ROTATE` for one-offs you do not mind excluding.
 
-The `HANDOFF` column in `cl` and `cl --list` shows each session's setting, with
-`↻` when a complete handoff is already waiting — so `off↻` means someone wrote
-one by hand for a session that will not be asked for one, and the next stop will
-clear it. Codex rows show `—`: rotation needs a session that can summarise
-itself, so there is nothing there to switch on.
+The `HANDOFF` column in `cl` and `cl --list` shows each session's mode in short
+form (`compact`, `handoff`, `fresh`, `resume`), with `↻` when a complete handoff
+is already waiting — so `resume↻` means someone wrote one by hand for a session
+that will not be asked for one, and the next stop will clear it. Codex rows show
+`—`: they always resume as themselves, so there is nothing there to choose.
 
 ### Rotation hint
 
