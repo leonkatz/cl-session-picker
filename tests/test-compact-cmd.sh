@@ -46,16 +46,28 @@ awk '/^cat > "\$AGENT" <<'"'"'PYEOF'"'"'$/{f=1; next} f && /^PYEOF$/{exit} f{pri
   "$HERE/test-compact-resume.sh" > "$AGENT"
 grep -q 'compact_boundary' "$AGENT" || setup_failed "could not read the simulated agent out of test-compact-resume.sh"
 
+# Process identity. cl reads a process's real image and argv from the kernel
+# (proc_identity), so the Python stand-in agent is — correctly — not Claude by
+# its argv. It is tied the way a real Claude session also is: Claude Code's own
+# registry entry for its pid ($HOME/.claude/sessions/<pid>.json), which cl's
+# production check validates field by field. Where argv identity itself is
+# under test, the agent runs under an interpreter image NAMED claude
+# (lib-fake-claude.sh).
+SESSDIR="$HOME/.claude/sessions"
+. "$HERE/lib-fake-claude.sh"
+fake_claude_image "$FIX/fake/claude" || setup_failed "no Claude stand-in image on this machine"
 mk_agent() { # <name> <sid> <mode> [delay]
-  # Bound as cl's own sessions are: a process tied to the session's id (here
-  # its --resume argv) in the pane, and the session stamped as tmux_claim does.
-  mk_pane "$1" "$2" "$3" "${4:-0.5}" "--resume $2"
+  # Bound as cl's own sessions are: Claude's registry places the session's
+  # process in the pane, and the session is stamped as tmux_claim does.
+  mk_pane "$1" "$2" "$3" "${4:-0.5}"
+  reg_claude "$SESSDIR" "$(pane_pid "$1")" "$2" || setup_failed "could not register $1"
   stamp "$1" claude "$2"
 }
-mk_pane() { # <name> <sid> <mode> [delay] [extra agent argv]: an UNSTAMPED pane
+mk_pane() { # <name> <sid> <mode> [delay] [extra agent argv]: an UNSTAMPED, UNTIED pane
+  # MK_EXE / MK_SCRIPT run the agent under another image or script path.
   printf '{"cwd":"%s"}\n{"customTitle":"%s"}\n' "$FIX/work" "$1" > "$PROJ/$2.jsonl"
   rtmux new-session -d -s "$1" -c "$FIX" \
-    "AGENT_MODE='$3' AGENT_DELAY='${4:-0.5}' AGENT_TRANSCRIPT='$PROJ/$2.jsonl' AGENT_RECV='$FIX/recv-$1.txt' exec python3 '$AGENT' ${5:-}" 2>/dev/null \
+    "AGENT_MODE='$3' AGENT_DELAY='${4:-0.5}' AGENT_TRANSCRIPT='$PROJ/$2.jsonl' AGENT_RECV='$FIX/recv-$1.txt' exec '${MK_EXE:-python3}' '${MK_SCRIPT:-$AGENT}' ${5:-}" 2>/dev/null \
     || setup_failed "could not start the agent for $1"
 }
 stamp() { rtmux set-option -t "=$1:" @cl_agent "$2" >/dev/null && rtmux set-option -t "=$1:" @cl_sid "$3" >/dev/null \
@@ -80,7 +92,7 @@ mk_codex() { # <name>
 reset() {
   rtmux kill-server >/dev/null 2>&1
   rm -f "$PROJ"/*.jsonl "$FIX"/recv-*.txt "$FIX/codex-tr.jsonl" "$STATEDIR"/*.json "$STATEDIR"/*.tsv
-  rm -rf "$CODEXDIR" "$FIX/store"
+  rm -rf "$CODEXDIR" "$FIX/store" "$SESSDIR"
 }
 compact_run() { # <out-file> [extra env...] -- [compact args...]
   local out="$1"; shift
@@ -370,18 +382,17 @@ check "…exit non-zero" "1" "$(cat "$FIX/loose.out.rc")"
 
 echo "an unstamped pane running the process tied to the session's id is allowed"
 reset
-# Another session first, so the tmux server's own argv is not this pane's
-# command line (the server keeps its first client's argv, --resume included).
-mk_agent First sid-first ok
-mk_pane Tied sid-tied ok 0.5 "--resume sid-tied"
+mk_pane Tied sid-tied ok
+reg_claude "$SESSDIR" "$(pane_pid Tied)" sid-tied || setup_failed "register Tied"
 compact_run "$FIX/tied.out" -- Tied
-contains "it is compacted (a hand-run claude --resume of this id)" "$(cat "$FIX/tied.out")" "✓ Tied: compacted by /compact"
+contains "it is compacted (a claude cl did not start, tied by Claude's registry)" "$(cat "$FIX/tied.out")" "✓ Tied: compacted by /compact"
 check "…with exactly one /compact" "1" "$(typed_compact Tied)"
 echo "…but the same process in a DIFFERENT pane does not vouch for this one"
 reset
 mk_agent First sid-first ok
 mk_pane Elsewhere sid-else ok
-mk_pane Decoy sid-decoy silent 0.5 "--resume sid-else"
+mk_pane Decoy sid-decoy silent
+reg_claude "$SESSDIR" "$(pane_pid Decoy)" sid-else || setup_failed "register Decoy"
 compact_run "$FIX/else.out" -- Elsewhere
 check "nothing is typed into the pane at the name" "0" "$(nlines "$FIX/recv-Elsewhere.txt")"
 contains "…refused as unverified" "$(cat "$FIX/else.out")" "✗ Elsewhere: its pane could not be verified"
@@ -444,8 +455,9 @@ mk_agent Host sid-host ok
 printf '{"cwd":"%s"}\n{"customTitle":"Bare"}\n' "$FIX/work" > "$PROJ/sid-bare.jsonl"
 # The session's process, on a terminal, under ANOTHER tmux name: no tmux
 # session at "Bare", so the iTerm route is the one taken.
-rtmux new-window -t '=Host:' -n bare "exec python3 -c 'import time; time.sleep(120)' --resume sid-bare"
+rtmux new-window -t '=Host:' -n bare "exec python3 -c 'import time; time.sleep(120)'"
 sleep 0.5
+reg_claude "$SESSDIR" "$(rtmux display-message -p -t '=Host:bare' '#{pane_pid}')" sid-bare || setup_failed "register Bare"
 bare_tty=$(rtmux display-message -p -t '=Host:bare' '#{pane_tty}')
 compact_run "$FIX/bare.out" PATH="$FAKEOSA:$BASEPATH" -- Bare
 contains "iTerm is asked to type only into a tagged window on that tty" "$(cat "$FIX/osa-script.txt" 2>/dev/null)" \
@@ -454,13 +466,113 @@ contains "…and with no such window, nothing is compacted" "$(cat "$FIX/bare.ou
 echo "a tied process with no terminal is refused before iTerm is asked"
 reset; rm -f "$FIX/osa-script.txt"
 printf '{"cwd":"%s"}\n{"customTitle":"NoTty"}\n' "$FIX/work" > "$PROJ/sid-notty.jsonl"
-python3 -c 'import os, sys, time; os.setsid(); time.sleep(60)' --resume sid-notty </dev/null >/dev/null 2>&1 &
+python3 -c 'import os, sys, time; os.setsid(); time.sleep(60)' </dev/null >/dev/null 2>&1 &
 notty_pid=$!
 sleep 0.5
+reg_claude "$SESSDIR" "$notty_pid" sid-notty || setup_failed "register NoTty"
 compact_run "$FIX/notty.out" PATH="$FAKEOSA:$BASEPATH" -- NoTty
 kill "$notty_pid" 2>/dev/null; wait "$notty_pid" 2>/dev/null
 contains "it is refused as unverified" "$(cat "$FIX/notty.out")" "✗ NoTty: its pane could not be verified"
 check "…and iTerm was never asked" "0" "$([ -e "$FIX/osa-script.txt" ] && echo 1 || echo 0)"
+
+# ── process identity: who counts as this session's Claude ────────────────────
+LIBALL="$FIX/lib-all.sh"
+sed '/^# Optional agent filter for direct launch/,$d' "$CL" > "$LIBALL"
+grep -q '^proc_identity()' "$LIBALL" || setup_failed "could not read the script's functions"
+argv_ok() { ( . "$LIBALL" 2>/dev/null; _claude_argv_session "$1" "$2"; echo $? ) }
+IDLE="$FAKE_CLAUDE_IDLE"
+mkdir -p "$FIX/share/claude/versions" "$FIX/fakenode" "$FIX/nm/@anthropic-ai/claude-code"
+cp "$FIX/fake/claude" "$FIX/share/claude/versions/2.1.319"; cp "$FIX/fake/claude" "$FIX/fakenode/node"
+printf '%s\n' "$IDLE" > "$FIX/nm/@anthropic-ai/claude-code/cli.js"
+"$FIX/fake/claude" -c "$IDLE" --resume sid-x </dev/null >/dev/null 2>&1 & p_native=$!
+"$FIX/share/claude/versions/2.1.319" -c "$IDLE" --session-id sid-x </dev/null >/dev/null 2>&1 & p_versions=$!
+"$FIX/fakenode/node" "$FIX/nm/@anthropic-ai/claude-code/cli.js" --resume sid-x </dev/null >/dev/null 2>&1 & p_node=$!
+"$FIX/fake/claude" -c "$IDLE" --resume sid-x --fork-session </dev/null >/dev/null 2>&1 & p_fork=$!
+"$FIX/fake/claude" -c "$IDLE" "words --resume sid-x" </dev/null >/dev/null 2>&1 & p_oneword=$!
+python3 -c "$IDLE" --resume sid-x </dev/null >/dev/null 2>&1 & p_python=$!
+/bin/sh -c 'exec -a "claude --resume sid-x" /bin/sleep 120' </dev/null >/dev/null 2>&1 & p_execa=$!
+/bin/sh -c 'exec -a claude /bin/sleep 120 --resume sid-x' </dev/null >/dev/null 2>&1 & p_execa2=$!
+sleep 1
+echo "argv identity: the real image and real argv, never the ps text"
+check "positive: an image named claude, --resume <sid> as two elements" "0" "$(argv_ok "$p_native" sid-x)"
+check "positive: Claude Code's versions/<version> image, --session-id <sid>" "0" "$(argv_ok "$p_versions" sid-x)"
+check "positive: node running @anthropic-ai/claude-code/cli.js" "0" "$(argv_ok "$p_node" sid-x)"
+check "…but not for another id" "1" "$(argv_ok "$p_native" sid-y)"
+check "negative: a fork of the session" "1" "$(argv_ok "$p_fork" sid-x)"
+check "negative: '--resume <sid>' inside ONE argv element" "1" "$(argv_ok "$p_oneword" sid-x)"
+check "negative: Codex's probe, a Python sleeper with --resume <sid>" "1" "$(argv_ok "$p_python" sid-x)"
+check "negative: exec -a 'claude --resume <sid>' /bin/sleep" "1" "$(argv_ok "$p_execa" sid-x)"
+check "negative: exec -a claude /bin/sleep … --resume <sid>" "1" "$(argv_ok "$p_execa2" sid-x)"
+check "argv_resume_pids finds exactly the three real clients" \
+  "$(printf '%s\n' "$p_native" "$p_versions" "$p_node" | sort | tr '\n' ' ')" \
+  "$( ( . "$LIBALL" 2>/dev/null; argv_resume_pids sid-x ) | sort | tr '\n' ' ')"
+echo "an identity that cannot be read is no evidence"
+check "python3 missing: no evidence, even for a real client" "1" \
+  "$( ( . "$LIBALL" 2>/dev/null; PATH=/nonexistent; _claude_argv_session "$p_native" sid-x; echo $? ) )"
+check "…and proc_identity says it failed" "1" "$( ( . "$LIBALL" 2>/dev/null; PATH=/nonexistent; proc_identity "$p_native" >/dev/null; echo $? ) )"
+check "the kernel refuses the read (pid 1, another user's process)" "1" "$( ( . "$LIBALL" 2>/dev/null; proc_identity 1 >/dev/null; echo $? ) )"
+kill "$p_execa" 2>/dev/null; wait "$p_execa" 2>/dev/null
+check "a process that is gone" "1" "$(argv_ok "$p_execa" sid-x)"
+kill "$p_native" "$p_versions" "$p_node" "$p_fork" "$p_oneword" "$p_python" "$p_execa2" 2>/dev/null
+wait 2>/dev/null
+
+echo "Codex's impostor probe: a Python sleeper's pane is not bound (registries empty)"
+reset
+rtmux new-session -d -s Impostor "exec python3 -c 'import time; time.sleep(60)' --resume review-impostor-sid"
+sleep 0.5
+imp=$( ( . "$LIBALL" 2>/dev/null; TMUX_TMPDIR="$TMUX_TMPDIR"; export TMUX_TMPDIR; HOME="$HOME"
+         compact_target_bound Impostor review-impostor-sid Impostor; echo " rc=$?" ) )
+contains "it is refused as unverifiable" "$imp" "rc=2"
+echo "…and end to end, neither impostor gets anything typed"
+reset
+mk_pane Impostor sid-imp ok 0.5 "--resume sid-imp"
+compact_run "$FIX/imp.out" -- Impostor
+check "the Python agent with --resume <sid> in its argv gets nothing" "0" "$(nlines "$FIX/recv-Impostor.txt")"
+contains "…refused as unverified" "$(cat "$FIX/imp.out")" "✗ Impostor: its pane could not be verified"
+reset
+printf '{"cwd":"%s"}\n{"customTitle":"Spoof"}\n' "$FIX/work" > "$PROJ/sid-spoof.jsonl"
+rtmux new-session -d -s Spoof "exec -a 'claude --resume sid-spoof' /bin/sleep 120"
+sleep 0.3
+compact_run "$FIX/spoof.out" -- Spoof
+contains "an exec -a 'claude --resume <sid>' sleeper is refused" "$(cat "$FIX/spoof.out")" "✗ Spoof: its pane could not be verified"
+echo "…while a real Claude image with that argv, unstamped and unregistered, is bound"
+reset
+MK_EXE="$FIX/fake/claude" mk_pane ArgvCl sid-argv ok 0.5 "--resume sid-argv"
+compact_run "$FIX/argvcl.out" -- ArgvCl
+contains "the native-image shape is compacted" "$(cat "$FIX/argvcl.out")" "✓ ArgvCl: compacted by /compact"
+reset
+cp "$AGENT" "$FIX/nm/@anthropic-ai/claude-code/cli.js"
+MK_EXE="$FIX/fakenode/node" MK_SCRIPT="$FIX/nm/@anthropic-ai/claude-code/cli.js" mk_pane NodeCl sid-node ok 0.5 "--resume sid-node"
+compact_run "$FIX/nodecl.out" -- NodeCl
+contains "the node-wrapper shape is compacted" "$(cat "$FIX/nodecl.out")" "✓ NodeCl: compacted by /compact"
+
+# ── cleanup when the put-back fails ──────────────────────────────────────────
+echo "a request that is not ours and cannot be put back is kept, and the call fails"
+CLR="$FIX/clr.sh"
+awk '/^_c_clear_request\(\) \{/{f=1} f{print} f && /^}$/{exit}' "$CL" > "$CLR"
+grep -q '^_c_clear_request()' "$CLR" || setup_failed "could not extract _c_clear_request"
+clr() { # <setup code> -> "rc outcome | request at the path | files left"
+  local d="$FIX/clr"; rm -rf "$d"; mkdir -p "$d"
+  printf 'another run, cl-done:other-run\n' > "$d/request.md"
+  ( . "$CLR"; _CL_STOP_ROOT="$d"; _h_ctok=(cl-done:ours); _h_name=(Review)
+    precompact_request_path() { printf '%s/request.md' "$d"; }
+    eval "$1"
+    _c_clear_request 0 2>/dev/null; rc=$?
+    printf '%s %s | %s | %s' "$rc" "$_C_CLEARED" "$(cat "$d/request.md" 2>/dev/null || echo none)" \
+      "$(cat "$d"/request.md.clearing.* 2>/dev/null || echo none)" )
+}
+check "Codex's probe (no hard links): put back by a no-clobber move instead" \
+  "0 not-ours | another run, cl-done:other-run | none" "$(clr 'ln() { return 1; }')"
+check "link AND move fail: the backup is retained and the result is non-zero" \
+  "1 failed | none | another run, cl-done:other-run" \
+  "$(clr 'ln() { return 1; }; mv() { case "$1" in -n) return 1 ;; esac; command mv "$@"; }')"
+check "a NEWER request (another token) is established at the path: the backup goes" \
+  "0 not-ours | newer, cl-done:newer-run | none" "$(clr 'ln() { printf "newer, cl-done:newer-run\n" > "$2"; return 1; }')"
+check "something at the path that is not established as newer: the backup is kept" \
+  "1 failed | junk with no token | another run, cl-done:other-run" "$(clr 'ln() { printf "junk with no token\n" > "$2"; return 1; }')"
+check "…nor is the SAME token in a different file" \
+  "1 failed | changed, cl-done:other-run | another run, cl-done:other-run" \
+  "$(clr 'ln() { printf "changed, cl-done:other-run\n" > "$2"; return 1; }')"
 
 # ── interrupted ──────────────────────────────────────────────────────────────
 echo "SIGTERM after dispatch removes this run's request, and only that"

@@ -241,17 +241,22 @@ mk_agent() { # <name> <sid> <mode> [delay] [chars lost from the first arrival]
   # process's children for caffeinate. AGENT_BUSY comes from the caller's env.
   printf '{"cwd":"%s"}\n{"customTitle":"%s"}\n' "$FIX/work" "$1" > "$PROJ/$2.jsonl"
   rtmux new-session -d -s "$1" -c "$FIX" \
-    "AGENT_BUSY='${AGENT_BUSY:-0}' AGENT_MODE='$3' AGENT_DELAY='${4:-0.5}' AGENT_DROP='${5:-0}' AGENT_TRANSCRIPT='$PROJ/$2.jsonl' AGENT_RECV='$FIX/recv-$1.txt' exec python3 '$AGENT' --resume '$2'" 2>/dev/null \
+    "AGENT_BUSY='${AGENT_BUSY:-0}' AGENT_MODE='$3' AGENT_DELAY='${4:-0.5}' AGENT_DROP='${5:-0}' AGENT_TRANSCRIPT='$PROJ/$2.jsonl' AGENT_RECV='$FIX/recv-$1.txt' exec python3 '$AGENT'" 2>/dev/null \
     || setup_failed "could not start the agent for $1"
   # Bound as cl's own sessions are: stamped as cl stamps the panes it launches
-  # (tmux_claim), and running a process tied to the session's id (here by its
-  # --resume argv; a real claude is also in Claude Code's registry). cl types
-  # only into a pane holding that process.
+  # (tmux_claim), and with Claude Code's own registry entry placing the
+  # session's process in the pane — cl reads a process's identity from the
+  # kernel, so a Python stand-in is not Claude by its argv, and the registry
+  # (validated by cl's production check: pid, sessionId, start time) is the
+  # tie. cl types only into a pane holding that process.
+  reg_claude "$HOME/.claude/sessions" "$(rtmux list-panes -t "=$1" -F '#{pane_pid}' 2>/dev/null | head -1)" "$2" \
+    || setup_failed "could not register $1"
   stamp "$1" claude "$2"
 }
 stamp() { rtmux set-option -t "=$1:" @cl_agent "$2" >/dev/null && rtmux set-option -t "=$1:" @cl_sid "$3" >/dev/null \
   || setup_failed "could not stamp $1"; }
-reset() { rtmux kill-server >/dev/null 2>&1; pkill -f '^caffeinate 6061$' 2>/dev/null; rm -f "$PROJ"/*.jsonl "$FIX"/recv-*.txt "$STATEDIR/state.json" "$STATEDIR/rotation-log.tsv"; }
+reset() { rtmux kill-server >/dev/null 2>&1; pkill -f '^caffeinate 6061$' 2>/dev/null; rm -f "$PROJ"/*.jsonl "$FIX"/recv-*.txt "$STATEDIR/state.json" "$STATEDIR/rotation-log.tsv"; rm -rf "$HOME/.claude/sessions"; }
+. "$HERE/lib-fake-claude.sh"
 stop_run() { # <out-file> [extra env...] -- [stop flags...]
   local out="$1"; shift
   local -a envs=() flags=()

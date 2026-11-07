@@ -30,10 +30,13 @@ printf '{"type":"session_meta","payload":{"id":"%s","cwd":"%s"}}\n' "$SX" "$FIX/
 printf '#!/bin/sh\nexit 0\n' > "$FIX/bin/claude"; chmod +x "$FIX/bin/claude"
 
 # Two of the three Claude sessions running, found the way a real one is under a
-# HOME with no Claude registry: argv `claude --resume <sid>`. Not started inside
+# HOME with no Claude registry: a Claude client (lib-fake-claude.sh) whose
+# argv is `--resume <sid>`. Not started inside
 # $( ), and with stdio detached, so no command substitution waits on them.
+. "$(dirname "$CL")/../tests/lib-fake-claude.sh"
+fake_claude_image "$FIX/agentbin/claude" || setup_failed "no Claude stand-in image on this machine"
 for s in "$S1" "$S2"; do
-  /bin/sh -c "exec -a \"claude --resume $s\" sleep 600" </dev/null >/dev/null 2>&1 &
+  "$FIX/agentbin/claude" -c "$FAKE_CLAUDE_IDLE" --resume "$s" </dev/null >/dev/null 2>&1 &
   PIDS="$PIDS $!"
   # Disowned: stop kills these, and bash would otherwise announce each death
   # ("Terminated: 15") on stderr, where it reads like a failing test.
@@ -67,7 +70,7 @@ printf 'a session cl could not stop fails the stop\n'
 # stand-in that ignores SIGTERM is still running when the shutdown wait ends.
 S4=01a00000-0000-7000-8000-000000000004
 mk "$S4" Stubborn
-/bin/sh -c "trap '' TERM; exec -a \"claude --resume $S4\" sleep 600" </dev/null >/dev/null 2>&1 &
+"$FIX/agentbin/claude" -c "$FAKE_CLAUDE_IDLE" --ignore-term --resume "$S4" </dev/null >/dev/null 2>&1 &
 STUB=$!; PIDS="$PIDS $STUB"; disown "$STUB" 2>/dev/null || true
 sleep 0.5
 out=$(cl stop --no-handoff --keep-tabs); rc=$?

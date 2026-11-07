@@ -149,10 +149,25 @@ A tmux session at the right name is not proof: names collide, and a name
 match is all liveness checks. A cl stamp (`@cl_agent`/`@cl_sid`) is not proof
 either: it is session-scoped, while typing to `=<session>:` reaches whichever
 pane has focus. So the evidence is always a **process tied to this session's
-id** — cl's launch record bound to name and id, Claude Code's registry proven
-by start time, or a `--resume`/`--session-id` argv for exactly that id (never
-a fork) — running in the place cl types into. `compact_target_bound` returns
-that place, and only it is typed into:
+id** — cl's launch record bound to name and id, Claude Code's registry entry
+(pid, session id and start time all matching), or a verified Claude client
+whose argv resumes exactly that id — running in the place cl types into.
+`compact_target_bound` returns that place, and only it is typed into.
+
+"A verified Claude client" is read from the kernel, never from `ps`
+(`proc_identity`: libproc's `proc_pidpath` for the image actually executing,
+`sysctl KERN_PROCARGS2` for argv with its real boundaries; `/proc` on Linux;
+through `python3 -I`). The image must be Claude Code's
+(`…/claude/versions/<version>`, or named `claude`, or node running
+`…/@anthropic-ai/claude-code/cli.js`); `--resume <id>` or `--session-id <id>`
+must be two adjacent argv elements; `--fork-session` disqualifies. A Python
+sleeper with `--resume <id>`, or `exec -a 'claude --resume <id>' /bin/sleep`,
+is not Claude. An identity that cannot be read (no python3, or the kernel
+refuses) is no evidence. What this cannot stop is a program deliberately
+installed under one of those names; it stops anything that merely mentions
+one. The same check is what `session_pid`, and so every kill path, reads.
+
+| what sits at the name | result |
 
 | what sits at the name | result |
 |---|---|
@@ -313,10 +328,13 @@ What is different:
 - **Which request is "this run's".** Only a file holding a token this run
   issued. A session refused or skipped before a token was issued has no
   request of this run, so nothing is removed for it. Removal renames the file
-  to a name only that call knows, checks the token, then deletes it — or links
-  it back if it is not ours — so a newer request written in between is never
-  the one deleted. A removal that fails is reported, and under `cl compact`
-  makes the exit non-zero.
+  to a name only that call knows, checks the token, then deletes it — or puts
+  it back if it is not ours (a link, or a no-clobber move), so a newer request
+  written in between is never the one deleted. If it cannot be put back, it is
+  KEPT under that name, said, and the call fails — unless what is now at the
+  path is established to supersede it: a different `cl-done` token, or a
+  byte-identical copy. A removal or put-back that fails is reported, and under
+  `cl compact` makes the exit non-zero.
 - **The report** is one line per target: the path taken and the boundary
   record's `preTokens → postTokens`.
 - **No rotation log line.** The log is one row per stop and `cl rotate stats`

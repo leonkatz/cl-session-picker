@@ -69,17 +69,29 @@ BASEPATH="$FIX/bin:/usr/bin:/bin"
 # `cl stop` plans only for sessions that are RUNNING (session_is_live), so a
 # fixture of bare transcripts is a fleet of closed sessions with nothing to ask.
 # These stand-ins make each fixture session live the way a real one is found
-# here — argv `claude --resume <sid>`, with no Claude registry under this HOME.
+# here — a Claude client whose argv resumes <sid>, with no Claude registry
+# under this HOME.
 # A real stop kills them, so live_up runs before every stop and respawns what is
 # gone. Detached stdio, because a child holding a $( ) pipe hangs the caller;
 # pids go to a file because $! set inside $( ) is lost with the subshell.
 LIVE_PIDS="$FIX/live.pids"
+# A Claude stand-in is a process whose real image is named claude, with real
+# argv (lib-fake-claude.sh): cl reads identity from the kernel, so an exec -a
+# sleeper is not Claude. Codex stand-ins keep the exec -a shape their own
+# checks read. Each slot's pid is kept, so a live one is not started twice.
+. "$(dirname "$CL")/../tests/lib-fake-claude.sh"
+fake_claude_image "$FIX/fakeclaude/claude" || { printf 'FIXTURE SETUP FAILED: no Claude stand-in image on this machine\n' >&2; exit 2; }
 live_up() {
-  local argv
+  local argv i=0 pf
   for argv in "${LIVE_ARGV[@]}"; do
-    pgrep -f "^${argv} 600\$" >/dev/null 2>&1 && continue
-    /bin/sh -c "exec -a \"$argv\" sleep 600" </dev/null >/dev/null 2>&1 &
-    echo $! >> "$LIVE_PIDS"
+    i=$((i+1)); pf="$LIVE_PIDS.$i"
+    [ -f "$pf" ] && kill -0 "$(cat "$pf")" 2>/dev/null && continue
+    case "$argv" in
+      claude\ *) # shellcheck disable=SC2086
+                 "$FIX/fakeclaude/claude" -c "$FAKE_CLAUDE_IDLE" ${argv#claude } </dev/null >/dev/null 2>&1 & ;;
+      *)         /bin/sh -c "exec -a \"$argv\" sleep 600" </dev/null >/dev/null 2>&1 & ;;
+    esac
+    echo $! > "$pf"; echo $! >> "$LIVE_PIDS"
   done
   sleep 0.3
 }
