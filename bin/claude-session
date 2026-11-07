@@ -3634,26 +3634,49 @@ compact_boundary_after() {
   printf '%s' "$out"
 }
 
-# The text of any record, for the two checks that look for command output.
-_CL_JQ_TEXT='(.message.content? // .content? // "")
-  | if type == "string" then . elif type == "array" then (map(.text? // "") | join(" ")) else "" end'
+# "Compacted", as Claude Code actually records it: a USER record whose content
+# is a STRING, the command's stdout wrapped in <local-command-stdout>, and the
+# word itself styled with ANSI SGR escapes:
+#   "<local-command-stdout>\u001b[2mCompacted (ctrl+o …)\u001b[22m</local-command-stdout>"
+# A plain contains("<local-command-stdout>Compacted") never matches that. And
+# it is anchored to the start of a string-content user record ONLY: a
+# tool_result is array content, so a session that reads this script, or a
+# transcript, after compacting cannot be taken for the command's own output.
+_CL_JQ_COMPACTED='def compacted_output:
+  .type == "user" and ((.message.content? // null) | type) == "string"
+  and (.message.content | test("^<local-command-stdout>(\u001b\\[[0-9;]*m)*Compacted"));'
 
 # compact_output_after <mark>: 0 when /compact has reported "Compacted" after
 # the mark — the second accepted confirmation, for a version that writes the
 # command's output but a boundary this check does not recognise.
 compact_output_after() {
-  _tail_records "$1" | jq -s -e "map(select(($_CL_JQ_TEXT) | contains(\"<local-command-stdout>Compacted\"))) | length > 0" >/dev/null 2>&1
+  _tail_records "$1" | jq -s -e "$_CL_JQ_COMPACTED"' map(select(compacted_output)) | length > 0' >/dev/null 2>&1
 }
 
-# compact_idle_record <mark> [token]: 0 when the LAST record after the mark is
-# one a session at rest after a compaction ends on: the "Compacted" output, or
-# the SessionStart hook record a compaction fires. With a token (a session
-# that compacted on its own and then finished its turn), the token's reply.
+# compact_idle_record <mark> [token]: 0 when the session is at rest after its
+# compaction, judged by the LAST CONVERSATION record (user/assistant) after the
+# mark — exactly as compact_token_seen judges a turn's end.
+#
+# Not the last record of any kind: after a manual compaction Claude Code writes
+# the Compacted output, then attachment records (the SessionStart:compact hook
+# among them), then a batch of metadata (file-history-snapshot, last-prompt,
+# custom-title, permission-mode…); a finished turn is followed by
+# stop_hook_summary, turn_duration and more. A bare `last` lands on metadata,
+# never passes, and sends every compacted session to the kill prompt — which,
+# unattended, is answered "no" and fails the stop.
+#
+# Idle means that record is the Compacted output — or, with a token (a session
+# that compacted on its own and then finished its turn), the assistant reply
+# carrying it. Deliberately NOT any free-text mention of "SessionStart" and
+# "compact": a tool_result can contain both, and matching it would skip the
+# prompt for a session that is busy.
 compact_idle_record() {
-  _tail_records "$1" | jq -s -e --arg tok "${2:-}" "last | select(. != null)
-    | ((($_CL_JQ_TEXT) | contains(\"<local-command-stdout>Compacted\"))
-       or ((tostring | contains(\"SessionStart\")) and (tostring | test(\"compact\")))
-       or (\$tok != \"\" and .type == \"assistant\" and (tostring | contains(\$tok))))" >/dev/null 2>&1
+  _tail_records "$1" | jq -s -e --arg tok "${2:-}" "$_CL_JQ_COMPACTED"'
+    map(select(.type == "user" or .type == "assistant")) | last | select(. != null)
+    | compacted_output
+      or ($tok != "" and .type == "assistant"
+          and ([(.message.content // []) | if type == "array" then .[] else empty end
+                | select(.type == "text") | (.text // "") | contains($tok)] | any))' >/dev/null 2>&1
 }
 
 # compact_preflight <sid> <boundary-uuid>: before `cl start` resumes a session
@@ -4022,8 +4045,13 @@ _stop_compact_phase() {
   [ "$c_count" -gt 0 ] || return 0
 
   # The same announcement shape as the handoff broadcast, said up front: how
-  # many will be asked, and how long the phase may take.
-  printf '⏳ asking %s session(s) to finish up, then /compact, all at once — up to %ss\n' "$c_count" "$CL_COMPACT_TIMEOUT" >&2
+  # many will be asked, and how long the phase may take. A dry run says how
+  # many WOULD be asked, and promises no wait.
+  if [ -n "$dry_run" ]; then
+    printf '⏳ asking %s session(s) to finish up, then /compact (dry run: nothing is sent, nothing is waited for)\n' "$c_count" >&2
+  else
+    printf '⏳ asking %s session(s) to finish up, then /compact, all at once — up to %ss\n' "$c_count" "$CL_COMPACT_TIMEOUT" >&2
+  fi
   if [ -n "$dry_run" ]; then
     for (( i=0; i<_n; i++ )); do
       [ "${_h_rot[$i]}" = "compact-resume" ] || continue
@@ -4251,7 +4279,7 @@ do_stop() {
   # row would bury the sessions it sits between.
   local env_rotate; env_rotate=$(rotate_env_value)
   if [ -n "${CL_ROTATE:-}" ] && [ -z "$env_rotate" ]; then
-    printf 'claude-session: ignoring CL_ROTATE="%s" (expected 0/1, on/off, no/yes) — using the stored setting\n' "$CL_ROTATE" >&2
+    printf 'claude-session: ignoring CL_ROTATE="%s" (expected 0/1, on/off, no/yes, or a mode: compact-resume, handoff, fresh, resume) — using the stored setting\n' "$CL_ROTATE" >&2
   fi
   # The serial stop divided one budget BETWEEN sessions; this one shares a
   # window between them, so a per-session floor has nothing left to describe.

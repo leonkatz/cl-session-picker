@@ -49,8 +49,18 @@ trap 'rtmux kill-server >/dev/null 2>&1; rm -rf "$FIX"' EXIT
 #   a pointer it follows   assistant tool_use, then a user tool_result holding
 #                          the FILE's text (so the token really does sit in a
 #                          tool_result), then the assistant's reply
-#   /compact               a queue-operation, a compact_boundary, and the
-#                          "<local-command-stdout>Compacted" user record
+#   a finished turn        the metadata Claude writes after one
+#                          (stop_hook_summary, turn_duration, last-prompt, …)
+#   /compact               a queue-operation, a compact_boundary, the
+#                          Compacted stdout record exactly as Claude Code
+#                          writes it (string content, ANSI SGR around the
+#                          word), the SessionStart attachment records, then a
+#                          metadata batch — so "the last record" is never the
+#                          conversation record a check is looking for
+#
+# AGENT_BUSY=1 gives the agent a child process named caffeinate, which is what
+# claude_busy reads as "mid-task": the case where only the transcript can say
+# the session is really at rest.
 #
 # Nothing is passed to it out of band: the token and the handoff path are read
 # from the request files the typed pointers name. AGENT_MODE picks the
@@ -77,6 +87,26 @@ def note(s):
         fh.write(s + "\n")
 def assistant(blocks):
     rec({"type": "assistant", "message": {"role": "assistant", "content": blocks}})
+# Exactly the bytes Claude Code records: ESC[2m … ESC[22m around the word.
+COMPACTED = "<local-command-stdout>\x1b[2mCompacted (ctrl+o to see full summary)\x1b[22m</local-command-stdout>"
+def compacted_output():
+    rec({"type": "user", "message": {"role": "user", "content": COMPACTED}})
+def after_turn():
+    for r in ({"type": "system", "subtype": "stop_hook_summary"},
+              {"type": "system", "subtype": "turn_duration", "durationMs": 1200},
+              {"type": "last-prompt"}, {"type": "file-history-snapshot", "snapshot": {}}):
+        rec(r)
+def after_compact():
+    rec({"type": "attachment", "attachment": {"type": "hook_success", "hookName": "SessionStart:compact"}})
+    rec({"type": "attachment", "attachment": {"type": "hook_additional_context", "hookName": "SessionStart"}})
+    for r in ({"type": "file-history-snapshot", "snapshot": {}}, {"type": "last-prompt"},
+              {"type": "custom-title"}, {"type": "agent-name"}, {"type": "mode"}, {"type": "permission-mode"}):
+        rec(r)
+if os.environ.get("AGENT_BUSY") == "1":
+    import subprocess
+    # argv[0] "caffeinate": what claude_busy looks for among the pane's children.
+    subprocess.Popen(["caffeinate", "6061"], executable="/bin/sleep",
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 def boundary(trigger, pre, post):
     rec({"type": "system", "subtype": "compact_boundary",
          "compactMetadata": {"trigger": trigger, "preTokens": pre, "postTokens": post}})
@@ -134,7 +164,7 @@ try:
                            {"type": "tool_use", "id": "t2", "name": "Bash", "input": {"command": "true"}}])
             else:
                 assistant([{"type": "text", "text": "Workflow done.\n" + tok}])
-            rec({"type": "system", "subtype": "turn_duration", "durationMs": 1200})
+            after_turn()
             if mode == "trailing":
                 # The token is written, but the file keeps growing for a while
                 # (metadata after the turn). /compact must wait until it is still.
@@ -171,32 +201,49 @@ try:
             if mode == "output-only":
                 # A version whose boundary this check would not recognise, but
                 # which still reports the command's output.
-                rec({"type": "user", "message": {"role": "user", "content":
-                     "<local-command-stdout>Compacted (ctrl+o to see full summary)</local-command-stdout>"}})
+                compacted_output()
+                after_compact()
                 continue
             boundary("manual", 968000, 22000)
-            rec({"type": "user", "message": {"role": "user", "content":
-                 "<local-command-stdout>Compacted (ctrl+o to see full summary)</local-command-stdout>"}})
+            compacted_output()
+            if mode == "busy-reader":
+                # Compacted, and straight on to new work: reading a file whose
+                # text mentions SessionStart and compact. The last conversation
+                # record is that tool_result — the session is NOT at rest.
+                assistant([{"type": "tool_use", "id": "t3", "name": "Read", "input": {"file_path": "settings.json"}}])
+                rec({"type": "user", "message": {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t3",
+                     "content": '{"hooks":{"SessionStart":[{"matcher":"compact","command":"x"}]}}'}]}})
+                after_compact()
+                continue
+            after_compact()
 finally:
     termios.tcsetattr(fd, termios.TCSADRAIN, old)
 PYEOF
 
 mk_agent() { # <name> <sid> <mode> [delay] [chars lost from the first arrival]
+  # `exec`, so the pane's root process IS the agent: claude_busy looks at that
+  # process's children for caffeinate. AGENT_BUSY comes from the caller's env.
   printf '{"cwd":"%s"}\n{"customTitle":"%s"}\n' "$FIX/work" "$1" > "$PROJ/$2.jsonl"
   rtmux new-session -d -s "$1" -c "$FIX" \
-    "AGENT_MODE='$3' AGENT_DELAY='${4:-0.5}' AGENT_DROP='${5:-0}' AGENT_TRANSCRIPT='$PROJ/$2.jsonl' AGENT_RECV='$FIX/recv-$1.txt' python3 '$AGENT'" 2>/dev/null \
+    "AGENT_BUSY='${AGENT_BUSY:-0}' AGENT_MODE='$3' AGENT_DELAY='${4:-0.5}' AGENT_DROP='${5:-0}' AGENT_TRANSCRIPT='$PROJ/$2.jsonl' AGENT_RECV='$FIX/recv-$1.txt' exec python3 '$AGENT'" 2>/dev/null \
     || setup_failed "could not start the agent for $1"
 }
-reset() { rtmux kill-server >/dev/null 2>&1; rm -f "$PROJ"/*.jsonl "$FIX"/recv-*.txt "$STATEDIR/state.json" "$STATEDIR/rotation-log.tsv"; }
+reset() { rtmux kill-server >/dev/null 2>&1; pkill -f '^caffeinate 6061$' 2>/dev/null; rm -f "$PROJ"/*.jsonl "$FIX"/recv-*.txt "$STATEDIR/state.json" "$STATEDIR/rotation-log.tsv"; }
 stop_run() { # <out-file> [extra env...] -- [stop flags...]
   local out="$1"; shift
   local -a envs=() flags=()
   while [ $# -gt 0 ] && [ "$1" != "--" ]; do envs+=("$1"); shift; done
   [ "${1:-}" = "--" ] && shift
   flags=("$@")
-  env -i HOME="$HOME" PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" CL_HANDOFF_DIR="$FIX/store" \
+  # In a new session with NO controlling terminal: the kill prompt reads
+  # /dev/tty, so here it cannot be answered and is declined — the unattended
+  # outcome, and never a suite that hangs waiting for a keypress.
+  python3 -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
+    env -i HOME="$HOME" PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" CL_HANDOFF_DIR="$FIX/store" \
     CL_HANDOFF_TIMEOUT=10 CL_HANDOFF_ATTEMPTS=1 CL_HANDOFF_VERIFY=2 CL_COMPACT_TIMEOUT=20 CL_COMPACT_IDLE_POLL=1 \
-    ${envs[@]+"${envs[@]}"} bash "$CL" stop --keep-tabs ${flags[@]+"${flags[@]}"} > "$out" 2>&1
+    ${envs[@]+"${envs[@]}"} bash "$CL" stop --keep-tabs ${flags[@]+"${flags[@]}"} > "$out" 2>&1 < /dev/null
+  echo $? > "$out.rc"
 }
 log_field() { awk -F'\t' -v c="$1" 'NR==1{for(i=1;i<=NF;i++) if($i==c) k=i; next} NR==2{print $k}' "$STATEDIR/rotation-log.tsv"; }
 row_field() { jq -r --arg n "$1" --arg f "$2" '.[] | select(.name == $n) | .[$f] // empty' "$STATEDIR/state.json" 2>/dev/null; }
@@ -243,10 +290,45 @@ check "…why" "ok,ok,ok" "$(log_field reasons)"
 check "…and the preTokens/postTokens from the boundary record" "968000,968000,968000 22000,22000,22000" \
   "$(log_field pre_tokens) $(log_field post_tokens)"
 
-echo "a session at rest after its compaction is stopped without the mid-task prompt"
-# Driven on retire_session itself, because a real busy signal cannot be
-# fixtured: the busy check is stubbed to say "mid-task" and the prompt's answer
-# is "no". Only the idle-proven argument may skip it.
+echo "a busy-looking session at rest after its compaction is stopped with no prompt"
+# End to end, on the transcript tail Claude Code really writes: the Compacted
+# stdout with its escape codes, then attachments and metadata. The agent also
+# LOOKS busy (a caffeinate child), so only the transcript can clear it — and
+# unattended a prompt is declined, which would leave it running.
+reset
+AGENT_BUSY=1 mk_agent Rest sid-rs ok
+sleep 0.5
+# The premise: a caffeinate child of the pane's own process, which is what
+# claude_busy reads as mid-task (the Reader case below shows the prompt fire).
+rest_pane=$(rtmux list-panes -t =Rest -F '#{pane_pid}' 2>/dev/null | head -1)
+check "the premise: the pane's process has a caffeinate child" "1" \
+  "$(pgrep -P "$rest_pane" -f '^caffeinate 6061$' >/dev/null 2>&1 && echo 1 || echo 0)"
+stop_run "$FIX/rest.out"
+rest="$(cat "$FIX/rest.out")"
+contains "the ESC-styled Compacted output confirms the compaction" "$rest" '✓ "Rest" compacted'
+not_contains "no mid-task prompt is shown" "$rest" "looks mid-task"
+check "the session is stopped" "0" "$(rtmux list-sessions 2>/dev/null | grep -c '^Rest')"
+check "…and the stop succeeds" "0" "$(cat "$FIX/rest.out.rc")"
+check "the premise: metadata records follow the Compacted output" "permission-mode" \
+  "$(tail -1 "$PROJ/sid-rs.jsonl" | jq -r .type)"
+
+echo "…but one that went on to read a file mentioning SessionStart and compact is not at rest"
+reset
+AGENT_BUSY=1 mk_agent Reader sid-rd busy-reader
+sleep 0.5
+stop_run "$FIX/reader.out"
+reader="$(cat "$FIX/reader.out")"
+contains "the compaction is still confirmed" "$reader" '✓ "Reader" compacted'
+check "the premise: a tool_result names SessionStart and compact" "1" \
+  "$(grep -c '"tool_result".*SessionStart.*compact' "$PROJ/sid-rd.jsonl" | awk '{print ($1>0)}')"
+contains "the mid-task prompt is shown" "$reader" '"Reader" looks mid-task'
+check "…declined unattended, so the session is left running" "1" "$(rtmux list-sessions 2>/dev/null | grep -c '^Reader')"
+check "…and the stop says so by exiting non-zero" "1" "$(cat "$FIX/reader.out.rc")"
+reset
+
+echo "retire_session skips its prompt only on the idle-proven argument"
+# The plumbing, on retire_session itself: the busy check is stubbed to say
+# "mid-task" and the prompt's answer is "no". Only the argument may skip it.
 LIB="$FIX/retire.sh"
 awk '/^retire_session\(\) \{/{f=1} f{print} f && /^}$/{exit}' "$CL" > "$LIB"
 grep -q '^retire_session()' "$LIB" || setup_failed "could not extract retire_session"

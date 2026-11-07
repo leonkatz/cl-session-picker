@@ -20,6 +20,17 @@ Where phase 1 settles something this page leaves open:
   answer by hand. `/compact` that cannot be typed after the token: resume as-is.
 - **A failed resume at start** leaves any handoff in the store untouched — it is
   neither rotated from nor consumed.
+- **A hand-written handoff is not used in compact-resume mode.** `cl handoff`
+  inside a compact-resume session does not make it rotate: the stop compacts
+  it and files any waiting handoff under `consumed/`. To rotate from one, set
+  the session to `handoff` (`cl mode "Name" handoff`) first. Only a session
+  that falls back to a handoff (no `cl-done` reply in time, or no pane to
+  type into) honours one written by hand.
+- **"At rest" after a compaction** is judged on the last *conversation* record
+  too: Claude Code follows the Compacted output (string content, wrapped in
+  ANSI SGR codes) with attachment and metadata records. Only that output, or
+  the token reply for a session that compacted on its own, counts — never a
+  free-text mention of the hook, which a tool_result can contain.
 
 ## What it is for
 

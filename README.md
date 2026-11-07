@@ -437,7 +437,9 @@ default. `CL_COMPACT_TIMEOUT` (default 600s) bounds the whole phase, for all
 sessions at once. If no token arrives in time the session is asked for a
 handoff instead; if a session compacts on its own before `/compact`, it is not
 compacted twice; if no compaction is confirmed after `/compact`, it resumes
-as-is. Codex sessions always resume as themselves in this version.
+as-is. A handoff written by hand with `cl handoff` is not used by a
+compact-resume session — set it to `handoff` first if you want it to rotate.
+Codex sessions always resume as themselves in this version.
 
 ### Measuring whether it pays
 
