@@ -149,8 +149,8 @@ has "…and says why" "$out" "Claude mechanism"
 # the fixture the n/a cell was unreachable: a revert matrix removed the guard
 # that produces it and nothing failed, because no row ever exercised it.
 out=$(cl --list 2>/dev/null)
-check "a codex row shows n/a in HANDOFF, not a setting" "—" "$(printf '%s' "$out" | awk '$2=="Gamma"{print $6}')"
-check "…and the default does not change that" "—" \
+check "a codex row shows its own mode, not the Claude setting" "resume" "$(printf '%s' "$out" | awk '$2=="Gamma"{print $6}')"
+check "…and the default does not change that" "resume" \
   "$(cl rotate off >/dev/null; cl --list 2>/dev/null | awk '$2=="Gamma"{print $6}')"
 cl rotate on >/dev/null
 # …and it is never asked for a handoff at a stop, whatever the policy says.
@@ -526,8 +526,8 @@ cl mode --default handoff >/dev/null
 check "--default sets the default" "handoff" "$(cell Beta)"
 cl mode Alpha clear >/dev/null
 check "clear un-sets one session" "handoff" "$(cell Alpha)"
-check "a Codex session cannot be given a mode in this version" "1" "$(cl mode --codex Gamma fresh >/dev/null 2>&1; echo $?)"
-check "…and still shows —" "—" "$(cell Gamma)"
+check "a Codex session cannot be given a Claude-only mode" "1" "$(cl mode --codex Gamma handoff >/dev/null 2>&1; echo $?)"
+check "…and still shows its default" "resume" "$(cell Gamma)"
 cl rotate off Alpha >/dev/null
 check "cl rotate off still works, stored as resume" "resume" "$(jq -r '.sessions.claude.Alpha' "$ROT")"
 check "every mode has a cell short enough for the column" "compact handoff fresh resume" \

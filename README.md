@@ -89,7 +89,7 @@ session state. Open a new terminal afterward so the `cl` alias stops resolving.
 - `cl --codex "Name"` — resume a Codex session when the same name exists for both agents
 - `cl stop` — prepare each Claude session by its **restart mode** (by default: compact it), then snapshot live sessions, kill them, and close their iTerm tabs. A session whose compaction or handoff does not land is stopped anyway and comes back by resuming (`--require-handoff` to ask everyone for a handoff and fail closed, `--keep-tabs` to leave tabs open, `--no-handoff` for the fast stop — no compaction, no handoff, clears any pending handoff — `--dry-run` to preview)
 - `cl start` — relaunch every session from the last `stop`, the way its stop recorded: resumed after its compaction with a first prompt, started **fresh** from a **complete** handoff, started as a new session, or resumed as-is (see [Restart modes](#restart-modes) and [Handoff and rotation](docs/handoff.md))
-- `cl mode "Name" <compact-resume|handoff|fresh|resume>` — choose how that session is stopped and started again (`cl mode "Name"` shows it)
+- `cl mode "Name" <compact-resume|handoff|fresh|resume>` — choose how that session is stopped and started again (`cl mode "Name"` shows it; `cl mode --codex "Name" fresh|resume` for a Codex session)
 - `cl handoff` — run inside a session to write its handoff by hand (stamped with that session's id, so a late write is never adopted by its replacement)
 - `cl start --fresh "Name" [--dry-run]` — rotate one **live** session now, without stopping anything else
 - The handoff instruction is replaceable: put your own in `~/.config/claude-session/handoff-prompt.txt`
@@ -306,7 +306,9 @@ it launched with; only a fresh launch upgrades).
     to leave all tabs open.
 - **`cl start`** reads the state file and, for each session, reattaches if it's
   already live, as the agent it was saved under. Rotation is a Claude
-  mechanism, so a Codex row always resumes as itself. For a Claude session the
+  mechanism, so a Codex row resumes as itself — unless its mode is `fresh`, in
+  which case it comes back as a new thread under its name (see
+  [Restart modes](#restart-modes)). For a Claude session the
   **mode its stop recorded** comes first: a compacted session is resumed by id
   with a first prompt (after checking it is still the session that was
   compacted — if not, it resumes plainly and says so, and never rotates from a
@@ -439,7 +441,30 @@ handoff instead; if a session compacts on its own before `/compact`, it is not
 compacted twice; if no compaction is confirmed after `/compact`, it resumes
 as-is. A handoff written by hand with `cl handoff` is not used by a
 compact-resume session — set it to `handoff` first if you want it to rotate.
-Codex sessions always resume as themselves in this version.
+
+**Codex sessions** can be `resume` (their default, whatever the Claude default
+is) or `fresh`; the other two need a Claude session acting on itself, and are
+refused for Codex.
+
+```sh
+cl mode --codex "Review" fresh    # or resume, or clear
+```
+
+A fresh Codex session is stopped like any other. On `cl start`, before
+anything is launched, `cl` makes the new thread through `codex app-server`
+(`thread/start`, then `thread/name/set` to the session's name, and the name
+read back), archives the old thread with `codex archive` — before the
+coordination lane is re-armed, so nothing can elect the old one — and moves
+the saved row onto the new id. Only then does the ordinary path run
+`codex resume <new-id> "<first prompt>"`, so the new thread is owned, stopped
+and listed like any other, and its first turn fires the repo's SessionStart
+hook. The first prompt comes from
+`~/.config/claude-session/codex-fresh-prompt.txt` or a one-line default. If any
+of those steps fails, what was done is undone (the new thread archived, the old
+one unarchived) and the old thread is resumed plainly, with the reason printed.
+The old id is kept in `fresh-history.json`, with the command to bring it back
+(`codex unarchive <id> && codex resume <id>`). `CL_CODEX_RPC_TIMEOUT` (default
+20s) bounds each app-server request.
 
 ### Measuring whether it pays
 
@@ -498,7 +523,7 @@ The `HANDOFF` column in `cl` and `cl --list` shows each session's mode in short
 form (`compact`, `handoff`, `fresh`, `resume`), with `↻` when a complete handoff
 is already waiting — so `resume↻` means someone wrote one by hand for a session
 that will not be asked for one, and the next stop will clear it. Codex rows show
-`—`: they always resume as themselves, so there is nothing there to choose.
+`resume` or `fresh`, the only modes a Codex session can have, and never `↻`.
 
 ### Rotation hint
 

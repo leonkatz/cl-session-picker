@@ -1,9 +1,8 @@
 # Restart modes — design
 
-Status: phase 1 implemented — the four modes for Claude, mode storage and
-migration, and compact-resume end to end. Codex `fresh` (below) is phase 2 and
-not built yet; Codex sessions still always resume. The design review's
-findings are folded in and marked **(R)**.
+Status: phases 1 and 2 implemented — the four modes for Claude, mode storage
+and migration, compact-resume end to end, and Codex `fresh` (below). The design
+review's findings are folded in and marked **(R)**.
 
 Where phase 1 settles something this page leaves open:
 
@@ -185,6 +184,45 @@ resume path:
 To verify while building: that `thread/start` writes a rollout `discover_codex`
 sees, and that the first turn fires SessionStart. The lane's unanswered notes
 are re-offered to the new thread by the watcher's own re-send.
+
+### Where phase 2 settles something
+
+- **Verified against Codex 0.163.0**, in a throwaway `CODEX_HOME`: the method
+  names and params are as above (`thread/start {cwd}` → `result.thread.id`;
+  `thread/name/set {threadId, name}`; `thread/read {threadId}` →
+  `result.thread.name`), after the usual `initialize` / `initialized`. The
+  server must be kept open while a request is in flight — EOF on stdin abandons
+  it — so cl drives it over a FIFO. `thread/start` writes the rollout under
+  `sessions/` and `thread/name/set` appends to `session_index.jsonl`, so
+  `discover_codex` lists the new thread by name before any turn. A
+  `codex resume <id> "<prompt>"` of such a thread fired a project
+  `.codex/hooks.json` SessionStart hook on its first turn, with `session_id` set
+  to the new id and `source: "resume"`; `thread/start` alone fired nothing.
+- **Storage.** `sessions.codex` holds `resume` or `fresh` per session. There is
+  no Codex default in the store: the stored default may be `compact-resume`,
+  which a Codex session cannot do, so a Codex session without a setting is
+  `resume`. `cl mode --codex "Name" fresh|resume|clear`, `cl rotate off
+  --codex "Name"` and `cl rotate clear --codex "Name"` are accepted;
+  `compact-resume`, `handoff`, `rotate on --codex` and `mode --codex --default`
+  are refused with a message.
+- **The stop** records the Codex mode on the row (`--no-handoff` makes it
+  `resume`, as for Claude; `--require-handoff` does not change a Codex row) and
+  says so for a fresh one. Codex rows stay out of the rotation log.
+- **Step 3** sets the row's `mode` to `resume` and keeps the old id as
+  `fresh_from`, under the same lock `ack_state_row` takes. If the launch that
+  follows is refused and the row stays for a later start, that start resumes
+  the new thread instead of making another.
+- **Undoing a failure.** A new thread that will not be used is archived, so two
+  threads never share the name (discovery is newest-wins, and the empty one
+  would win). A failed step 3 unarchives the old thread first. Archive and
+  unarchive are judged by where the rollout ends up, not only by exit code.
+- **Never archive a running thread.** If a local process is resuming the old
+  thread, or cl's launch record says one is, the replacement is refused and the
+  thread resumed plainly.
+- **The bare-tab path** carries the mode and the old id in the tab command
+  (`cl --codex "Name" --restart-mode fresh <old-id>`); the tab does steps 1-4.
+  A tab that runs after the name has moved on to another thread resumes that
+  thread rather than replacing it.
 
 ## Out of scope here
 
