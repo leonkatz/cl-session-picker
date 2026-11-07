@@ -247,11 +247,25 @@ mk_agent() { # <name> <sid> <mode> [delay] [chars lost from the first arrival]
     *) rtmux set-option -t "=$1:" @cl_agent "${MK_STAMP:-claude}" >/dev/null 2>&1
        rtmux set-option -t "=$1:" @cl_sid "$2" >/dev/null 2>&1 ;;
   esac
+  # A stamp alone never lets the stop kill: the session's process must be found
+  # in a pane. A python stand-in is not a claude executable, so it is tied the
+  # way Claude Code ties itself, through its own registry. MK_TIE=0 skips it.
+  [ "${MK_TIE:-1}" = "1" ] && register_pane "$1" "$2"
+  return 0
+}
+register_pane() { # <tmux-session> <sid>: Claude's registry entry for its pane process
+  local pp lst
+  pp=$(rtmux list-panes -t "=$1" -F '#{pane_pid}' 2>/dev/null | head -1)
+  [ -n "$pp" ] || return 0
+  lst=$(TZ=UTC ps -p "$pp" -o lstart= 2>/dev/null | tr -s ' ' | sed 's/^ //; s/ $//')
+  mkdir -p "$HOME/.claude/sessions"
+  jq -n --arg s "$2" --argjson p "$pp" --arg ps "$lst" '{pid: $p, sessionId: $s, procStart: $ps}' \
+    > "$HOME/.claude/sessions/$pp.json"
 }
 # Per run, so a suite running beside this one cannot kill its busy stand-ins
 # (or have them killed): every reset pkills the tag.
 BUSY_TAG=$((7000 + $$ % 2000))
-reset() { rtmux kill-server >/dev/null 2>&1; pkill -f "^caffeinate $BUSY_TAG\$" 2>/dev/null; rm -f "$PROJ"/*.jsonl "$FIX"/recv-*.txt "$STATEDIR/state.json" "$STATEDIR/rotation-log.tsv"; }
+reset() { rtmux kill-server >/dev/null 2>&1; pkill -f "^caffeinate $BUSY_TAG\$" 2>/dev/null; rm -rf "$HOME/.claude/sessions"; rm -f "$PROJ"/*.jsonl "$FIX"/recv-*.txt "$STATEDIR/state.json" "$STATEDIR/rotation-log.tsv"; }
 stop_run() { # <out-file> [extra env...] -- [stop flags...]
   local out="$1"; shift
   local -a envs=() flags=()
@@ -372,13 +386,22 @@ contains "a session stamped for another agent is left alone" "$(cat "$FIX/foreig
 check "…and it is still running" "1" "$(rtmux list-sessions 2>/dev/null | grep -c '^Foreign')"
 reset
 # Unstamped, with nothing tying its process to the session: asked, not killed.
-MK_STAMP=none mk_agent Loose sid-ls ok
+MK_TIE=0 MK_STAMP=none mk_agent Loose sid-ls ok
 sleep 0.5
 stop_run "$FIX/loose.out"
 contains "an unstamped, untied session is asked about" "$(cat "$FIX/loose.out")" \
   '"Loose": cl cannot tie the tmux session at Loose to this session'
 check "…declined unattended, so it is left running" "1" "$(rtmux list-sessions 2>/dev/null | grep -c '^Loose')"
 check "…and the stop exits non-zero" "1" "$(cat "$FIX/loose.out.rc")"
+reset
+# Stamped with this exact SID, but nothing of the session is running in it
+# (Claude exited, its window stayed): a stamp alone does not bind.
+MK_TIE=0 mk_agent Stale sid-st ok
+sleep 0.5
+stop_run "$FIX/stale.out"
+contains "an exact stamp with no live process is asked about" "$(cat "$FIX/stale.out")" \
+  '"Stale": cl cannot tie the tmux session at Stale to this session'
+check "…declined unattended, so it is left running" "1" "$(rtmux list-sessions 2>/dev/null | grep -c '^Stale')"
 reset
 # Unstamped (every session from before stamps were readable), but Claude's own
 # registry places this session's process in the pane: that is the binding.

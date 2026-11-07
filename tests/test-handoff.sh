@@ -268,7 +268,17 @@ TMUX_TMPDIR="$FIX/tmux-tmp"; mkdir -p "$TMUX_TMPDIR"
 rtmux() { TMUX_TMPDIR="$TMUX_TMPDIR" tmux "$@"; }
 # Stamped the way cl stamps its own sessions: the stop kills a tmux session
 # only when it is bound to the session being stopped.
-stamp_claude() { rtmux set-option -t "=$1:" @cl_agent claude >/dev/null 2>&1; rtmux set-option -t "=$1:" @cl_sid "$2" >/dev/null 2>&1; }
+stamp_claude() {
+  local pp lst
+  rtmux set-option -t "=$1:" @cl_agent claude >/dev/null 2>&1; rtmux set-option -t "=$1:" @cl_sid "$2" >/dev/null 2>&1
+  # A stamp alone never binds: the pane's process is tied the way Claude Code
+  # ties itself, through its registry (a stand-in is not a claude executable).
+  pp=$(rtmux list-panes -t "=$1" -F '#{pane_pid}' 2>/dev/null | head -1)
+  [ -n "$pp" ] || return 0
+  lst=$(TZ=UTC ps -p "$pp" -o lstart= 2>/dev/null | tr -s ' ' | sed 's/^ //; s/ $//')
+  mkdir -p "$HOME/.claude/sessions"
+  jq -n --arg s "$2" --argjson p "$pp" --arg ps "$lst" '{pid: $p, sessionId: $s, procStart: $ps}' > "$HOME/.claude/sessions/$pp.json"
+}
 cleanup_rtmux() { rtmux kill-server >/dev/null 2>&1 || true; }
 trap 'cleanup_rtmux; live_down; rm -rf "$FIX"' EXIT
 

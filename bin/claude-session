@@ -2822,16 +2822,17 @@ tmux_owned() {
 # tmux_claude_binding <tmux-session> <sid> <name>: may the stop kill this tmux
 # session as this Claude session? Prints bound, unbound, or foreign:<agent>.
 #
-# The NAME is derived and can collide, so it is not authority. A stamp for
-# another agent is a positive sign that the session is someone else's work:
-# foreign. A claude stamp carrying this exact SID is cl's own proof: bound.
-# Anything weaker is only bound when the process tied to this SID runs in one
-# of the session's panes:
+# The NAME is derived and can collide, so it is not authority. A stamp can
+# only refuse: one for another agent marks someone else's work (foreign).
+# Otherwise the session is bound only when the process tied to this SID runs
+# in one of its panes. That holds even for a stamp with this exact SID, since
+# Claude can exit and leave its stamped window open. These alone never bind:
 #   - no stamp at all. Every session made before stamps were readable on
-#     tmux 3.x has none, so refusing those outright would strand them.
+#     tmux 3.x has none.
 #   - a "-" SID, which proves cl launched something, not which transcript.
 #   - a different SID. A fresh rotation stamps the SID it rotated FROM and the
 #     row moves on, so a mismatch is routine, not proof of a foreigner.
+#   - this exact SID.
 # An unbound session is asked about, never killed silently.
 tmux_claude_binding() {
   local t="$1" sid="$2" name="$3" a s pid p hops=0 panes
@@ -2840,9 +2841,8 @@ tmux_claude_binding() {
   if [ -n "$a" ] && [ "$a" != "claude" ]; then
     printf 'foreign:%s\n' "$a"; return 0
   fi
-  if [ "$a" = "claude" ] && [ -n "$sid" ] && [ "$s" != "-" ] && [ "$s" = "$sid" ]; then
-    printf 'bound\n'; return 0
-  fi
+  # Even an exact stamp is not enough on its own: Claude can exit and leave its
+  # tmux window open, still stamped. The kill needs the live process.
   pid=$(session_pid "$sid" claude "$name")
   if [ -n "$pid" ]; then
     panes=" $(tmux list-panes -s -t "=$t" -F '#{pane_pid}' 2>/dev/null | tr '\n' ' ')"
