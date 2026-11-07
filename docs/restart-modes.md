@@ -211,19 +211,43 @@ are re-offered to the new thread by the watcher's own re-send.
 - **The stop** records the Codex mode on the row (`--no-handoff` makes it
   `resume`, as for Claude; `--require-handoff` does not change a Codex row) and
   says so for a fresh one. Codex rows stay out of the rotation log.
-- **Step 3** sets the row's `mode` to `resume` and keeps the old id as
-  `fresh_from`, under the same lock `ack_state_row` takes. If the launch that
-  follows is refused and the row stays for a later start, that start resumes
-  the new thread instead of making another.
-- **Undoing a failure.** A new thread that will not be used is archived, so two
-  threads never share the name (discovery is newest-wins, and the empty one
-  would win). A failed step 3 unarchives the old thread first. Archive and
-  unarchive are judged by where the rollout ends up, not only by exit code.
+- **A persisted transaction** (from the design review's requirement 2). One
+  file per Codex session name under `~/.config/claude-session/codex-fresh/`
+  records `old_sid`, `new_sid`, a cycle id and the phase, each written before
+  the boundary it names is crossed: `begun` (before thread/start), `created`
+  (the new id, before naming), `named` (name read back, rollout visible),
+  `archived` (old thread hidden; recovery entry written), `rewritten` (row on
+  the new id), `launching`. The file is removed once the launch is verified.
+  A `cl start` that finds one carries that transaction on.
+- **Rollback, explicitly.** Only before `archived`: the new thread (if any) is
+  archived so two threads never share the name, the transaction removed, and
+  the old thread resumed plainly. From `archived` on it only rolls forward — a
+  failed row write launches nothing and leaves the transaction for the next
+  start, which resumes the same new thread. Unarchive is never automatic; it is
+  the printed way back. A crash between thread/start answering and `created`
+  being written leaves an unnamed thread nobody has the id of; unnamed threads
+  are not listed, and the retry starts over from `begun`.
+- **Serialised.** The whole sequence runs under a per-name claim taken before
+  any thread is made; the row is read again inside it. A second `cl start`
+  waits up to `CL_FRESH_CLAIM_WAIT` (10s) and then leaves it to the first. A
+  claim whose holder has died is taken over.
+- **Launch acceptance.** The row stays mode `fresh` with `fresh_pending` = the
+  cycle until the launch is verified as codex on the new id: a tmux session
+  stamped for that id whose pane runs `codex … resume <id>`, or cl's launch
+  record for that name and id. Unverified, the transaction stays at
+  `launching` and the row is kept; the next start (or stop) verifies and
+  settles it, or relaunches the same thread. A session left unstamped by a
+  start killed mid-launch is adopted only when its pane runs exactly the
+  pending new id. Archive is judged by where the rollout ends up, not only by
+  exit code, and an old thread already archived by an interrupted run counts
+  as archived.
 - **Never archive a running thread.** If a local process is resuming the old
   thread, or cl's launch record says one is, the replacement is refused and the
   thread resumed plainly.
 - **The bare-tab path** carries the mode and the old id in the tab command
-  (`cl --codex "Name" --restart-mode fresh <old-id>`); the tab does steps 1-4.
+  (`cl --codex "Name" --restart-mode fresh <old-id>`); the tab does steps 1-4
+  under the claim and does not acknowledge the row (its exec cannot see the
+  agent start); the next `cl start` verifies the launch record and settles it.
   A tab that runs after the name has moved on to another thread resumes that
   thread rather than replacing it. Because `cl start` re-arms the lanes before
   its tabs run, archive-before-rearm does not hold here: until the new thread's
@@ -231,8 +255,8 @@ are re-offered to the new thread by the watcher's own re-send.
 - **`CL_ROTATE`** set to `fresh` or `resume` (or `0`/`off`) applies to a Codex
   session for that stop; a Claude-only mode in it does not change a Codex row.
 - **A refused tmux launch after steps 1-3** keeps the row (now on the new id,
-  mode `resume`), records the old id in `fresh-history.json` and prints its
-  recovery command, as the other failure paths do.
+  still pending) and the transaction, and prints the recovery command; the old
+  id was recorded in `fresh-history.json` at the archive.
 
 ## Out of scope here
 

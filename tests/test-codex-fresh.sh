@@ -10,7 +10,13 @@
 # the ordinary `codex resume <new> "<first prompt>"` (docs/restart-modes.md,
 # "fresh, for Codex").
 #
-# Every failure in the first three steps has to land in the same place: the old
+# The swap is a persisted transaction (one file per name, phase by phase, under
+# a per-name claim): a failure before the archive rolls back to the old thread;
+# from the archive on, a retry — even after the whole cl process group was
+# killed at a boundary — carries the same new thread forward, and the row is
+# settled only once the launch is verified as codex on the new id.
+#
+# Every failure BEFORE the archive has to land in the same place: the old
 # thread resumed plainly, still discoverable under its name, and no row or
 # listing pointing at a thread that is not there. So the simulated codex below
 # can be told to fail each step, and each case checks all three.
@@ -43,7 +49,7 @@ cleanup() {
   [ -f "$FIX/procs" ] && xargs kill < "$FIX/procs" 2>/dev/null
   # The simulated codex's "TUI" sleeps for a duration nothing else uses, so
   # this reaches only its own.
-  pkill -f '^sleep 59.123$' 2>/dev/null
+  pkill -f '^codex resume [0-9a-f-]+ 59\.123$' 2>/dev/null
   rtmux kill-server >/dev/null 2>&1
   rm -rf "$FIX" 2>/dev/null || { sleep 0.5; rm -rf "$FIX" 2>/dev/null; }
   return 0
@@ -78,8 +84,20 @@ mkdir -p "$STATEDIR" "$CODEX_HOME/sessions/2026/01/01" "$HOME/.claude/projects/p
 # FAKE_COLLIDE=1: before answering thread/start, the server sends a REQUEST of
 # its own that happens to carry the same id.
 # Each app-server writes its pid to $FAKE_SERVER_PIDS.
+# FAKE_CRASH_AT=name|read|archive: SIGKILL the whole cl process group (its
+# leader's pid is in $FAKE_CRASH_PGID_FILE) on receiving thread/name/set, on
+# receiving thread/read, or just after moving the old rollout — a crash at
+# that boundary, with nothing left to clean up after itself.
+# FAKE_SLOW_START=<s>: thread/start answers after that long.
 cat > "$FIX/fakecodex.py" <<'PYEOF'
-import json, os, sys, glob, shutil, time
+import json, os, sys, glob, shutil, time, signal
+def crash(at):
+    if os.environ.get("FAKE_CRASH_AT") != at:
+        return
+    log("crash " + at)
+    with open(os.environ["FAKE_CRASH_PGID_FILE"]) as fh:
+        os.killpg(int(fh.read().strip()), signal.SIGKILL)
+    sys.exit(0)
 home = os.environ["CODEX_HOME"]
 calls = os.environ.get("FAKE_CALLS", os.devnull)
 failure = os.environ.get("FAKE_FAIL", "")
@@ -117,6 +135,12 @@ if cmd == "app-server":
             log("app-server notify " + method); continue
         log("app-server " + method)
         mid = msg["id"]
+        if method == "thread/name/set":
+            crash("name")
+        if method == "thread/read":
+            crash("read")
+        if method == "thread/start" and os.environ.get("FAKE_SLOW_START"):
+            time.sleep(float(os.environ["FAKE_SLOW_START"]))
         if method == "initialize":
             reply(mid, {"userAgent": "fake", "codexHome": home})
         elif method == "thread/start":
@@ -128,7 +152,7 @@ if cmd == "app-server":
                 sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": mid, "method": "item/tool/requestUserInput",
                                              "params": {"threadId": "x"}}) + "\n"); sys.stdout.flush()
                 time.sleep(0.5)
-            tid = os.environ.get("FAKE_NEW_ID", "01eeeeee-0000-7000-8000-0000000000ee")
+            tid = os.environ.get("FAKE_NEW_ID") or open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "new_id")).read().strip()
             if failure != "norollout":
                 d = os.path.join(home, "sessions", "2026", "02", "02"); os.makedirs(d, exist_ok=True)
                 with open(os.path.join(d, "rollout-2026-02-02T00-00-00-%s.jsonl" % tid), "w") as fh:
@@ -143,7 +167,13 @@ if cmd == "app-server":
                                      "updated_at": "2026-02-02T00:00:00Z"}, separators=(",", ":")) + "\n")
             reply(mid, {})
         elif method == "thread/read":
-            name = names.get(params["threadId"])
+            # From the index, like Codex's own store: a later app-server must
+            # see a name an earlier one set.
+            name = None
+            for line in open(os.path.join(home, "session_index.jsonl")):
+                rec = json.loads(line)
+                if rec.get("id") == params["threadId"]:
+                    name = rec.get("thread_name")
             if failure == "readback":
                 name = "something else"
             reply(mid, {"thread": {"id": params["threadId"], "name": name}})
@@ -168,10 +198,20 @@ if cmd in ("archive", "unarchive"):
     else:
         dest = os.path.join(home, "sessions", "2026", "01", "01")
     shutil.move(src, os.path.join(dest, os.path.basename(src)))
+    if cmd == "archive" and tid == os.environ.get("FAKE_CRASH_ARCHIVE_ID"):
+        crash("archive")
     sys.exit(0)
 if cmd == "resume":
     log("resume " + " | ".join(args[1:]))
-    os.execvp("sleep", ["sleep", "59.123"])
+    if os.environ.get("FAKE_RESUME_DIES"):
+        sys.exit(1)
+    if os.environ.get("FAKE_RESUME_NOT_CODEX"):
+        # A pane that stays up running something else: a wrapper, an error
+        # screen. Pane lifetime is not an agent.
+        os.execvp("sleep", ["sleep", "59.124"])
+    # Stays up looking like what it stands in for: launch verification looks
+    # for `codex … resume <id>` inside the pane, as the kill path does.
+    os.execv("/bin/sh", ["sh", "-c", 'exec -a "codex resume %s" sleep 59.123' % args[1]])
 log("other " + " ".join(args))
 PYEOF
 printf '#!/bin/sh\nexec python3 "%s" "$@"\n' "$FIX/fakecodex.py" > "$FIX/bin/codex"
@@ -180,9 +220,19 @@ ln -sf "$(command -v jq)" "$FIX/bin/jq"
 # tmux itself, except that FAKE_TMUX_REFUSE makes new-session fail: the one
 # way to reach "steps 1-3 done, then the launch refused".
 REALTMUX="$(command -v tmux)"
+# FAKE_TMUX_CRASH=before|after kills the cl process group just before, or
+# just after, the launch — a crash after the row write, and after the launch.
 cat > "$FIX/bin/tmux" <<TMUXEOF
 #!/bin/sh
 [ -n "\${FAKE_TMUX_REFUSE:-}" ] && [ "\$1" = "new-session" ] && exit 1
+if [ "\$1" = "new-session" ] && [ "\${FAKE_TMUX_CRASH:-}" = "before" ]; then
+  echo "crash before-launch" >> "\$FAKE_CALLS"; kill -9 -- -"\$(cat "\$FAKE_CRASH_PGID_FILE")"; exit 1
+fi
+if [ "\$1" = "new-session" ] && [ "\${FAKE_TMUX_CRASH:-}" = "after" ]; then
+  "$REALTMUX" "\$@"; rc=\$?
+  sleep 0.3
+  echo "crash after-launch" >> "\$FAKE_CALLS"; kill -9 -- -"\$(cat "\$FAKE_CRASH_PGID_FILE")"; exit \$rc
+fi
 exec "$REALTMUX" "\$@"
 TMUXEOF
 chmod +x "$FIX/bin/tmux"
@@ -195,8 +245,13 @@ chmod +x "$FIX/rearm.sh"
 printf '#!/bin/sh\nfor a in "$@"; do printf "%%s\\n" "$a"; done >> "%s"\nexec sleep 60\n' "$FIX/argv.claude" > "$FIX/bin/claude"
 chmod +x "$FIX/bin/claude"
 
-OLD=01aaaaaa-0000-7000-8000-0000000000aa
-NEW=01eeeeee-0000-7000-8000-0000000000ee
+# Ids unique to this run. The liveness checks are machine-wide (`codex …
+# resume <id>` anywhere on the box), and other suites run stand-ins with fixed
+# ids — a shared id would make their processes look like this thread running.
+RUN_TAG=$(printf '%06x%06x' "$(( $$ & 0xffffff ))" "$(( RANDOM * 32768 + RANDOM ))" | cut -c1-12)
+OLD=01aaaaaa-0000-7000-8000-$RUN_TAG
+NEW=01eeeeee-0000-7000-8000-$RUN_TAG
+printf '%s\n' "$NEW" > "$FIX/new_id"
 mk_thread() { # <sid> <name>
   printf '{"id":"%s","thread_name":"%s","updated_at":"2026-01-01T00:00:00Z"}\n' "$1" "$2" >> "$CODEX_HOME/session_index.jsonl"
   printf '{"type":"session_meta","payload":{"id":"%s","cwd":"%s"}}\n' "$1" "$FIX/work" \
@@ -204,7 +259,10 @@ mk_thread() { # <sid> <name>
 }
 reset() {
   rtmux kill-server >/dev/null 2>&1
-  rm -rf "$CODEX_HOME" "$STATEDIR"/state*.json* "$STATEDIR/history" "$STATEDIR/fresh-history.json" "$FIX/calls" "$FIX/argv.claude"
+  pkill -f '^codex resume [0-9a-f-]+ 59\.123$' 2>/dev/null
+  pkill -f '^sleep 59\.124$' 2>/dev/null
+  rm -rf "$CODEX_HOME" "$STATEDIR"/state*.json* "$STATEDIR/history" "$STATEDIR/fresh-history.json" "$FIX/calls" "$FIX/argv.claude" \
+         "$STATEDIR/codex-fresh" "$STATEDIR/pids"
   mkdir -p "$CODEX_HOME/sessions/2026/01/01"
   mk_thread "$OLD" Gamma
 }
@@ -334,12 +392,13 @@ run -- start >/dev/null; sleep 0.3
 contains "the configured prompt is passed" "$(cat "$FIX/calls")" "resume $NEW | New thread. Read your board."
 rm -f "$STATEDIR/codex-fresh-prompt.txt"
 
-echo "after a fresh start the row is resume, so a re-run resumes NEW and makes no third thread"
+echo "a launch refused after the swap keeps it pending, and a re-run resumes NEW with no third thread"
 reset; write_row fresh
 out=$(run FAKE_TMUX_REFUSE=1 -- start); sleep 0.3
 contains "the refused launch is reported" "$out" "could not prepare Gamma"
 check "the kept row names the new thread" "$NEW" "$(jq -r '.[0].sid' "$STATE" 2>/dev/null)"
-check "…as resume" "resume" "$(jq -r '.[0].mode' "$STATE" 2>/dev/null)"
+check "…still pending, not finished" "fresh" "$(jq -r '.[0].mode' "$STATE" 2>/dev/null)"
+check "…with its cycle named" "1" "$(jq -r '.[0].fresh_pending // empty' "$STATE" 2>/dev/null | grep -c .)"
 check "…keeping the old id as fresh_from" "$OLD" "$(jq -r '.[0].fresh_from' "$STATE" 2>/dev/null)"
 contains "the old id's way back is printed" "$out" "codex unarchive $OLD"
 check "…and recorded" "codex" \
@@ -349,8 +408,7 @@ out=$(run -- start); sleep 0.3
 check "the re-run makes no thread" "0" "$(line_of 'app-server')"
 check "…archives nothing" "0" "$(line_of '^archive')"
 check "…leaves the new thread listed" "active" "$(active "$NEW")"
-contains "…and resumes the new thread" "$(cat "$FIX/calls")" "resume $NEW"
-not_contains "…plainly" "$(cat "$FIX/calls")" "resume $NEW |"
+contains "…and resumes the new thread, its first turn still to come" "$(cat "$FIX/calls")" "resume $NEW | cl started you"
 
 echo "an app-server that ignores TERM and outlives EOF cannot hang the start"
 reset; write_row fresh; rm -f "$FIX/server.pids"
@@ -447,16 +505,20 @@ reset; write_row fresh
 : > "$STATE.acklock"
 out=$(run -- start); sleep 0.3
 rm -f "$STATE.acklock"
-plain_fallback "row"
+# After the archive the transaction only rolls forward: nothing is launched
+# now, nothing is unarchived, and the next start finishes the same thread.
 contains "row: it names the failure" "$out" "could not move its restart row"
-check "row: the old thread was unarchived again" "1" "$([ "$(line_of "unarchive $OLD")" -gt "$(line_of "archive $OLD")" ] && echo 1 || echo 0)"
-check "row: the new thread is discarded" "archived" "$(active "$NEW")"
-
-echo "step 3 failure, and the old thread cannot come back either"
-reset; write_row fresh; : > "$STATE.acklock"
-out=$(run FAKE_UNARCHIVE_FAIL="$OLD" -- start); sleep 0.3
-rm -f "$STATE.acklock"
-contains "it gives the command to recover it" "$out" "run: codex unarchive $OLD"
+not_contains "row: nothing is launched" "$(cat "$FIX/calls")" "resume "
+check "row: nothing is unarchived" "0" "$(line_of 'unarchive')"
+check "row: the old thread stays archived" "archived" "$(active "$OLD")"
+check "row: the new thread stays listed" "active" "$(active "$NEW")"
+check "row: the way back is recorded" "$OLD" "$(jq -r '.[0].old_sid' "$STATEDIR/fresh-history.json" 2>/dev/null)"
+check "row: the row is kept" "1" "$(jq length "$STATE" 2>/dev/null)"
+out=$(run -- start); sleep 0.3
+contains "row: the re-run carries the replacement on" "$out" "carrying on its pending replacement"
+check "row: …making no second thread" "1" "$(grep -c 'app-server thread/start' "$FIX/calls")"
+contains "row: …and runs the new thread" "$(cat "$FIX/calls")" "resume $NEW | cl started you"
+check "row: …and the replacement is finished" "0" "$(ls "$STATEDIR/codex-fresh" 2>/dev/null | grep -c '\.json$')"
 
 echo "a thread something is still running is never archived"
 reset; write_row fresh
@@ -480,20 +542,173 @@ check "…and keeps the row on the old id" "$OLD" "$(jq -r '.[0].sid' "$STATE")"
 tab() { ( cd "$FIX" && env -i HOME="$HOME" CODEX_HOME="$CODEX_HOME" PATH="$NOTMUXPATH:/usr/bin:/bin" \
             FAKE_CALLS="$FIX/calls" CL_CODEX_RPC_TIMEOUT=2 "$@" ) >"$FIX/tab.out" 2>&1 & }
 tab bash "$CL" --codex Gamma --restart-mode fresh "$OLD"; tp=$!; sleep 3; kill "$tp" 2>/dev/null; wait "$tp" 2>/dev/null
-pkill -f "^sleep 59.123$" 2>/dev/null
 contains "the tab resumes the new thread with its first prompt" "$(cat "$FIX/calls")" "resume $NEW | cl started you"
 check "…having archived the old one" "archived" "$(active "$OLD")"
-check "…and acknowledged its row (moved, then consumed by the launch)" "0" "$([ -f "$STATE" ] && jq length "$STATE" || echo 0)"
+check "…and its row is NOT consumed: exec cannot see the agent start" "$NEW" "$(jq -r '.[0].sid' "$STATE" 2>/dev/null)"
+check "…so the replacement is still pending" "launching" "$(jq -r '.phase' "$STATEDIR"/codex-fresh/*.json 2>/dev/null)"
+out=$( ( cd "$FIX" && env -i HOME="$HOME" CODEX_HOME="$CODEX_HOME" PATH="$NOTMUXPATH:/usr/bin:/bin" \
+           FAKE_CALLS="$FIX/calls" CL_COORD_REARM="$FIX/rearm.sh" bash "$CL" start 2>&1 ) )
+contains "the next start verifies it and says so" "$out" "Gamma is running on its new Codex thread $NEW"
+check "…finishing the replacement" "0" "$(ls "$STATEDIR/codex-fresh" 2>/dev/null | grep -c '\.json$')"
+check "…and consuming the row" "0" "$([ -f "$STATE" ] && jq length "$STATE" || echo 0)"
+pkill -f '^codex resume [0-9a-f-]+ 59\.123$' 2>/dev/null
 echo "bare tab: a tab that runs after the name has moved on resumes, never replaces"
 rm -f "$FIX/calls"
 tab bash "$CL" --codex Gamma --restart-mode fresh "$OLD"; tp=$!; sleep 2; kill "$tp" 2>/dev/null; wait "$tp" 2>/dev/null
-pkill -f "^sleep 59.123$" 2>/dev/null
+pkill -f '^codex resume [0-9a-f-]+ 59\.123$' 2>/dev/null
 contains "it says so" "$(cat "$FIX/tab.out")" "no longer names thread $OLD"
 check "no second thread is made" "0" "$(line_of 'app-server')"
 contains "…and the current thread is resumed as it is" "$(cat "$FIX/calls")" "resume $NEW"
 not_contains "…without a first prompt" "$(cat "$FIX/calls")" "resume $NEW |"
 check "a Codex tab refuses a Claude-only mode" "1" \
   "$( ( cd "$FIX" && env -i HOME="$HOME" CODEX_HOME="$CODEX_HOME" PATH="$NOTMUXPATH:/usr/bin:/bin" bash "$CL" --codex Gamma --restart-mode compact-resume b-1 >/dev/null 2>&1 ); echo $?)"
+
+# ── crashes at each boundary, then a retry ──────────────────────────────────
+# Each case kills the whole cl process group at one boundary (nothing gets to
+# clean up), then runs an ordinary `cl start`. The retry must carry on the SAME
+# replacement: one thread made in total, the new one run, never a plain resume
+# of an archived old thread.
+crash_start() { # <VAR=value...>: a start in its own process group, killed by the fixture
+  rm -f "$FIX/pgid"
+  set -m
+  ( cd "$FIX" && exec env -i HOME="$HOME" CODEX_HOME="$CODEX_HOME" PATH="$FIX/bin:/usr/bin:/bin" TMUX_TMPDIR="$TMUX_TMPDIR" \
+      FAKE_CALLS="$FIX/calls" FAKE_CRASH_PGID_FILE="$FIX/pgid" CL_COORD_REARM="$FIX/rearm.sh" CL_HANDOFF_BUDGET=1 \
+      CL_CODEX_RPC_TIMEOUT=5 "$@" bash "$CL" start ) >"$FIX/crash.out" 2>&1 &
+  local cp=$!
+  set +m
+  disown "$cp" 2>/dev/null || true
+  echo "$cp" > "$FIX/pgid"
+  local w=0; while kill -0 "$cp" 2>/dev/null && [ "$w" -lt 150 ]; do sleep 0.1; w=$((w+1)); done
+  kill -9 -- -"$cp" 2>/dev/null
+  sleep 0.3
+}
+txn_phase() { jq -r '.phase // empty' "$STATEDIR"/codex-fresh/*.json 2>/dev/null; }
+retry_finishes() { # <label>
+  rm -f "$FIX/calls.before"; cp "$FIX/calls" "$FIX/calls.before" 2>/dev/null
+  out=$(run -- start); sleep 0.3
+  check "$1: one thread made in total" "1" "$(grep -c 'app-server thread/start' "$FIX/calls")"
+  contains "$1: the retry runs the new thread" "$(cat "$FIX/calls")" "resume $NEW | cl started you"
+  not_contains "$1: …never the old one" "$(cat "$FIX/calls")" "resume $OLD"
+  check "$1: the old thread is archived" "archived" "$(active "$OLD")"
+  check "$1: the name discovers the new thread" "$NEW" "$(disc_sid)"
+  check "$1: the replacement is finished" "" "$(txn_phase)"
+  check "$1: the way back is recorded once" "1" "$(jq --arg s "$OLD" '[.[] | select(.old_sid==$s)] | length' "$STATEDIR/fresh-history.json" 2>/dev/null)"
+}
+echo "crash after create (at the name step), then a retry"
+reset; write_row fresh
+crash_start FAKE_CRASH_AT=name
+contains "fixture: it crashed there" "$(cat "$FIX/calls")" "crash name"
+check "the new id was written down before the crash" "$NEW" "$(jq -r '.new_sid' "$STATEDIR"/codex-fresh/*.json 2>/dev/null)"
+check "…at phase created" "created" "$(txn_phase)"
+check "…with the old thread untouched" "active" "$(active "$OLD")"
+retry_finishes "after create"
+
+echo "crash after name (at the read-back), then a retry"
+reset; write_row fresh
+crash_start FAKE_CRASH_AT=read
+contains "fixture: it crashed there" "$(cat "$FIX/calls")" "crash read"
+check "the replacement is pending at created" "created" "$(txn_phase)"
+retry_finishes "after name"
+
+echo "crash after archive, then a retry"
+reset; write_row fresh
+crash_start FAKE_CRASH_AT=archive FAKE_CRASH_ARCHIVE_ID="$OLD"
+contains "fixture: it crashed there" "$(cat "$FIX/calls")" "crash archive"
+check "the old thread is archived" "archived" "$(active "$OLD")"
+check "the replacement is pending, its new id known" "$NEW" "$(jq -r '.new_sid' "$STATEDIR"/codex-fresh/*.json 2>/dev/null)"
+check "…and the row still names the old thread" "$OLD" "$(jq -r '.[0].sid' "$STATE")"
+retry_finishes "after archive"
+
+echo "crash after the row write (before launch), then a retry"
+reset; write_row fresh
+crash_start FAKE_TMUX_CRASH=before
+contains "fixture: it crashed there" "$(cat "$FIX/calls")" "crash before-launch"
+check "the row names the new thread" "$NEW" "$(jq -r '.[0].sid' "$STATE")"
+check "…still pending" "fresh" "$(jq -r '.[0].mode' "$STATE")"
+check "the replacement is at rewritten" "rewritten" "$(txn_phase)"
+retry_finishes "after row write"
+
+echo "crash after launch (before it was verified), then a retry"
+reset; write_row fresh
+crash_start FAKE_TMUX_CRASH=after
+contains "fixture: it crashed there" "$(cat "$FIX/calls")" "crash after-launch"
+check "the row is not consumed" "$NEW" "$(jq -r '.[0].sid' "$STATE" 2>/dev/null)"
+out=$(run -- start); sleep 0.3
+contains "the retry adopts the unstamped session its start launched" "$out" "adopting the tmux session"
+contains "the retry verifies the running thread" "$out" "Gamma is running on its new Codex thread $NEW"
+check "…launching nothing again" "1" "$(grep -c "resume $NEW" "$FIX/calls")"
+check "…making no second thread" "1" "$(grep -c 'app-server thread/start' "$FIX/calls")"
+check "…and finishing the replacement" "" "$(txn_phase)"
+check "…and consuming the row" "0" "$([ -f "$STATE" ] && jq length "$STATE" || echo 0)"
+
+echo "a launch that does not come up as codex on the new id is not settled"
+reset; write_row fresh
+out=$(run FAKE_RESUME_DIES=1 CL_RESUME_CHECK=1 -- start); sleep 0.3
+contains "it says it could not confirm" "$out" "could not confirm codex is running on its new thread"
+check "the row stays on the new thread" "$NEW" "$(jq -r '.[0].sid' "$STATE" 2>/dev/null)"
+check "…still pending" "fresh" "$(jq -r '.[0].mode' "$STATE" 2>/dev/null)"
+check "the replacement stays, at launching" "launching" "$(txn_phase)"
+rtmux kill-server >/dev/null 2>&1
+out=$(run -- start); sleep 0.3
+check "the retry makes no second thread" "1" "$(grep -c 'app-server thread/start' "$FIX/calls")"
+check "…and finishes it this time" "" "$(txn_phase)"
+
+echo "a pane that stays up without codex on the new id is not settled either"
+reset; write_row fresh
+out=$(run FAKE_RESUME_NOT_CODEX=1 CL_RESUME_CHECK=1 -- start); sleep 0.3
+check "fixture: the pane is up" "1" "$(rtmux list-sessions 2>/dev/null | grep -c '^codex_Gamma')"
+contains "it is not taken for the agent" "$out" "could not confirm codex is running on its new thread"
+check "the replacement stays pending" "launching" "$(txn_phase)"
+rtmux kill-server >/dev/null 2>&1
+
+# ── two starts at once ──────────────────────────────────────────────────────
+echo "a second cl start while one is replacing the thread does not run its own swap"
+reset; write_row fresh
+( run FAKE_SLOW_START=2 CL_CODEX_RPC_TIMEOUT=6 -- start > "$FIX/first.out" ) &
+first=$!
+w=0; until grep -q 'app-server thread/start' "$FIX/calls" 2>/dev/null || [ "$w" -ge 100 ]; do sleep 0.1; w=$((w+1)); done
+second=$(run CL_FRESH_CLAIM_WAIT=1 -- start)
+wait "$first" 2>/dev/null; sleep 0.3
+contains "the second start leaves it to the first" "$second" "another cl start"
+check "only one thread is made" "1" "$(grep -c 'app-server thread/start' "$FIX/calls")"
+check "only one archive of the old thread" "1" "$(grep -c "^archive $OLD" "$FIX/calls")"
+contains "the first start finished the replacement" "$(cat "$FIX/first.out")" "as a new Codex thread $NEW"
+check "the name discovers the new thread" "$NEW" "$(disc_sid)"
+
+echo "a second start that waits out the first finds the row already handled"
+reset; write_row fresh
+( run FAKE_SLOW_START=1 CL_CODEX_RPC_TIMEOUT=6 -- start > "$FIX/first.out" ) &
+first=$!
+w=0; until grep -q 'app-server thread/start' "$FIX/calls" 2>/dev/null || [ "$w" -ge 100 ]; do sleep 0.1; w=$((w+1)); done
+second=$(run CL_FRESH_CLAIM_WAIT=20 -- start)
+wait "$first" 2>/dev/null; sleep 0.3
+check "only one thread is made" "1" "$(grep -c 'app-server thread/start' "$FIX/calls")"
+contains "the second sees it was done meanwhile" "$second" "was started by another cl start meanwhile"
+check "the name discovers the new thread" "$NEW" "$(disc_sid)"
+
+echo "a claim left by a cl that died is taken over"
+reset; write_row fresh
+mkdir -p "$STATEDIR/codex-fresh"
+key=$(printf 'codex\037%s' Gamma | shasum -a 256 | cut -c1-40)
+ln -s "999999:not-a-real-start-token" "$STATEDIR/codex-fresh/$key.json.lock"
+out=$(run -- start); sleep 0.3
+contains "it says so" "$out" "taking over the replacement left by a cl that is gone"
+contains "…and carries out the swap" "$out" "as a new Codex thread $NEW"
+
+# ── names shared, and other threads in the repo ─────────────────────────────
+echo "other threads — one with the same name, one in the same repo — are left alone"
+reset
+OLDER=01bbbbbb-0000-7000-8000-$RUN_TAG; DELTA=01cccccc-0000-7000-8000-$RUN_TAG
+mk_thread "$OLDER" Gamma; touch -t 202001010000 "$CODEX_HOME/sessions/2026/01/01/rollout-2026-01-01T00-00-00-$OLDER.jsonl"
+mk_thread "$DELTA" Delta
+write_row fresh
+out=$(run -- start); sleep 0.3
+check "the row's thread is the one archived" "archived" "$(active "$OLD")"
+check "the older same-named thread is untouched" "active" "$(active "$OLDER")"
+check "the other thread in the repo is untouched" "active" "$(active "$DELTA")"
+check "only the row's thread was archived" "1" "$(grep -c '^archive ' "$FIX/calls")"
+check "the name discovers the new thread" "$NEW" "$(disc_sid)"
+check "Delta is still discovered as itself" "$DELTA" "$(run -- --discover | awk -F'\t' '$1=="Delta"{print $2}')"
 
 # ── phase-1 Claude behaviour beside it ──────────────────────────────────────
 echo "a Claude row in the same start is untouched by any of this"

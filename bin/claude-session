@@ -1898,16 +1898,17 @@ build_compact_resume_prompt() {
 #
 #   1. thread/start → the new id; thread/name/set to the session's name; the
 #      name read back with thread/read, so a set that did not take is caught
-#   2. `codex archive <old>` BEFORE anything re-arms, so nothing can elect the
-#      old thread again (discovery reads sessions/ only, and archive moves the
-#      rollout out of it)
+#   2. `codex archive <old>` (on the tmux path, before anything re-arms), so
+#      nothing can elect the old thread again (discovery reads sessions/ only,
+#      and archive moves the rollout out of it)
 #   3. the restart row moved onto the new id
-#   4. the caller runs `codex resume <new> "<first prompt>"`; the first turn
-#      fires the repo's SessionStart hook, which elects the new thread
+#   4. the caller runs `codex resume <new> "<first prompt>"`, and the row is
+#      settled only once that launch is verified as codex on the new id; the
+#      first turn fires the repo's SessionStart hook, which elects it
 #
-# A failure anywhere in 1-3 undoes what was done — the new thread archived,
-# the old one unarchived — and the caller resumes the old thread plainly. The
-# row never names a thread that is not there.
+# Every step is a phase of a persisted transaction — see THE FRESH
+# TRANSACTION below for the phases, the claim that serialises them, and the
+# one point (the archive) after which a retry only rolls forward.
 
 # The first message of a fresh Codex thread. It exists because a turn is what
 # fires SessionStart; the text itself is yours to change, in a file.
@@ -2021,23 +2022,117 @@ _codex_unarchive() {
   _codex_rollout_active "$1"
 }
 
-# _codex_row_rewrite <name> <old-id> <new-id>: move the restart row onto the new
-# thread (spec step 3), under the row lock ack_state_row takes. The mode becomes
-# resume and the old id is kept as fresh_from: if this launch is refused and
-# the row stays for a later start, that start resumes the new thread rather
-# than making yet another one. No row naming the old id is not a failure —
-# nothing then points at a thread about to be gone.
+# ── THE FRESH TRANSACTION ───────────────────────────────────────────────────
+#
+# Swapping a Codex session onto a new thread crosses boundaries that cannot be
+# undone by a process that has died: a thread made, a thread named, the old one
+# archived, the row moved. So each boundary is written down BEFORE it is
+# crossed, in a transaction file per agent and name, and a later `cl start`
+# that finds one carries THAT transaction on rather than starting another:
+#
+#   begun      old_sid recorded; no new thread yet
+#   created    thread/start answered: new_sid recorded before anything else
+#   named      the name set and read back, the new rollout visible
+#   archived   the old thread archived; the recovery entry written
+#   rewritten  the restart row moved onto new_sid (mode still fresh, with
+#              fresh_pending = the cycle, so nothing reads it as finished)
+#   launching  `codex resume <new>` handed to tmux or exec
+#   (finished) the launch verified as codex on new_sid: the file is removed and
+#              the row becomes mode resume
+#
+# Rollback exists only BEFORE `archived`: the old thread is still listed, so
+# the new one is archived (discarded), the file removed, and the old thread
+# resumed plainly. From `archived` on the transaction only rolls FORWARD — the
+# new thread was named and checked before the old one was hidden, so a retry
+# resumes it, and never plain-resumes an archived old thread. Unarchiving is
+# never automatic; it is the printed way back (`codex unarchive <old>`).
+#
+# A crash between thread/start answering and `created` being written leaves an
+# unnamed thread nobody knows the id of. It is invisible to discovery (only
+# named threads are listed), so the retry, which starts over from `begun`,
+# cannot be confused by it.
+#
+# The whole sequence runs under a per-name claim (codex_txn_claim), taken
+# before any thread is made and released once the row is settled, so a second
+# `cl start` waits for it or refuses — it never runs a swap of its own.
+CL_FRESH_DIR="$HOME/.config/claude-session/codex-fresh"
+CL_FRESH_CLAIM_WAIT="${CL_FRESH_CLAIM_WAIT:-10}"
+_txn_path() {
+  local key
+  key=$(printf 'codex\037%s' "$1" | shasum -a 256 2>/dev/null | cut -c1-40)
+  [ -n "$key" ] || key=$(printf 'codex\037%s' "$1" | cksum | tr -d ' ')
+  printf '%s/%s.json' "$CL_FRESH_DIR" "$key"
+}
+# _txn_get <name> <field>: one field of the pending transaction, or nothing.
+_txn_get() { jq -r --arg f "$2" '.[$f] // empty' "$(_txn_path "$1")" 2>/dev/null; }
+# _txn_put <name> <json-object>: merge fields in, atomically, and read the
+# phase back — the proof is the file, not the exit codes on the way to it.
+_txn_put() {
+  local f cur tmp
+  f=$(_txn_path "$1")
+  mkdir -p "$CL_FRESH_DIR" 2>/dev/null || return 1
+  cur=$(jq -c '.' "$f" 2>/dev/null) || cur='{}'
+  [ -n "$cur" ] || cur='{}'
+  tmp="$f.tmp.$$"
+  jq -n --argjson cur "$cur" --argjson add "$2" '$cur + $add' > "$tmp" 2>/dev/null && [ -s "$tmp" ] \
+    && mv "$tmp" "$f" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+  [ "$(_txn_get "$1" phase)" = "$(printf '%s' "$2" | jq -r '.phase // empty')" ] \
+    || [ -z "$(printf '%s' "$2" | jq -r '.phase // empty')" ]
+}
+_txn_drop() { rm -f "$(_txn_path "$1")" 2>/dev/null; }
+
+# codex_txn_claim <name>: the per-name claim, waiting up to CL_FRESH_CLAIM_WAIT
+# seconds for a live holder. A holder that has died (its start token no longer
+# matches) is the crash this whole design is for, so its claim is taken over —
+# removed only while it still names that dead holder, so a claim another
+# waiter has just made is not the one deleted. Sets _TXN_LOCK/_TXN_MINE.
+codex_txn_claim() {
+  local name="$1" lock mine holder hpid hstart ticks=0
+  mkdir -p "$CL_FRESH_DIR" 2>/dev/null || { printf '⚠ "%s": cannot create %s — not replacing its thread\n' "$name" "$CL_FRESH_DIR" >&2; return 1; }
+  lock="$(_txn_path "$name").lock"; mine=$(claim_token)
+  while ! ln -s "$mine" "$lock" 2>/dev/null; do
+    holder=$(readlink "$lock" 2>/dev/null)
+    if [ "$holder" = "$mine" ]; then break; fi
+    if [ -n "$holder" ]; then
+      hpid=${holder%%:*}; hstart=${holder#*:}
+      if [ "$(start_token "$hpid")" != "$hstart" ]; then
+        [ "$(readlink "$lock" 2>/dev/null)" = "$holder" ] && rm -f "$lock" 2>/dev/null
+        printf 'ℹ "%s": taking over the replacement left by a cl that is gone (pid %s)\n' "$name" "$hpid" >&2
+        continue
+      fi
+    fi
+    ticks=$((ticks+1))
+    if [ "$ticks" -gt $(( CL_FRESH_CLAIM_WAIT * 10 )) ]; then
+      printf '⏳ "%s": another cl start (pid %s) is replacing its thread — leaving it to that one\n' "$name" "${hpid:-?}" >&2
+      return 1
+    fi
+    sleep 0.1
+  done
+  _TXN_LOCK="$lock"; _TXN_MINE="$mine"
+  return 0
+}
+codex_txn_release() {
+  [ -n "${_TXN_LOCK:-}" ] && [ "$(readlink "$_TXN_LOCK" 2>/dev/null)" = "$_TXN_MINE" ] && rm -f "$_TXN_LOCK" 2>/dev/null
+  _TXN_LOCK=""; return 0
+}
+codex_txn_pending() { [ -n "$(_txn_get "$1" phase)" ]; }
+
+# _codex_row_rewrite <name> <old-id> <new-id> <cycle>: move the restart row
+# onto the new thread, under the row lock ack_state_row takes. Idempotent: a
+# row already on the new id is rewritten the same way. The mode stays fresh,
+# with fresh_pending naming the cycle — the row is not finished until the
+# launch is verified (codex_fresh_finish). No row naming either id is not a
+# failure: nothing then points at the thread about to be gone.
 _codex_row_rewrite() {
-  local name="$1" old="$2" new="$3" tmp rc=0
+  local name="$1" old="$2" new="$3" cycle="$4" tmp rc=0
   [ -f "$STATE" ] || return 0
-  [ "$(jq --arg n "$name" --arg s "$old" '[.[] | select((.agent // "claude") == "codex" and .name == $n and .sid == $s)] | length' "$STATE" 2>/dev/null)" = "0" ] && return 0
+  [ "$(jq --arg n "$name" --arg s "$old" --arg t "$new" '[.[] | select((.agent // "claude") == "codex" and .name == $n and (.sid == $s or .sid == $t))] | length' "$STATE" 2>/dev/null)" = "0" ] && return 0
   _state_row_lock "$name" || return 1
   tmp="$STATE.fresh.$$"
-  if jq --arg n "$name" --arg s "$old" --arg new "$new" \
-       'map(if (.agent // "claude") == "codex" and .name == $n and .sid == $s
-            then .sid = $new | .mode = "resume" | .fresh_from = $s else . end)' \
+  if jq --arg n "$name" --arg s "$old" --arg new "$new" --arg c "$cycle" \
+       'map(if (.agent // "claude") == "codex" and .name == $n and (.sid == $s or .sid == $new)
+            then .sid = $new | .mode = "fresh" | .fresh_from = $s | .fresh_pending = $c else . end)' \
        "$STATE" > "$tmp" 2>/dev/null && [ -s "$tmp" ] && mv "$tmp" "$STATE" 2>/dev/null; then
-    # Read back: the proof is the file, not the exit codes on the way to it.
     [ "$(jq --arg n "$name" --arg s "$new" '[.[] | select((.agent // "claude") == "codex" and .name == $n and .sid == $s)] | length' "$STATE" 2>/dev/null)" = "1" ] || rc=1
   else
     rc=1
@@ -2047,82 +2142,231 @@ _codex_row_rewrite() {
   return "$rc"
 }
 
-# codex_fresh_thread <name> <old-id> <cwd> -> the new thread id on stdout.
-# Steps 1-3 above. Non-zero when the caller must resume <old-id> plainly; by
-# then everything this did has been undone, or it says exactly what was not.
-codex_fresh_thread() {
-  local name="$1" old="$2" cwd="$3" res new got why=""
-  command -v jq >/dev/null 2>&1 || { printf '⚠ "%s": a fresh Codex thread needs jq — resuming it plainly\n' "$name" >&2; return 1; }
-  valid_codex_sid "$old" || { printf '⚠ "%s": "%s" is not a Codex thread id — resuming it plainly\n' "$name" "$old" >&2; return 1; }
-  # Never archive a thread something is still working. `cl start` checks
-  # liveness before it gets here; the tab path runs later, so it looks again.
-  if [ -n "$(session_pid "$old" codex)" ] || [ -n "$(registered_pid "$name" codex "$old")" ]; then
-    printf '⚠ "%s": its thread is still running here — not replacing it; resuming it plainly\n' "$name" >&2
-    return 1
-  fi
-  _codex_rollout_active "$old" || {
-    printf '⚠ "%s": thread %s is not in %s (archived or moved?) — not replacing it\n' "$name" "$old" "$CODEX_SESSIONS" >&2
-    return 1
-  }
-  # ── 1. a new thread, named, and the name read back ──
-  # An interrupt while the app-server is open would leave its clrpc.* FIFO
-  # directory behind, and the server itself. Trapped for exactly that window
-  # (open to close, the directory's whole life), then the previous traps are
-  # put back. Steps 2-3 make no temporary files; a signal there is the same as
-  # one at any other moment of a start.
-  local _prev_traps; _prev_traps=$(trap -p INT TERM HUP)
+# _codex_rollback <name> <old> [new]: before `archived` only. The old thread is
+# still listed; the new one (if any) is archived so the two never share the
+# name; the transaction is removed. The caller resumes <old> plainly.
+_codex_rollback() {
+  [ -n "${3:-}" ] && _codex_fresh_discard "$1" "$3"
+  _txn_drop "$1"
+}
+
+# _codex_name_new <name> <new> <cwd>: name the new thread and read the name
+# back, through its own app-server. Used when a transaction resumes at
+# `created`; the first pass names it on the connection that made it.
+_codex_name_new() {
+  local name="$1" new="$2" cwd="$3" res got why="" _prev_traps
+  _NAME_WHY=""
+  _prev_traps=$(trap -p INT TERM HUP)
   trap '_crpc_close; exit 130' INT TERM HUP
   if ! _crpc_open "$cwd"; then
     trap - INT TERM HUP; eval "$_prev_traps"
-    printf '⚠ "%s": could not start codex app-server — resuming it plainly\n' "$name" >&2
-    return 1
+    _NAME_WHY="could not start codex app-server"; return 1
   fi
-  new=""
-  if ! res=$(_crpc_call 1 initialize '{"clientInfo":{"name":"cl","version":"1"}}'); then
-    why=$(_crpc_why)
+  if ! _crpc_call 1 initialize '{"clientInfo":{"name":"cl","version":"1"}}' >/dev/null; then why=$(_crpc_why)
   else
     _crpc_send '{"jsonrpc":"2.0","method":"initialized"}'
-    if ! res=$(_crpc_call 2 thread/start "$(jq -cn --arg c "$cwd" '{cwd:$c}')"); then
-      why=$(_crpc_why)
+    if ! _crpc_call 2 thread/name/set "$(jq -cn --arg t "$new" --arg n "$name" '{threadId:$t, name:$n}')" >/dev/null; then why=$(_crpc_why)
+    elif ! res=$(_crpc_call 3 thread/read "$(jq -cn --arg t "$new" '{threadId:$t}')"); then why=$(_crpc_why)
     else
-      new=$(printf '%s' "$res" | jq -r '.thread.id // empty' 2>/dev/null)
-      if ! valid_codex_sid "$new"; then
-        why="thread/start returned no thread id"; new=""
-      elif ! _crpc_call 3 thread/name/set "$(jq -cn --arg t "$new" --arg n "$name" '{threadId:$t, name:$n}')" >/dev/null; then
-        why=$(_crpc_why)
-      elif ! res=$(_crpc_call 4 thread/read "$(jq -cn --arg t "$new" '{threadId:$t}')"); then
-        why=$(_crpc_why)
-      else
-        got=$(printf '%s' "$res" | jq -r '.thread.name // empty' 2>/dev/null)
-        [ "$got" = "$name" ] || why="the new thread's name reads back as \"$got\", not \"$name\""
-      fi
+      got=$(printf '%s' "$res" | jq -r '.thread.name // empty' 2>/dev/null)
+      [ "$got" = "$name" ] || why="the new thread's name reads back as \"$got\", not \"$name\""
     fi
   fi
   _crpc_close
   trap - INT TERM HUP; eval "$_prev_traps"
-  # Discovery has to find the new thread by name, or `cl --codex "<name>"` and
-  # the listing would not.
-  [ -z "$why" ] && [ -n "$new" ] && ! _codex_rollout_active "$new" && why="the new thread has no rollout in $CODEX_SESSIONS"
-  if [ -n "$why" ]; then
-    printf '⚠ "%s": could not make a fresh Codex thread (%s) — resuming it plainly\n' "$name" "$why" >&2
-    [ -n "$new" ] && _codex_fresh_discard "$name" "$new"
-    return 1
+  _NAME_WHY="$why"
+  [ -z "$why" ]
+}
+
+# codex_fresh_advance <name> <row-sid> <cwd>: carry the transaction for <name>
+# as far as `rewritten`, starting a new one if none is pending. The caller
+# holds codex_txn_claim. Prints the id to launch, and returns
+#   0  launch it as the new thread, with the first prompt
+#   1  launch it plainly (nothing was replaced, or a rollback happened)
+#   2  launch nothing; the row and the transaction stay for the next start
+codex_fresh_advance() {
+  local name="$1" rsid="$2" cwd="$3" phase old new cycle res got why=""
+  command -v jq >/dev/null 2>&1 || { printf '⚠ "%s": a fresh Codex thread needs jq — resuming it plainly\n' "$name" >&2; printf '%s' "$rsid"; return 1; }
+  phase=$(_txn_get "$name" phase); old=$(_txn_get "$name" old_sid); new=$(_txn_get "$name" new_sid)
+  cycle=$(_txn_get "$name" cycle)
+  if [ -n "$phase" ] && [ "$rsid" != "$old" ] && [ "$rsid" != "$new" ]; then
+    printf '⚠ "%s": a pending replacement (%s → %s) does not match this row (%s) — leaving it, and resuming %s plainly\n' \
+      "$name" "$old" "${new:-?}" "$rsid" "$rsid" >&2
+    printf '%s' "$rsid"; return 1
   fi
-  # ── 2. the old thread archived, before anything can elect it ──
-  if ! _codex_archive "$old"; then
-    printf '⚠ "%s": could not archive its old thread %s — resuming it plainly\n' "$name" "$old" >&2
-    _codex_fresh_discard "$name" "$new"
-    return 1
+  [ -n "$phase" ] && [ "$phase" != "begun" ] && printf 'ℹ "%s": carrying on its pending replacement (%s → %s, at %s)\n' "$name" "$old" "$new" "$phase" >&2
+
+  if [ -z "$phase" ] || [ "$phase" = "begun" ]; then
+    old="${old:-$rsid}"
+    valid_codex_sid "$old" || { printf '⚠ "%s": "%s" is not a Codex thread id — resuming it plainly\n' "$name" "$old" >&2; _txn_drop "$name"; printf '%s' "$old"; return 1; }
+    # Never archive a thread something is still working.
+    if [ -n "$(session_pid "$old" codex)" ] || [ -n "$(registered_pid "$name" codex "$old")" ]; then
+      printf '⚠ "%s": its thread is still running here — not replacing it; resuming it plainly\n' "$name" >&2
+      _txn_drop "$name"; printf '%s' "$old"; return 1
+    fi
+    if ! _codex_rollout_active "$old"; then
+      printf '⚠ "%s": thread %s is not in %s (archived or moved?) — not replacing it\n' "$name" "$old" "$CODEX_SESSIONS" >&2
+      _txn_drop "$name"; printf '%s' "$old"; return 1
+    fi
+    cycle="$(date +%s 2>/dev/null || echo 0)-$$-$RANDOM"
+    if ! _txn_put "$name" "$(jq -cn --arg n "$name" --arg c "$cwd" --arg o "$old" --arg y "$cycle" \
+           '{agent:"codex", name:$n, cwd:$c, old_sid:$o, new_sid:"", cycle:$y, phase:"begun"}')"; then
+      printf '⚠ "%s": could not record the replacement in %s — not replacing it; resuming it plainly\n' "$name" "$CL_FRESH_DIR" >&2
+      printf '%s' "$old"; return 1
+    fi
+    # ── create (and, on the same connection, name and read back) ──
+    local _prev_traps; _prev_traps=$(trap -p INT TERM HUP)
+    trap '_crpc_close; exit 130' INT TERM HUP
+    if ! _crpc_open "$cwd"; then
+      trap - INT TERM HUP; eval "$_prev_traps"
+      printf '⚠ "%s": could not start codex app-server — resuming it plainly\n' "$name" >&2
+      _codex_rollback "$name" "$old"; printf '%s' "$old"; return 1
+    fi
+    new=""
+    if ! res=$(_crpc_call 1 initialize '{"clientInfo":{"name":"cl","version":"1"}}'); then
+      why=$(_crpc_why)
+    else
+      _crpc_send '{"jsonrpc":"2.0","method":"initialized"}'
+      if ! res=$(_crpc_call 2 thread/start "$(jq -cn --arg c "$cwd" '{cwd:$c}')"); then
+        why=$(_crpc_why)
+      else
+        new=$(printf '%s' "$res" | jq -r '.thread.id // empty' 2>/dev/null)
+        if ! valid_codex_sid "$new"; then
+          why="thread/start returned no thread id"; new=""
+        elif ! _txn_put "$name" "$(jq -cn --arg t "$new" '{new_sid:$t, phase:"created"}')"; then
+          why="could not record the new thread id in $CL_FRESH_DIR"
+        elif ! _crpc_call 3 thread/name/set "$(jq -cn --arg t "$new" --arg n "$name" '{threadId:$t, name:$n}')" >/dev/null; then
+          why=$(_crpc_why)
+        elif ! res=$(_crpc_call 4 thread/read "$(jq -cn --arg t "$new" '{threadId:$t}')"); then
+          why=$(_crpc_why)
+        else
+          got=$(printf '%s' "$res" | jq -r '.thread.name // empty' 2>/dev/null)
+          [ "$got" = "$name" ] || why="the new thread's name reads back as \"$got\", not \"$name\""
+        fi
+      fi
+    fi
+    _crpc_close
+    trap - INT TERM HUP; eval "$_prev_traps"
+    phase="created"
+  elif [ "$phase" = "created" ]; then
+    if ! _codex_name_new "$name" "$new" "$cwd"; then why="${_NAME_WHY:-could not name the new thread}"; fi
   fi
-  # ── 3. the row onto the new thread ──
-  if ! _codex_row_rewrite "$name" "$old" "$new"; then
-    printf '⚠ "%s": could not move its restart row onto the new thread — resuming the old one plainly\n' "$name" >&2
-    _codex_unarchive "$old" \
-      || printf '⚠ "%s": and its old thread %s could not be unarchived — run: codex unarchive %s\n' "$name" "$old" "$old" >&2
-    _codex_fresh_discard "$name" "$new"
-    return 1
+
+  if [ "$phase" = "created" ]; then
+    [ -z "$why" ] && [ -n "$new" ] && ! _codex_rollout_active "$new" && why="the new thread has no rollout in $CODEX_SESSIONS"
+    if [ -z "$why" ] && ! _txn_put "$name" '{"phase":"named"}'; then why="could not record the named thread in $CL_FRESH_DIR"; fi
+    if [ -n "$why" ]; then
+      printf '⚠ "%s": could not make a fresh Codex thread (%s) — resuming it plainly\n' "$name" "$why" >&2
+      _codex_rollback "$name" "$old" "$new"; printf '%s' "$old"; return 1
+    fi
+    phase="named"
   fi
-  printf '%s' "$new"
+
+  if [ "$phase" = "named" ]; then
+    # Archived already means a crash after the archive and before it was
+    # written down; nothing more to do for this step.
+    if _codex_rollout_active "$old"; then
+      if [ -n "$(session_pid "$old" codex)" ] || [ -n "$(registered_pid "$name" codex "$old")" ]; then
+        printf '⚠ "%s": its old thread is running again — not archiving it; resuming it plainly\n' "$name" >&2
+        _codex_rollback "$name" "$old" "$new"; printf '%s' "$old"; return 1
+      fi
+      if ! _codex_archive "$old"; then
+        printf '⚠ "%s": could not archive its old thread %s — resuming it plainly\n' "$name" "$old" >&2
+        _codex_rollback "$name" "$old" "$new"; printf '%s' "$old"; return 1
+      fi
+    fi
+    # The recovery entry is written the moment the old thread stops being
+    # listed, so a crash after this still leaves the way back recorded.
+    record_fresh_history "$name" "$old" "$cwd" codex
+    _txn_put "$name" '{"phase":"archived"}' \
+      || printf '⚠ "%s": could not record the archive in %s — a retry will see the old thread archived and carry on\n' "$name" "$CL_FRESH_DIR" >&2
+    phase="archived"
+  fi
+
+  if [ "$phase" = "archived" ]; then
+    if ! _codex_row_rewrite "$name" "$old" "$new" "$cycle" || ! _txn_put "$name" '{"phase":"rewritten"}'; then
+      printf '⚠ "%s": could not move its restart row onto the new thread %s — nothing launched; re-run cl start to finish (the old thread %s is archived)\n' \
+        "$name" "$new" "$old" >&2
+      printf '%s' "$new"; return 2
+    fi
+    phase="rewritten"
+  fi
+
+  # rewritten | launching: the new thread is the one to run.
+  printf '%s' "$new"; return 0
+}
+
+# codex_launch_verified <name> <new> -> 0 when the process running is codex on
+# <new>, by the ownership rules retire_session trusts: a tmux session cl
+# stamped for that SID with a `codex … resume <new>` process inside its pane,
+# or cl's launch record for that name and SID (bare shape; exec keeps the pid
+# and start time the record names). tmux has-session alone proves a pane, not
+# an agent.
+codex_launch_verified() {
+  local name="$1" new="$2" t
+  t=$(tmux_name "$name" codex)
+  if command -v tmux >/dev/null 2>&1 && tmux has-session -t "=$t" 2>/dev/null; then
+    tmux_owned "$t" codex "$new" && _codex_pane_runs "$t" "$new"
+    return $?
+  fi
+  [ -n "$(registered_pid "$name" codex "$new")" ]
+}
+# _codex_pane_runs <tmux-session> <id>: a `codex … resume <id>` process is the
+# pane's own process or descends from it.
+_codex_pane_runs() {
+  local t="$1" new="$2" pane p q i
+  pane=$(tmux list-panes -t "=$t:" -F '#{pane_pid}' 2>/dev/null | head -1)
+  [ -n "$pane" ] || return 1
+  for p in $(pgrep -f "codex.* resume $new( |\$)" 2>/dev/null); do
+    q="$p"; i=0
+    while [ -n "$q" ] && [ "$q" != "0" ] && [ "$q" != "1" ] && [ "$i" -lt 20 ]; do
+      [ "$q" = "$pane" ] && return 0
+      q=$(ps -o ppid= -p "$q" 2>/dev/null | tr -d ' '); i=$((i+1))
+    done
+  done
+  return 1
+}
+
+# codex_fresh_finish <name> <new>: the launch is verified. The row (if it is
+# still there) becomes mode resume with fresh_pending cleared, and the
+# transaction is removed. Caller holds the claim.
+codex_fresh_finish() {
+  local name="$1" new="$2" tmp
+  if [ -f "$STATE" ] && _state_row_lock "$name"; then
+    tmp="$STATE.finish.$$"
+    jq --arg n "$name" --arg s "$new" \
+       'map(if (.agent // "claude") == "codex" and .name == $n and .sid == $s
+            then .mode = "resume" | del(.fresh_pending) else . end)' "$STATE" > "$tmp" 2>/dev/null \
+      && [ -s "$tmp" ] && mv "$tmp" "$STATE" 2>/dev/null
+    rm -f "$tmp" 2>/dev/null
+    _state_row_unlock
+  fi
+  _txn_drop "$name"
+}
+
+# codex_fresh_settle <name> <sid>: a pending transaction whose new thread is
+# already up and verified is finished; anything else is left as it is. Used
+# where a start or a stop meets a session that is live.
+codex_fresh_settle() {
+  local name="$1" sid="$2"
+  case "$(_txn_get "$name" phase)" in rewritten|launching) ;; *) return 1 ;; esac
+  [ "$(_txn_get "$name" new_sid)" = "$sid" ] || return 1
+  codex_txn_claim "$name" || return 1
+  # A start that died between `tmux new-session` and stamping it left an
+  # unstamped session. It is adopted only on the strongest evidence there is:
+  # nothing has stamped it at all, the pending transaction names this exact new
+  # id, and the pane itself runs `codex resume <that id>` — an id only this
+  # transaction knew.
+  local t; t=$(tmux_name "$name" codex)
+  if command -v tmux >/dev/null 2>&1 && tmux has-session -t "=$t" 2>/dev/null \
+     && [ -z "$(tmux show-option -qv -t "=$t:" "@cl_agent" 2>/dev/null)" ] && _codex_pane_runs "$t" "$sid"; then
+    tmux_claim "$t" codex "$sid"
+    printf 'ℹ "%s": adopting the tmux session its interrupted start launched on %s\n' "$name" "$sid" >&2
+  fi
+  if [ "$(_txn_get "$name" new_sid)" = "$sid" ] && codex_launch_verified "$name" "$sid"; then
+    codex_fresh_finish "$name" "$sid"; codex_txn_release; return 0
+  fi
+  codex_txn_release; return 1
 }
 # _codex_fresh_discard <name> <id>: archive a new thread that will not be used,
 # so two threads never share the name — discovery is newest-wins, and an empty
@@ -2788,7 +3032,7 @@ tmux_start_and_attach() { # t cwd cmd agent [sid] [display-name]
   #
   # An ordinary launch has no matching row and the pre-created `cl start` path
   # has already consumed its own, so this is a no-op in both.
-  [ -n "${6:-}" ] && ack_state_row "${6}" "$agent" "$sid"
+  [ -n "${6:-}" ] && [ "${_CL_SKIP_ACK:-}" != "1" ] && ack_state_row "${6}" "$agent" "$sid"
   exec tmux attach-session -t "=${t}"
 }
 
@@ -2944,7 +3188,7 @@ launch_session() { # name sid cwd [agent] [first-prompt]
     # before exec, which is the last moment any code here runs. The sid is the
     # one actually being resumed, so a row for a different generation of this
     # name is left alone.
-    ack_state_row "$name" "$agent" "$sid"
+    [ "${_CL_SKIP_ACK:-}" = "1" ] || ack_state_row "$name" "$agent" "$sid"
     drop_cmux_env; cd "$cwd" || exit 1; eval "exec $cmd"
   fi
 }
@@ -4752,6 +4996,10 @@ do_stop() {
     # everything, because it is the most explicit thing the operator can say;
     # below that, CL_ROTATE for a one-off, then the stored setting.
     stop_rotate_resolve "$name" "$agent" "$no_handoff" "$require_handoff" "$env_rotate"
+    # A fresh replacement launched by an earlier start and running verified is
+    # finished before this stop records anything, so its transaction cannot
+    # outlive the cycle it belonged to.
+    [ "$agent" = "codex" ] && [ -z "$dry_run" ] && codex_fresh_settle "$name" "$sid" 2>/dev/null
     _h_name[$_n]="$name"; _h_sid[$_n]="$sid"; _h_cwd[$_n]="$cwd"
     _h_tmux[$_n]="$(tmux_name "$name" "$agent")"; _h_agent[$_n]="$agent"
     _h_rot[$_n]="$_STOP_ROTATE"
@@ -5388,7 +5636,7 @@ do_start() {
   # consumed handoff through to the tab, and a Codex row has to carry --codex —
   # so the command is built in the same place those are decided, rather than
   # reconstructed from the name later. (It also means STATE is read once.)
-  local name sid cwd agent ronly rmode rbid t i=0 claim cmd rsid_env kept="" cfresh ccompact cxfresh osid nsid
+  local name sid cwd agent ronly rmode rbid t i=0 claim cmd rsid_env kept="" cfresh ccompact cxfresh cxclaim cxrc osid nsid
   local -a tab_cmds=() _cr_t=() _cr_name=() _cr_sid=() _cr_cwd=()
   while IFS=$'\t' read -r name sid cwd agent ronly rmode rbid; do
     agent="${agent:-claude}"
@@ -5402,6 +5650,12 @@ do_start() {
       # agent on the same transcript. The row is kept so the next start picks
       # it up once it really is gone.
       if agent_live "$agent" "$sid" "$name"; then
+        # The tab of an earlier start launched this fresh thread; now it can
+        # be checked, and the replacement finished.
+        if [ "$agent" = "codex" ] && codex_fresh_settle "$name" "$sid"; then
+          printf '✓ %s is running on its new Codex thread %s\n' "$name" "$sid"
+          continue
+        fi
         printf '● %s already live\n' "$name"
         kept="${kept}${agent}"$'\t'"${name}"$'\n'
         continue
@@ -5416,7 +5670,7 @@ do_start() {
       # self-correcting: if the tab worked, the session is live and the next
       # `cl start` skips it; if it did not, the row and the handoff are both
       # still there and a re-run does the right thing.
-      if [ "$agent" != "claude" ] && [ "$rmode" = "fresh" ]; then
+      if [ "$agent" != "claude" ] && { [ "$rmode" = "fresh" ] || codex_txn_pending "$name"; }; then
         # The tab makes the new thread, as it does the launch: if the tab never
         # runs, nothing was archived and the row still names the old thread.
         # The old id travels with it, so a tab that runs late, after the name
@@ -5453,6 +5707,12 @@ do_start() {
       continue
     fi
     if tmux has-session -t "=${t}" 2>/dev/null; then
+      # A fresh replacement whose launch was not yet verified is finished here
+      # once it is: the row is then done with, like any started session.
+      if [ "$agent" = "codex" ] && codex_fresh_settle "$name" "$sid"; then
+        printf '✓ %s is running on its new Codex thread %s\n' "$name" "$sid"
+        continue
+      fi
       printf '● %s already live\n' "$name"
       kept="${kept}${agent}"$'\t'"${name}"$'\n'
       continue
@@ -5460,15 +5720,33 @@ do_start() {
     # tmux path: `tmux new-session -d` either creates the session or it does
     # not, and this process sees which — so the claim can be committed or
     # rolled back right here, against real acceptance.
-    claim=""; rsid_env=""; cfresh=0; ccompact=0; cxfresh=0; osid="$sid"
+    claim=""; rsid_env=""; cfresh=0; ccompact=0; cxfresh=0; cxclaim=0; osid="$sid"
     if [ "$agent" != "claude" ]; then
       # fresh: a NEW thread made, named and swapped in first (steps 1-3), then
       # resumed by id like any other, with a first prompt so its first turn
       # fires SessionStart. Any failure there has been undone, and this is the
       # plain resume of the old thread.
-      if [ "$rmode" = "fresh" ] && nsid=$(codex_fresh_thread "$name" "$sid" "$cwd"); then
-        sid="$nsid"; cxfresh=1
-        cmd=$(resume_cmd "$agent" "$sid" "$name" "$(build_codex_fresh_prompt)")
+      if [ "$rmode" = "fresh" ] || codex_txn_pending "$name"; then
+        # The whole swap runs under the per-name claim, so a second start
+        # cannot run its own. Inside it the row is read again: while this one
+        # waited, another start may have moved or consumed it.
+        if ! codex_txn_claim "$name"; then
+          kept="${kept}${agent}"$'\t'"${name}"$'\n'; continue
+        fi
+        cxclaim=1
+        nsid=$(jq -r --arg n "$name" '[.[] | select((.agent // "claude") == "codex" and .name == $n)][0].sid // empty' "$STATE" 2>/dev/null)
+        if [ -z "$nsid" ]; then
+          printf 'ℹ %s was started by another cl start meanwhile\n' "$name"
+          codex_txn_release; continue
+        fi
+        sid="$nsid"; osid="$sid"
+        nsid=$(codex_fresh_advance "$name" "$sid" "$cwd"); cxrc=$?
+        case "$cxrc" in
+          0) osid=$(_txn_get "$name" old_sid); sid="$nsid"; cxfresh=1
+             cmd=$(resume_cmd "$agent" "$sid" "$name" "$(build_codex_fresh_prompt)") ;;
+          1) sid="$nsid"; cmd=$(resume_cmd "$agent" "$sid" "$name"); codex_txn_release; cxclaim=0 ;;
+          *) codex_txn_release; kept="${kept}${agent}"$'\t'"${name}"$'\n'; continue ;;
+        esac
       else
         cmd=$(resume_cmd "$agent" "$sid" "$name")
       fi
@@ -5513,8 +5791,19 @@ do_start() {
         record_fresh_history "$name" "$sid" "$cwd"
         printf '✦ prepared %s as a new session  (%s)\n' "$name" "$cwd"
       elif [ "$cxfresh" = "1" ]; then
-        record_fresh_history "$name" "$osid" "$cwd" codex
-        printf '✦ prepared %s as a new Codex thread %s; the old one is archived  (%s)\n' "$name" "$sid" "$cwd"
+        # Launched is not started: settled only once the pane holds codex on
+        # the new id. Until then the transaction and the row both stay, and
+        # the next start finishes (or relaunches) this same thread.
+        _txn_put "$name" '{"phase":"launching"}' >/dev/null 2>&1
+        _vw=0
+        until codex_launch_verified "$name" "$sid" || [ "$_vw" -ge "$(( ${CL_RESUME_CHECK:-5} * 4 ))" ]; do sleep 0.25; _vw=$((_vw+1)); done
+        if codex_launch_verified "$name" "$sid"; then
+          codex_fresh_finish "$name" "$sid"
+          printf '✦ prepared %s as a new Codex thread %s; the old one is archived  (%s)\n' "$name" "$sid" "$cwd"
+        else
+          printf '⚠ %s: could not confirm codex is running on its new thread %s — kept for the next cl start\n' "$name" "$sid" >&2
+          kept="${kept}${agent}"$'\t'"${name}"$'\n'
+        fi
       elif [ "$ccompact" = "1" ]; then
         _cr_t+=("$t"); _cr_name+=("$name"); _cr_sid+=("$sid"); _cr_cwd+=("$cwd")
         printf '⟳ prepared %s from its compaction  (%s)\n' "$name" "$cwd"
@@ -5524,16 +5813,16 @@ do_start() {
       tab_cmds+=("$(tab_cmd "$agent" "$name")")
     else
       [ -n "$claim" ] && rollback_claim "$root" "$name" "$claim"
-      # Steps 1-3 already happened: the old thread is archived and the row
-      # names the new one (mode resume, so a re-run resumes it rather than
-      # making a third). The old id still needs its way back recorded and said.
+      # Steps 1-3 already happened: the old thread is archived (its way back
+      # recorded then) and the row names the new one with the transaction
+      # still pending, so a re-run resumes it rather than making a third.
       if [ "$cxfresh" = "1" ]; then
-        record_fresh_history "$name" "$osid" "$cwd" codex
-        printf '  (%s now names the new Codex thread %s; its old thread %s is archived)\n' "$name" "$sid" "$osid" >&2
+        printf '  (%s now names the new Codex thread %s; its old thread %s is archived — run: codex unarchive %s)\n' "$name" "$sid" "$osid" "$osid" >&2
       fi
       printf '✗ could not prepare %s — leaving it in the restart list\n' "$name" >&2
       kept="${kept}${agent}"$'\t'"${name}"$'\n'
     fi
+    [ "$cxclaim" = "1" ] && codex_txn_release
   # mode and boundary use "-" for "none": tab is IFS whitespace to `read`, so an
   # empty field in the middle would shift the ones after it.
   done < <(jq -r '.[] | [.name, .sid, .cwd, (.agent // "claude"), (.resume_only // false),
@@ -6153,25 +6442,35 @@ case "${1:-}" in
     # the way --rotate-from is. This tab is the process that launches, so it is
     # the one that preflights (compact-resume) or retires the old id (fresh).
     # `cl --codex <name> --restart-mode fresh <old-id>`: the same, for a Codex
-    # row. This tab makes the new thread (codex_fresh_thread) and resumes it by
-    # id; any failure there resumes the old thread plainly.
+    # row. This tab carries the fresh transaction (codex_fresh_advance) under
+    # the per-name claim and resumes the new thread by id; a rollback resumes
+    # the old thread plainly. The row is settled by a later start, which can
+    # see what this exec cannot.
     if [ "${2:-}" = "--restart-mode" ] && [ "$AGENT_FILTER" = "codex" ]; then
       rrow=$(discover | awk -F'\t' -v n="$1" '$1==n && $5=="codex" {print; exit}')
       [ -n "$rrow" ] || { echo "claude-session: no codex session named '$1' (try --list)" >&2; exit 1; }
       rcwd=$(printf '%s' "$rrow" | cut -f3); rsid=$(printf '%s' "$rrow" | cut -f2)
       case "${3:-}" in
         fresh)
-          if [ -n "${4:-}" ] && [ "$4" != "$rsid" ]; then
+          if [ -n "${4:-}" ] && [ "$4" != "$rsid" ] && ! codex_txn_pending "$1"; then
             # The name has moved on since the stop (a newer thread, or this
             # tab ran twice): that thread was never stopped, so it is resumed,
             # not replaced.
             printf 'ℹ "%s" no longer names thread %s — resuming %s as it is\n' "$1" "$4" "$rsid" >&2
             launch_session "$1" "$rsid" "$rcwd" codex
-          elif rnew=$(codex_fresh_thread "$1" "$rsid" "$rcwd"); then
-            record_fresh_history "$1" "$rsid" "$rcwd" codex
-            launch_session "$1" "$rnew" "$rcwd" codex "$(build_codex_fresh_prompt)"
           else
-            launch_session "$1" "$rsid" "$rcwd" codex
+            codex_txn_claim "$1" || exit 1
+            rnew=$(codex_fresh_advance "$1" "${4:-$rsid}" "$rcwd"); rrc=$?
+            case "$rrc" in
+              0) _txn_put "$1" '{"phase":"launching"}' >/dev/null 2>&1
+                 codex_txn_release
+                 # The row is NOT acknowledged by this launch: exec ends this
+                 # process, so it cannot see the agent start. The next start
+                 # verifies it (codex_fresh_settle) and settles the row.
+                 _CL_SKIP_ACK=1 launch_session "$1" "$rnew" "$rcwd" codex "$(build_codex_fresh_prompt)" ;;
+              1) codex_txn_release; launch_session "$1" "$rnew" "$rcwd" codex ;;
+              *) codex_txn_release; exit 1 ;;
+            esac
           fi ;;
         *) echo "claude-session: --restart-mode: '${3:-}' is not a Codex restart mode (fresh)" >&2; exit 1 ;;
       esac
