@@ -266,6 +266,9 @@ contains "…and says so rather than crashing" "$plain_out" "saved state is empt
 # TMUX_TMPDIR so they talk to the one throwaway server, never the user's.
 TMUX_TMPDIR="$FIX/tmux-tmp"; mkdir -p "$TMUX_TMPDIR"
 rtmux() { TMUX_TMPDIR="$TMUX_TMPDIR" tmux "$@"; }
+# Stamped the way cl stamps its own sessions: the stop kills a tmux session
+# only when it is bound to the session being stopped.
+stamp_claude() { rtmux set-option -t "=$1:" @cl_agent claude >/dev/null 2>&1; rtmux set-option -t "=$1:" @cl_sid "$2" >/dev/null 2>&1; }
 cleanup_rtmux() { rtmux kill-server >/dev/null 2>&1 || true; }
 trap 'cleanup_rtmux; live_down; rm -rf "$FIX"' EXIT
 
@@ -304,6 +307,7 @@ with open("$RECV", "wb") as f:
 time.sleep(3)
 PYEOF
 rtmux new-session -d -s TmuxSendTarget -c "$FIX" "python3 $RECEIVER"
+stamp_claude "TmuxSendTarget" sid-tmuxsend
 # send_text_tmux isn't independently callable (the script isn't designed to
 # be sourced), so it's driven through its one real caller: request_handoff,
 # via a real (non-dry-run, non-handoff) `cl stop` against a discover fixture
@@ -341,6 +345,7 @@ echo "cl stop --dry-run --no-handoff never kills (flag order/combination bug)"
 # short-circuit used to live ONLY inside the no_handoff=0 branch, so
 # `--dry-run --no-handoff` fell straight through to a real kill-session.
 rtmux new-session -d -s DryRunProbe -c "$FIX" 'sleep 30'
+stamp_claude "DryRunProbe" sid-dryrunprobe
 printf '{"cwd":"%s"}\n{"customTitle":"DryRunProbe"}\n' "$FIX" > "$HOME/.claude/projects/p1/sid-dryrunprobe.jsonl"
 live_up
 env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
@@ -364,6 +369,7 @@ echo "cl start --fresh fails closed when retirement is declined (real tmux, no t
 # scripted pane command.
 # shellcheck disable=SC2016  # single quotes are the point: this runs inside the pane's OWN shell, not this one
 rtmux new-session -d -s FreshFailClosed -c "$FIX" 'i=0; while :; do i=$((i+1)); done'
+stamp_claude "FreshFailClosed" sid-freshfail
 sleep 1   # let CPU% ramp up before cl samples it
 printf '{"cwd":"%s"}\n{"customTitle":"FreshFailClosed"}\n' "$FIX" > "$HOME/.claude/projects/p1/sid-freshfail.jsonl"
 fresh_fail_out=$(env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
@@ -389,6 +395,7 @@ echo "cl start --fresh fails closed on a handoff timeout ALONE, even when retire
 # prompt — proving the block comes from the missing handoff, not from a busy
 # check.
 rtmux new-session -d -s HandoffOnlyFail -c "$FIX" 'sleep 30'
+stamp_claude "HandoffOnlyFail" sid-handoffonly
 printf '{"cwd":"%s"}\n{"customTitle":"HandoffOnlyFail"}\n' "$FIX" > "$HOME/.claude/projects/p1/sid-handoffonly.jsonl"
 handoff_only_out=$(env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
   CL_HANDOFF_DIR="$FIX/dir-handoffonly" CL_HANDOFF_TIMEOUT=1 \
@@ -656,6 +663,7 @@ echo "cl stop retries before giving up, then stops anyway"
 # once; but the handoff is an optimisation, so exhausting the attempts stops
 # the session rather than wedging the command.
 rtmux new-session -d -s KeepAlive -c "$FIX" 'sleep 30'
+stamp_claude "KeepAlive" sid-keepalive
 printf '{"cwd":"%s"}\n{"customTitle":"KeepAlive"}\n' "$FIX" > "$HOME/.claude/projects/p1/sid-keepalive.jsonl"
 live_up
 keep_out=$(env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
@@ -701,6 +709,7 @@ echo "a hand-written handoff is honoured by cl stop instead of asking"
 # The whole reason `cl stop` can afford to fail closed: there is a way to
 # satisfy it when the pane cannot be reached at all.
 rtmux new-session -d -s ManualTarget -c "$FIX" 'sleep 30'
+stamp_claude "ManualTarget" sid-manual
 printf '{"cwd":"%s"}\n{"customTitle":"ManualTarget"}\n' "$FIX" > "$HOME/.claude/projects/p1/sid-manual.jsonl"
 MSTORE="$FIX/manual-honour"; mkdir -p "$MSTORE"
 printf 'written by hand\n<!-- cl:manual:2026-09-24T00:00:00Z -->\n' > "$MSTORE/ManualTarget.md"
@@ -780,6 +789,7 @@ check "three rotations in the same second keep three files" "3" "$(ls "$CC/consu
 # ===========================================================================
 echo "cl stop stops a session even when no handoff arrives"
 rtmux new-session -d -s PlainStop -c "$FIX" 'sleep 30'
+stamp_claude "PlainStop" sid-plainstop
 printf '{"cwd":"%s"}\n{"customTitle":"PlainStop"}\n' "$FIX" > "$HOME/.claude/projects/p1/sid-plainstop.jsonl"
 live_up
 ps_out=$(env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
@@ -794,6 +804,7 @@ rm -f "$HOME/.claude/projects/p1/sid-plainstop.jsonl"
 
 echo "--require-handoff opts back in to failing closed"
 rtmux new-session -d -s StrictStop -c "$FIX" 'sleep 30'
+stamp_claude "StrictStop" sid-strict
 printf '{"cwd":"%s"}\n{"customTitle":"StrictStop"}\n' "$FIX" > "$HOME/.claude/projects/p1/sid-strict.jsonl"
 live_up
 st_out=$(env -i HOME="$HOME" CL_HANDOFF_VERIFY=0 PATH="$BASEPATH" TMUX_TMPDIR="$TMUX_TMPDIR" \
@@ -810,6 +821,7 @@ echo "a failed request does not destroy the last good handoff"
 # Sweeping the prior answer before asking bought nothing and could lose the
 # only handoff the session ever produced.
 rtmux new-session -d -s KeepPrior -c "$FIX" 'sleep 30'
+stamp_claude "KeepPrior" sid-keepprior
 printf '{"cwd":"%s"}\n{"customTitle":"KeepPrior"}\n' "$FIX" > "$HOME/.claude/projects/p1/sid-keepprior.jsonl"
 KP="$FIX/keep-prior"; mkdir -p "$KP"
 printf 'good work from the previous cycle\n\n<!-- cl:clho:9:9:9:9 -->\n' > "$KP/KeepPrior.md"
@@ -826,6 +838,7 @@ echo "--no-handoff really does mean 'resume it as-is'"
 # The printed promise was false: skipping the REQUEST left an existing handoff
 # in place, so the next start rotated anyway.
 rtmux new-session -d -s SkipRot -c "$FIX" 'sleep 30'
+stamp_claude "SkipRot" sid-skiprot
 printf '{"cwd":"%s"}\n{"customTitle":"SkipRot"}\n' "$FIX" > "$HOME/.claude/projects/p1/sid-skiprot.jsonl"
 SK="$FIX/skip-store"; mkdir -p "$SK"
 printf 'from an earlier cycle\n\n<!-- cl:clho:5:5:5:5 -->\n' > "$SK/SkipRot.md"
@@ -896,6 +909,7 @@ echo "start --fresh refuses before retiring when the handoff cannot be claimed"
 # The old order retired first and consumed after, so a consume failure left the
 # session dead and the replacement reading a still-active file.
 rtmux new-session -d -s "claude-FreshClaim" -c "$FIX" 'sleep 30'
+stamp_claude "claude-FreshClaim" sid-freshclaim
 printf '{"cwd":"%s"}\n{"customTitle":"FreshClaim"}\n' "$FIX" > "$HOME/.claude/projects/p1/sid-freshclaim.jsonl"
 FC="$FIX/fresh-claim"; mkdir -p "$FC"
 printf 'work\n\n<!-- cl:manual:2026-09-25T00:00:00Z -->\n' > "$FC/FreshClaim.md"
@@ -1042,6 +1056,7 @@ echo "a stop whose handoff failed records resume-only, and start honours it"
 # complete handoff left in place would make the next start rotate from notes
 # that predate everything done since. The printed promise has to be durable.
 rtmux new-session -d -s RoOnly -c "$FIX" 'sleep 30'
+stamp_claude "RoOnly" sid-roonly
 printf '{"cwd":"%s"}\n{"customTitle":"RoOnly"}\n' "$FIX" > "$HOME/.claude/projects/p1/sid-roonly.jsonl"
 RO="$FIX/resume-only"; mkdir -p "$RO"
 printf 'OLD notes from an earlier cycle\n\n<!-- cl:clho:1:1:1:1 -->\n' > "$RO/RoOnly.md"
@@ -1062,6 +1077,7 @@ rm -f "$HOME/.claude/projects/p1/sid-roonly.jsonl"
 
 echo "--no-handoff is honoured even if clearing the handoff fails"
 rtmux new-session -d -s SkipHard -c "$FIX" 'sleep 30'
+stamp_claude "SkipHard" sid-skiphard
 printf '{"cwd":"%s"}\n{"customTitle":"SkipHard"}\n' "$FIX" > "$HOME/.claude/projects/p1/sid-skiphard.jsonl"
 SH="$FIX/skip-hard"; mkdir -p "$SH"
 printf 'pending\n\n<!-- cl:clho:2:2:2:2 -->\n' > "$SH/SkipHard.md"

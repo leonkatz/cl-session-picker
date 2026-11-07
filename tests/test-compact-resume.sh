@@ -239,6 +239,14 @@ mk_agent() { # <name> <sid> <mode> [delay] [chars lost from the first arrival]
   rtmux new-session -d -s "$1" -c "$FIX" \
     "AGENT_BUSY='${AGENT_BUSY:-0}' AGENT_BUSY_TAG='$BUSY_TAG' AGENT_MODE='$3' AGENT_DELAY='${4:-0.5}' AGENT_DROP='${5:-0}' AGENT_TRANSCRIPT='$PROJ/$2.jsonl' AGENT_RECV='$FIX/recv-$1.txt' exec python3 '$AGENT'" 2>/dev/null \
     || setup_failed "could not start the agent for $1"
+  # Stamped the way cl stamps the sessions it creates, since only that (or the
+  # session's process found in its panes) lets the stop kill it. MK_STAMP=none
+  # leaves it unstamped; any other value stamps it as that agent.
+  case "${MK_STAMP:-claude}" in
+    none) ;;
+    *) rtmux set-option -t "=$1:" @cl_agent "${MK_STAMP:-claude}" >/dev/null 2>&1
+       rtmux set-option -t "=$1:" @cl_sid "$2" >/dev/null 2>&1 ;;
+  esac
 }
 # Per run, so a suite running beside this one cannot kill its busy stand-ins
 # (or have them killed): every reset pkills the tag.
@@ -335,9 +343,56 @@ reader="$(cat "$FIX/reader.out")"
 contains "the compaction is still confirmed" "$reader" '✓ "Reader" compacted'
 check "the premise: a tool_result names SessionStart and compact" "1" \
   "$(grep -c '"tool_result".*SessionStart.*compact' "$PROJ/sid-rd.jsonl" | awk '{print ($1>0)}')"
-contains "the mid-task prompt is shown" "$reader" '"Reader" looks mid-task'
+contains "it is asked about, because it was never seen at rest" "$reader" '"Reader": it was not seen at rest after it compacted'
 check "…declined unattended, so the session is left running" "1" "$(rtmux list-sessions 2>/dev/null | grep -c '^Reader')"
 check "…and the stop says so by exiting non-zero" "1" "$(cat "$FIX/reader.out.rc")"
+reset
+
+echo "…and a QUIET one doing that work is asked about too, not handed to the busy check"
+# Nothing about it looks busy, so only the missing idle proof can save it.
+mk_agent QuietReader sid-qr busy-reader
+sleep 0.5
+stop_run "$FIX/qreader.out"
+qreader="$(cat "$FIX/qreader.out")"
+contains "the compaction is confirmed" "$qreader" '✓ "QuietReader" compacted'
+check "the premise: tool work follows the compaction" "1" \
+  "$(grep -c '"tool_result"' "$PROJ/sid-qr.jsonl" | awk '{print ($1>0)}')"
+contains "it is asked about, with the reason" "$qreader" '"QuietReader": it was not seen at rest after it compacted'
+check "…declined unattended, so it is left running" "1" "$(rtmux list-sessions 2>/dev/null | grep -c '^QuietReader')"
+check "…and the stop exits non-zero" "1" "$(cat "$FIX/qreader.out.rc")"
+reset
+
+echo "the stop kills a tmux session only when it is bound to this session"
+# A session stamped for another agent is someone else's: left, unasked.
+MK_STAMP=codex mk_agent Foreign sid-fg ok
+sleep 0.5
+stop_run "$FIX/foreign.out"
+contains "a session stamped for another agent is left alone" "$(cat "$FIX/foreign.out")" \
+  'leaving Foreign — the tmux session at Foreign is stamped as a codex session'
+check "…and it is still running" "1" "$(rtmux list-sessions 2>/dev/null | grep -c '^Foreign')"
+reset
+# Unstamped, with nothing tying its process to the session: asked, not killed.
+MK_STAMP=none mk_agent Loose sid-ls ok
+sleep 0.5
+stop_run "$FIX/loose.out"
+contains "an unstamped, untied session is asked about" "$(cat "$FIX/loose.out")" \
+  '"Loose": cl cannot tie the tmux session at Loose to this session'
+check "…declined unattended, so it is left running" "1" "$(rtmux list-sessions 2>/dev/null | grep -c '^Loose')"
+check "…and the stop exits non-zero" "1" "$(cat "$FIX/loose.out.rc")"
+reset
+# Unstamped (every session from before stamps were readable), but Claude's own
+# registry places this session's process in the pane: that is the binding.
+TIED_SID=0f6b1c2e-4d5a-4b7c-9e8f-1a2b3c4d5e6f
+MK_STAMP=none mk_agent Tied "$TIED_SID" ok
+sleep 0.5
+tied_pane=$(rtmux list-panes -t =Tied -F '#{pane_pid}' 2>/dev/null | head -1)
+mkdir -p "$HOME/.claude/sessions"
+jq -n --arg s "$TIED_SID" --argjson p "$tied_pane" --arg ps "$(TZ=UTC ps -p "$tied_pane" -o lstart= | tr -s ' ' | sed 's/^ //; s/ $//')" \
+  '{pid: $p, sessionId: $s, procStart: $ps}' > "$HOME/.claude/sessions/$tied_pane.json"
+stop_run "$FIX/tied.out"
+not_contains "an unstamped session tied by Claude's registry is not asked about" "$(cat "$FIX/tied.out")" 'cannot tie'
+check "…and it is stopped" "0" "$(rtmux list-sessions 2>/dev/null | grep -c '^Tied')"
+rm -rf "$HOME/.claude/sessions"
 reset
 
 echo "…and one written to after its idle proof is asked about, busy-looking or not"
@@ -373,6 +428,8 @@ rs() { # <idle-proven> -> the retire_session status
     tmux() { case "$1" in has-session) return 0 ;; kill-session) return 0 ;; esac; return 1; }
     session_busy() { return 0; }
     close_iterm_tab() { :; }
+    tmux_claude_binding() { printf '%s\n' "${RS_BIND:-bound}"; }
+    _rs_recheck() { :; }
     # The prompt reads /dev/tty, which a harness cannot feed; a function named
     # `read` answers "no" in its place (it sets the caller's local `ans`).
     read() { ans=n; return 0; }
@@ -381,6 +438,8 @@ rs() { # <idle-proven> -> the retire_session status
 }
 check "without proof of rest, a busy-looking session is asked about (and kept)" "1" "$(rs 0)"
 check "with it, the prompt is skipped and the session stopped" "0" "$(rs 1)"
+check "an unbound session is asked about even with the proof (and kept)" "1" "$(RS_BIND=unbound rs 1)"
+check "a foreign-stamped one is not cl's to stop, whatever the proof" "4" "$(RS_BIND=foreign:codex rs 1)"
 
 echo "the token counts only once the transcript has stopped growing"
 reset

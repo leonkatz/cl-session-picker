@@ -2819,6 +2819,45 @@ tmux_owned() {
   [ -n "$s2" ] && [ "$s2" != "-" ] && [ "$s2" = "$3" ]
 }
 
+# tmux_claude_binding <tmux-session> <sid> <name>: may the stop kill this tmux
+# session as this Claude session? Prints bound, unbound, or foreign:<agent>.
+#
+# The NAME is derived and can collide, so it is not authority. A stamp for
+# another agent is a positive sign that the session is someone else's work:
+# foreign. A claude stamp carrying this exact SID is cl's own proof: bound.
+# Anything weaker is only bound when the process tied to this SID runs in one
+# of the session's panes:
+#   - no stamp at all. Every session made before stamps were readable on
+#     tmux 3.x has none, so refusing those outright would strand them.
+#   - a "-" SID, which proves cl launched something, not which transcript.
+#   - a different SID. A fresh rotation stamps the SID it rotated FROM and the
+#     row moves on, so a mismatch is routine, not proof of a foreigner.
+# An unbound session is asked about, never killed silently.
+tmux_claude_binding() {
+  local t="$1" sid="$2" name="$3" a s pid p hops=0 panes
+  a=$(tmux show-option -qv -t "=$t:" "@cl_agent" 2>/dev/null)
+  s=$(tmux show-option -qv -t "=$t:" "@cl_sid" 2>/dev/null)
+  if [ -n "$a" ] && [ "$a" != "claude" ]; then
+    printf 'foreign:%s\n' "$a"; return 0
+  fi
+  if [ "$a" = "claude" ] && [ -n "$sid" ] && [ "$s" != "-" ] && [ "$s" = "$sid" ]; then
+    printf 'bound\n'; return 0
+  fi
+  pid=$(session_pid "$sid" claude "$name")
+  if [ -n "$pid" ]; then
+    panes=" $(tmux list-panes -s -t "=$t" -F '#{pane_pid}' 2>/dev/null | tr '\n' ' ')"
+    p="$pid"
+    # Walk up from the tied process: a pane may run it directly or through a
+    # shell or wrapper. Bounded, because ps may hand back junk for a dying pid.
+    while [ -n "$p" ] && [ "$p" -gt 1 ] 2>/dev/null && [ "$hops" -lt 64 ]; do
+      case "$panes" in *" $p "*) printf 'bound\n'; return 0 ;; esac
+      p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
+      hops=$((hops + 1))
+    done
+  fi
+  printf 'unbound\n'
+}
+
 # agent_live <agent> <sid> <name>: is something already working this session?
 #
 # Used by `cl start` only, where the bias is deliberately the opposite of the
@@ -3315,14 +3354,29 @@ handoff_target_busy() {
 # idle proof), and a quiet turn has no wake-lock or CPU. Unattended, that
 # question is declined and the session is left running.
 #
+# An eighth argument is the stop's index for a compacted session. With a sixth
+# argument of 1, the transcript is re-checked there (compact_still_at_rest) once
+# the kill target is resolved, just before the kill; anything written since the
+# idle proof turns the skip back into the question.
+#
 # A sixth argument, 1, skips the "looks mid-task, kill it anyway?" prompt. Only
 # the compact-resume stop passes it, and only once the transcript PROVES the
 # session is idle since its compaction (see compact_idle): the busy signal
 # lingers for minutes after a turn, so after a compaction it would ask about
 # every session, while the transcript can say it is done.
+# _rs_recheck: retire_session's last transcript check before a kill. It reads
+# retire_session's locals (dynamic scope) and do_stop's _h_* arrays through
+# compact_still_at_rest, and only ever downgrades a proven idle to the question.
+_rs_recheck() {
+  [ "$idle_proven" = "1" ] && [ -n "$recheck_i" ] || return 0
+  compact_still_at_rest "$recheck_i" && return 0
+  idle_proven="ask"; ask_why="it was written to after it compacted, so it may be working"
+}
+
 retire_session() {
   local name="$1" sid="$2" t="$3" close_tabs="$4" agent="${5:-claude}" idle_proven="${6:-0}"
   local ask_why="${7:-it may still be compacting (/compact was never confirmed)}"
+  local recheck_i="${8:-}"
   local ans pid ptok rrc _ppid _pcomm hint kids surv
   hint=$(agent_hint "$agent")
   if tmux has-session -t "=${t}" 2>/dev/null; then
@@ -3342,6 +3396,24 @@ retire_session() {
       fi
       return 4
     fi
+    # The same rule for Claude, in the one place every kill goes through: a
+    # caller that refused to TYPE into a pane (cl compact's binding check) must
+    # not then have the stop KILL it by name.
+    if [ "$agent" != "codex" ]; then
+      local _tb
+      _tb=$(tmux_claude_binding "$t" "$sid" "$name")
+      case "$_tb" in
+        foreign:*)
+          printf '⚠ leaving %s — the tmux session at %s is stamped as a %s session, not this one; not cl'"'"'s to kill.\n' "$name" "$t" "${_tb#foreign:}" >&2
+          return 4 ;;
+        unbound)
+          # This outranks any idle proof: the proof is about a transcript, and
+          # nothing ties that transcript to what is running in this session.
+          ask_why="cl cannot tie the tmux session at $t to this session (no matching stamp, and its process is not in that session's panes)$( [ "$idle_proven" = "ask" ] && printf '; also, %s' "$ask_why" )"
+          idle_proven="ask" ;;
+      esac
+    fi
+    _rs_recheck
     if [ "$idle_proven" = "ask" ]; then
       printf '⏳ "%s": %s. Kill it anyway? [y/N] ' "$name" "$ask_why" >&2
       read -r ans </dev/tty
@@ -3416,6 +3488,7 @@ retire_session() {
     tmux*) printf '⚠ skipping %s — owned by a tmux server not visible here\n' "$name" >&2; return 2 ;;
   esac
 
+  _rs_recheck
   if [ "$idle_proven" = "ask" ]; then
     printf '⏳ "%s" (pid %s): %s. Kill it anyway? [y/N] ' "$name" "$pid" "$ask_why" >&2
     read -r ans </dev/tty
@@ -5138,7 +5211,12 @@ do_stop() {
           n_ronly=$((n_ronly+1))
           [ -n "${_h_taken[$i]}" ] || _h_taken[$i]="resume"
           [ -n "${_h_why[$i]}" ] || _h_why[$i]="ok"
-          [ "${_h_taken[$i]}" = "compact-resume" ] && [ "${_h_cidle[$i]}" = "1" ] && _idle=1
+          if [ "${_h_taken[$i]}" = "compact-resume" ]; then
+            # Compacted but never seen at rest since: work that started right
+            # after /compact, before the proof, may be a quiet turn the busy
+            # heuristic cannot see, so the decision is forced, not handed back.
+            if [ "${_h_cidle[$i]}" = "1" ]; then _idle=1; else _idle="noproof"; fi
+          fi
         fi
         ;;
       handoff)
@@ -5209,16 +5287,20 @@ do_stop() {
     # Evidence the session may be working, which the busy heuristic cannot see
     # (a quiet turn has no wake-lock or CPU), forces the question rather than
     # handing the decision back to that heuristic.
+    # The re-check against the transcript happens inside retire_session, after
+    # the kill target is resolved and right before the kill (the index passed
+    # last), so as little time as possible separates it from the destructive
+    # call. That narrows the window; it cannot close it.
     _ask_why=""
-    if [ "$_idle" = "1" ] && ! compact_still_at_rest "$i"; then
-      _idle="ask"; _ask_why="it was written to after it compacted, so it may be working"
+    if [ "$_idle" = "noproof" ]; then
+      _idle="ask"; _ask_why="it was not seen at rest after it compacted, so it may be working"
     fi
     # /compact was typed and never confirmed: it may be running now, quietly.
     # "Resume as-is" is what the next start does, not a licence to kill now.
     if [ "${_h_why[$i]}" = "no-boundary" ]; then
       _idle="ask"; _ask_why="it may still be compacting (/compact was never confirmed)"
     fi
-    rrc=0; retire_session "$name" "$sid_i" "$t" "$close_tabs" "$agent" "$_idle" "$_ask_why" || rrc=$?
+    rrc=0; retire_session "$name" "$sid_i" "$t" "$close_tabs" "$agent" "$_idle" "$_ask_why" "$i" || rrc=$?
     # Logged AFTER the kill, so a session the stop could not retire is not
     # recorded as a clean stop: its path stays (what the next start will do),
     # its reason says what this stop did, and it counts as kept.
