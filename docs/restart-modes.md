@@ -167,7 +167,10 @@ need be) to
 (`node -e … -- …/cli.js`) is data, not what node runs. Then `--resume <id>` or
 `--session-id <id>` must be two adjacent argv elements after it and before
 any `--` (the rest is prompt text), every such option must name this id (given
-two, the client may run the other), and `--fork-session` disqualifies. The
+two, the client may run the other), any other session selector (`-r`,
+`--resume=…`, `--session-id=…`, `-c`/`--continue`) disqualifies — failing
+closed even on a genuine `--resume=<id>`, a form cl never launches — and so
+does `--fork-session`. The
 entry must resolve to a FILE (node runs a directory's `index.js`). On macOS the
 argv is read past the exec path's padding exactly — `roundup(len + 1, 8)`
 bytes, measured across path lengths — so an empty `argv[0]`, which a parser

@@ -534,6 +534,15 @@ fi
 "$FIX/fake/claude" --resume sid-x --resume sid-other </dev/null >/dev/null 2>&1 & p_two=$!
 "$FIX/fake/claude" --session-id sid-x --resume sid-other </dev/null >/dev/null 2>&1 & p_two_mixed=$!
 "$FIX/fake/claude" --resume sid-x -- --resume sid-other </dev/null >/dev/null 2>&1 & p_after_dd=$!
+# Every other way the CLI selects a session, beside a correct --resume <sid>.
+p_sel=""; sel_forms=""
+for form in "-r sid-other" "-rsid-other" "--resume=sid-other" "--session-id=sid-other" "-c" "--continue"; do
+  # shellcheck disable=SC2086
+  "$FIX/fake/claude" --resume sid-x $form </dev/null >/dev/null 2>&1 &
+  p_sel="$p_sel $!"; sel_forms="$sel_forms|$form"
+done
+"$FIX/fake/claude" --resume=sid-x </dev/null >/dev/null 2>&1 & p_eqform=$!
+"$FIX/fake/claude" --resume "" </dev/null >/dev/null 2>&1 & p_emptysid=$!
 # A DIRECTORY named cli.js: node would run its index.js.
 DIRCLI="$FIX/dircli/@anthropic-ai/claude-code/cli.js"
 mkdir -p "$DIRCLI"; printf '// index\n' > "$DIRCLI/index.js"
@@ -576,6 +585,14 @@ check "negative: --resume <sid> after -- (it is prompt text)" "1" "$(argv_ok "$p
 check "negative: --resume <sid> --resume <other>" "1" "$(argv_ok "$p_two" sid-x)"
 check "negative: --session-id <sid> --resume <other>" "1" "$(argv_ok "$p_two_mixed" sid-x)"
 check "positive: --resume <sid>, then -- and prompt text naming another" "0" "$(argv_ok "$p_after_dd" sid-x)"
+k=1
+for pp in $p_sel; do
+  k=$((k+1)); form=$(printf '%s' "$sel_forms" | cut -d'|' -f"$k")
+  check "negative: --resume <sid> together with $form" "1" "$(argv_ok "$pp" sid-x)"
+done
+check "negative (fail closed): --resume=<sid> alone is not accepted either" "1" "$(argv_ok "$p_eqform" sid-x)"
+check "negative: an empty session id matches nothing" "1" "$(argv_ok "$p_native" "")"
+check "…not even a client launched with --resume \"\"" "1" "$(argv_ok "$p_emptysid" "")"
 pad_ok=""; pad_argv0=""; k=0
 for pp in $p_pad; do
   k=$((k+1)); pad_ok="$pad_ok$(argv_ok "$pp" "sid-pad-$k")"
@@ -629,7 +646,7 @@ check "…control: the same answer from a read that succeeds is accepted" "0" \
 kill "$p_execa" 2>/dev/null; wait "$p_execa" 2>/dev/null
 check "a process that is gone" "1" "$(argv_ok "$p_execa" sid-x)"
 kill "$p_native" "$p_versions" "$p_node" "$p_nodebin" "$p_node_e" "$p_node_p" "$p_node_req" "$p_node_other" "$p_node_flag" "$p_node_dd" "$p_node_rel" "$p_node_look" "$p_argv0e" "$p_argv0n" ${p_realargv0:+"$p_realargv0"} \
-  "$p_dd_prompt" "$p_two" "$p_two_mixed" "$p_after_dd" "$p_dircli" $p_pad \
+  "$p_dd_prompt" "$p_two" "$p_two_mixed" "$p_after_dd" "$p_dircli" $p_pad $p_sel "$p_eqform" "$p_emptysid" \
   "$p_fork" "$p_oneword" "$p_python" "$p_execa2" ${p_realnode:+"$p_realnode"} 2>/dev/null
 wait 2>/dev/null
 

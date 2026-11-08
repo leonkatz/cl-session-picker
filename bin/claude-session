@@ -2725,8 +2725,9 @@ proc_identity() {
 #     argv is data, not what node runs;
 #   * this session: `--resume <sid>` or `--session-id <sid>` as two ADJACENT
 #     argv elements, after the executable (after the entry script for node)
-#     and before any `--` (what follows is the prompt), and EVERY such option
-#     naming <sid>;
+#     and before any `--` (what follows is the prompt), EVERY such option
+#     naming <sid>, and no other session selector at all (-r, --resume=,
+#     --session-id=, -c/--continue);
 #   * not a fork: no `--fork-session` element — a fork's argv names the session
 #     it forked FROM, not the one it is.
 # The read's exit status is honoured (through a file, not a process
@@ -2736,6 +2737,7 @@ proc_identity() {
 _claude_argv_session() {
   local pid="$1" sid="$2" exe a i n from entry idf
   local -a f=() av=()
+  [ -n "$sid" ] || return 1
   idf=$(mktemp "${TMPDIR:-/tmp}/clid.XXXXXX" 2>/dev/null) || return 1
   if ! proc_identity "$pid" > "$idf"; then rm -f "$idf"; return 1; fi
   while IFS= read -r -d '' a; do f+=("$a"); done < "$idf"
@@ -2771,6 +2773,11 @@ _claude_argv_session() {
   # The session pair, among the OPTIONS only: after `--` the rest is the
   # prompt, text that may say anything. And every --resume/--session-id must
   # name this session: given two, the process may run the other one.
+  # Any OTHER way of choosing a session refuses outright: -r (and -r<x>),
+  # --resume=<x>, --session-id=<x>, -c/--continue. The CLI accepts them, so
+  # beside `--resume <sid>` they mean the process may run a different
+  # session. A genuine `--resume=<sid>` is rejected with them — failing closed
+  # costs nothing, as cl never launches that form.
   local seen=0
   for (( i=from; i<n; i++ )); do
     case "${av[$i]}" in
@@ -2778,6 +2785,7 @@ _claude_argv_session() {
       --resume|--session-id)
         [ "${av[$((i+1))]:-}" = "$sid" ] || return 1
         seen=1; i=$((i+1)) ;;
+      -r|-r*|--resume=*|--session-id=*|-c|--continue) return 1 ;;
     esac
   done
   [ "$seen" = 1 ]
