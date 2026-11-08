@@ -285,19 +285,94 @@ are re-offered to the new thread by the watcher's own re-send.
 - **The stop** records the Codex mode on the row (`--no-handoff` makes it
   `resume`, as for Claude; `--require-handoff` does not change a Codex row) and
   says so for a fresh one. Codex rows stay out of the rotation log.
-- **Step 3** sets the row's `mode` to `resume` and keeps the old id as
-  `fresh_from`, under the same lock `ack_state_row` takes. If the launch that
-  follows is refused and the row stays for a later start, that start resumes
-  the new thread instead of making another.
-- **Undoing a failure.** A new thread that will not be used is archived, so two
-  threads never share the name (discovery is newest-wins, and the empty one
-  would win). A failed step 3 unarchives the old thread first. Archive and
-  unarchive are judged by where the rollout ends up, not only by exit code.
+- **A persisted transaction** (from the design review's requirement 2). One
+  file per Codex session name under `~/.config/claude-session/codex-fresh/`
+  records `old_sid`, `new_sid`, a cycle id and the phase, each written before
+  the boundary it names is crossed: `begun` (before thread/start), `created`
+  (the new id, before naming), `named` (name read back, rollout visible),
+  `archived` (old thread hidden; recovery entry written), `rewritten` (row on
+  the new id), `launching`. The file is removed once the launch is verified.
+  A `cl start` that finds one carries that transaction on.
+- **Rollback, explicitly.** Only before `archived`: the new thread (if any) is
+  archived so two threads never share the name, the transaction removed, and
+  the old thread resumed plainly. From `archived` on it only rolls forward — a
+  failed row write launches nothing and leaves the transaction for the next
+  start, which resumes the same new thread. Unarchive is never automatic; it is
+  the printed way back. The archive is judged by its postcondition, not the
+  command's exit status: a reply lost after the side effect still counts as
+  archived (roll forward); still listed means it did not happen (roll back);
+  neither listed nor in `archived_sessions/` stops the run as
+  `archive-uncertain`, discarding nothing and launching nothing. A rollback
+  also refuses unless the old thread is still listed.
+- **Not exactly-once, and nothing is adopted.** A run that dies after
+  thread/start takes effect but before `created` is written leaves a thread
+  whose id was never saved. Whose a thread is cannot be established from local
+  storage, so cl never adopts one: not by age, cwd, being the only candidate,
+  or even the creation marker it passes to thread/start (`threadSource =
+  cl-fresh:<cycle>`, which Codex 0.163 writes into the rollout's
+  `session_meta.thread_source`). The marker only DETECTS: a retry at `begun`
+  that finds a thread carrying it stops, names it, and prints how to settle it
+  by hand; nothing is made, archived or launched. No marked thread means
+  creation starts over. In the probe, an unnamed thread whose app-server exits
+  writes no rollout, so in practice there is nothing to find; a Codex that did
+  persist one without the marker would get a second thread, never a stolen
+  one.
+- **Probed against Codex 0.163.0** (throwaway `CODEX_HOME`, no credentials):
+  `thread/start` alone, with the app-server closed before naming, wrote no
+  rollout, and a second app-server then refused both `thread/name/set` ("no
+  rollout found") and `thread/read` ("thread not loaded"). Once a thread was
+  named, a second app-server could rename it and read the name back. So a
+  `created` retry works for a named rollout, and fails closed — a rollback,
+  the old thread untouched — when there is none. `thread/list` returned no
+  threads in that setup. The same probe showed `threadSource` passed to
+  thread/start returned by thread/start and thread/read and written to the
+  rollout as `thread_source`.
+- **Serialised.** The whole sequence runs under a per-name claim taken before
+  any thread is made; the row is read again inside it. A second `cl start`
+  waits up to `CL_FRESH_CLAIM_WAIT` (10s) and then leaves it to the first. The
+  claim is a symlink made with `ln -sn`; anything else at its path (a
+  directory, a file) is refused. A claim whose holder has died is NOT taken
+  over: every takeover protocol reduces to compare-then-delete somewhere, and
+  a late delete can remove a live claim. The start refuses and prints how to
+  check that nothing is still working on it (`ps -p <pid>`, `pgrep` for
+  another `cl start`) and a removal conditional on the link still naming that
+  exact dead holder. A refused start is the accepted cost.
+- **Launch acceptance.** The row stays mode `fresh` with `fresh_pending` = the
+  cycle until the launch is verified as codex on the new id: a tmux session
+  stamped for that id whose pane runs Codex resuming that id, or cl's launch
+  record for that name and id, running the same. "Runs Codex" is read from
+  the kernel, not `ps`: `proc_identity` (shared with the Claude side) gives
+  the executing image's path (libproc `proc_pidpath`) and argv with its real
+  boundaries (`KERN_PROCARGS2`), through `python3 -I`. The executable must be
+  named `codex`, or be `node` whose argv[1] — the entry script, with no node
+  options before it, not itself an option, and an absolute path (a relative
+  one would be resolved in cl's directory, not the launch's) — resolves to
+  `…/@openai/codex/bin/codex.js` (`node -e …`, `-p`, `--require x` would run
+  other code with that path as mere data); then the first argv element past
+  the options must be `resume`, followed by the id. `ps -o command=` would split one
+  argv[0] of `codex resume <id>` into three words, and `ps -o comm=` follows
+  `exec -a`. An identity that cannot be read — no python3, a failed read, a
+  process gone — is no evidence.
+  The journal is removed only once the row's move to `resume` has been
+  written and read back; if it cannot be, the journal and the pending row
+  both stay.
+- **Coordination is reported, not claimed.** A verified launch does not show
+  which thread a configured lane now elects: that moves on the new thread's
+  first SessionStart, which cl cannot see. With a re-arm helper installed, cl
+  says the lane is not verified; without one, there is no lane to wait for. Unverified, the transaction stays at
+  `launching` and the row is kept; the next start (or stop) verifies and
+  settles it, or relaunches the same thread. A session left unstamped by a
+  start killed mid-launch is adopted only when its pane runs exactly the
+  pending new id. Archive is judged by where the rollout ends up, not only by
+  exit code, and an old thread already archived by an interrupted run counts
+  as archived.
 - **Never archive a running thread.** If a local process is resuming the old
   thread, or cl's launch record says one is, the replacement is refused and the
   thread resumed plainly.
 - **The bare-tab path** carries the mode and the old id in the tab command
-  (`cl --codex "Name" --restart-mode fresh <old-id>`); the tab does steps 1-4.
+  (`cl --codex "Name" --restart-mode fresh <old-id>`); the tab does steps 1-4
+  under the claim and does not acknowledge the row (its exec cannot see the
+  agent start); the next `cl start` verifies the launch record and settles it.
   A tab that runs after the name has moved on to another thread resumes that
   thread rather than replacing it. Because `cl start` re-arms the lanes before
   its tabs run, archive-before-rearm does not hold here: until the new thread's
@@ -305,8 +380,8 @@ are re-offered to the new thread by the watcher's own re-send.
 - **`CL_ROTATE`** set to `fresh` or `resume` (or `0`/`off`) applies to a Codex
   session for that stop; a Claude-only mode in it does not change a Codex row.
 - **A refused tmux launch after steps 1-3** keeps the row (now on the new id,
-  mode `resume`), records the old id in `fresh-history.json` and prints its
-  recovery command, as the other failure paths do.
+  still pending) and the transaction, and prints the recovery command; the old
+  id was recorded in `fresh-history.json` at the archive.
 
 ## `cl compact`: steps 2-5 without a stop
 

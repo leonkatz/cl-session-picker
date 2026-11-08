@@ -482,11 +482,38 @@ and moves the saved row onto the new id. Only then does the ordinary path run
 `codex resume <new-id> "<first prompt>"`, so the new thread is owned, stopped
 and listed like any other, and its first turn fires the repo's SessionStart
 hook. The first prompt comes from
-`~/.config/claude-session/codex-fresh-prompt.txt` or a one-line default. If any
-of those steps fails, what was done is undone (the new thread archived, the old
-one unarchived) and the old thread is resumed plainly, with the reason printed.
-The old id is kept in `fresh-history.json`, with the command to bring it back
-(`codex unarchive <id> && codex resume <id>`). `CL_CODEX_RPC_TIMEOUT` (default
+`~/.config/claude-session/codex-fresh-prompt.txt` or a one-line default.
+
+The swap is a **transaction**, written down before each step in
+`~/.config/claude-session/codex-fresh/` and run under a per-session claim, so a
+second `cl start` waits for it (up to `CL_FRESH_CLAIM_WAIT`, default 10s) or
+leaves it alone — it never runs a swap of its own. A failure **before** the old
+thread is archived is rolled back: the new thread is archived, and the old one
+resumed plainly with the reason printed. **From the archive on, it only rolls
+forward**: the new thread was named and checked first, so if anything later
+fails — or `cl` itself is killed — the next `cl start` finds the pending
+transaction and carries on with that same new thread. It never makes another,
+and never resumes the archived old one. The row is settled (mode `resume`) only
+once the launch is verified as codex running on the new id: a `cl`-stamped
+tmux session with that process inside its pane, or `cl`'s launch record in the
+iTerm shape (checked by the next `cl start`, since the tab's own process has
+become the agent). "Codex" is checked against the process's real executable
+and argv as the kernel records them (which needs `python3`; without it nothing
+is accepted), and the journal is kept until the row's settling is written. An
+archive is judged by where the old rollout ended up, not by the command's exit
+status; when that cannot be told, the run stops without discarding anything. A
+crash in the moment between a thread being made and its id being saved is not
+recovered automatically: if a thread carrying the replacement's creation
+marker turns up, the retry stops and names it for you to settle — so this is
+not exactly-once, but it never adopts a thread it cannot prove it made. A
+claim left by a killed `cl start` is never taken over: the next start refuses
+and prints how to check nothing is still working on it, and the exact,
+conditional command to clear it.
+A verified launch does not prove a coordination lane has moved to the new
+thread; with a re-arm helper installed, `cl` says so rather than reporting it
+done. The old id is kept in `fresh-history.json` the moment it is
+archived, with the command to bring it back (`codex unarchive <id> && codex
+resume <id>`); unarchiving is never automatic. `CL_CODEX_RPC_TIMEOUT` (default
 20s) bounds each app-server request.
 
 Without tmux (the iTerm shape) the new thread is made by the session's tab,
