@@ -383,6 +383,15 @@ stamp (`@cl_agent` / `@cl_sid`, set when `cl` creates the session). A matching
 tmux *name* is not proof: the name is derived from the display name and the
 derivation collides.
 
+A tmux-hosted Claude session follows the same rule, with these differences:
+- A session stamped for another agent is left alone.
+- A Claude stamp with this session's id is killed as before.
+- Anything weaker is killed only if the session's own process is found running in one of that tmux session's panes. Weaker means:
+  - no stamp at all, which covers every session from before stamps were readable;
+  - a `-` id;
+  - a different id. A fresh rotation keeps the id it rotated from.
+- Otherwise the stop asks first, and an unattended stop leaves the session running.
+
 A Codex session it has no record for is reported and left running, with its own
 tab to close — but only when something suggests it is actually being served.
 Stored threads with no process produce no warning at all:

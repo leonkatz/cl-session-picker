@@ -105,7 +105,7 @@ def after_compact():
 if os.environ.get("AGENT_BUSY") == "1":
     import subprocess
     # argv[0] "caffeinate": what claude_busy looks for among the pane's children.
-    subprocess.Popen(["caffeinate", "6061"], executable="/bin/sleep",
+    subprocess.Popen(["caffeinate", os.environ.get("AGENT_BUSY_TAG", "6061")], executable="/bin/sleep",
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 def boundary(trigger, pre, post):
     rec({"type": "system", "subtype": "compact_boundary",
@@ -232,6 +232,17 @@ try:
                 after_compact()
                 continue
             after_compact()
+            if mode in ("wakes", "wakes-user"):
+                # At rest after compacting, then a queued lane note is delivered
+                # and starts a new turn: the stop must see it before the kill.
+                time.sleep(float(os.environ.get("AGENT_WAKE", "2.5")))
+                if mode == "wakes":
+                    rec({"type": "queue-operation", "operation": "enqueue", "content": "lane note"})
+                rec({"type": "user", "message": {"role": "user", "content": "lane note"}})
+            if mode == "queued":
+                # A note queued the moment the compaction ended, inside the idle
+                # proof's size mark and never yet a conversation record.
+                rec({"type": "queue-operation", "operation": "enqueue", "content": "lane note"})
 finally:
     termios.tcsetattr(fd, termios.TCSADRAIN, old)
 PYEOF
@@ -241,21 +252,37 @@ mk_agent() { # <name> <sid> <mode> [delay] [chars lost from the first arrival]
   # process's children for caffeinate. AGENT_BUSY comes from the caller's env.
   printf '{"cwd":"%s"}\n{"customTitle":"%s"}\n' "$FIX/work" "$1" > "$PROJ/$2.jsonl"
   rtmux new-session -d -s "$1" -c "$FIX" \
-    "AGENT_BUSY='${AGENT_BUSY:-0}' AGENT_MODE='$3' AGENT_DELAY='${4:-0.5}' AGENT_DROP='${5:-0}' AGENT_TRANSCRIPT='$PROJ/$2.jsonl' AGENT_RECV='$FIX/recv-$1.txt' exec python3 '$AGENT'" 2>/dev/null \
+    "AGENT_BUSY='${AGENT_BUSY:-0}' AGENT_BUSY_TAG='$BUSY_TAG' AGENT_MODE='$3' AGENT_DELAY='${4:-0.5}' AGENT_DROP='${5:-0}' AGENT_TRANSCRIPT='$PROJ/$2.jsonl' AGENT_RECV='$FIX/recv-$1.txt' exec python3 '$AGENT'" 2>/dev/null \
     || setup_failed "could not start the agent for $1"
-  # Bound as cl's own sessions are: stamped as cl stamps the panes it launches
-  # (tmux_claim), and with Claude Code's own registry entry placing the
-  # session's process in the pane — cl reads a process's identity from the
-  # kernel, so a Python stand-in is not Claude by its argv, and the registry
-  # (validated by cl's production check: pid, sessionId, start time) is the
-  # tie. cl types only into a pane holding that process.
-  reg_claude "$HOME/.claude/sessions" "$(rtmux list-panes -t "=$1" -F '#{pane_pid}' 2>/dev/null | head -1)" "$2" \
-    || setup_failed "could not register $1"
-  stamp "$1" claude "$2"
+  # Stamped the way cl stamps the sessions it creates, since only that (or the
+  # session's process found in its panes) lets the stop kill it. MK_STAMP=none
+  # leaves it unstamped; any other value stamps it as that agent.
+  case "${MK_STAMP:-claude}" in
+    none) ;;
+    *) rtmux set-option -t "=$1:" @cl_agent "${MK_STAMP:-claude}" >/dev/null 2>&1
+       rtmux set-option -t "=$1:" @cl_sid "$2" >/dev/null 2>&1 ;;
+  esac
+  # A stamp alone never lets the stop kill: the session's process must be found
+  # in a pane. A python stand-in is not a claude executable, so it is tied the
+  # way Claude Code ties itself, through its own registry. MK_TIE=0 skips it.
+  [ "${MK_TIE:-1}" = "1" ] && register_pane "$1" "$2"
+  return 0
 }
+register_pane() { # <tmux-session> <sid>: Claude's registry entry for its pane process
+  local pp lst
+  pp=$(rtmux list-panes -t "=$1" -F '#{pane_pid}' 2>/dev/null | head -1)
+  [ -n "$pp" ] || return 0
+  lst=$(TZ=UTC ps -p "$pp" -o lstart= 2>/dev/null | tr -s ' ' | sed 's/^ //; s/ $//')
+  mkdir -p "$HOME/.claude/sessions"
+  jq -n --arg s "$2" --argjson p "$pp" --arg ps "$lst" '{pid: $p, sessionId: $s, procStart: $ps}' \
+    > "$HOME/.claude/sessions/$pp.json"
+}
+# Per run, so a suite running beside this one cannot kill its busy stand-ins
+# (or have them killed): every reset pkills the tag.
+BUSY_TAG=$((7000 + $$ % 2000))
+reset() { rtmux kill-server >/dev/null 2>&1; pkill -f "^caffeinate $BUSY_TAG\$" 2>/dev/null; rm -rf "$HOME/.claude/sessions"; rm -f "$PROJ"/*.jsonl "$FIX"/recv-*.txt "$STATEDIR/state.json" "$STATEDIR/rotation-log.tsv"; }
 stamp() { rtmux set-option -t "=$1:" @cl_agent "$2" >/dev/null && rtmux set-option -t "=$1:" @cl_sid "$3" >/dev/null \
   || setup_failed "could not stamp $1"; }
-reset() { rtmux kill-server >/dev/null 2>&1; pkill -f '^caffeinate 6061$' 2>/dev/null; rm -f "$PROJ"/*.jsonl "$FIX"/recv-*.txt "$STATEDIR/state.json" "$STATEDIR/rotation-log.tsv"; rm -rf "$HOME/.claude/sessions"; }
 . "$HERE/lib-fake-claude.sh"
 stop_run() { # <out-file> [extra env...] -- [stop flags...]
   local out="$1"; shift
@@ -329,7 +356,7 @@ sleep 0.5
 # claude_busy reads as mid-task (the Reader case below shows the prompt fire).
 rest_pane=$(rtmux list-panes -t =Rest -F '#{pane_pid}' 2>/dev/null | head -1)
 check "the premise: the pane's process has a caffeinate child" "1" \
-  "$(pgrep -P "$rest_pane" -f '^caffeinate 6061$' >/dev/null 2>&1 && echo 1 || echo 0)"
+  "$(pgrep -P "$rest_pane" -f "^caffeinate $BUSY_TAG\$" >/dev/null 2>&1 && echo 1 || echo 0)"
 stop_run "$FIX/rest.out"
 rest="$(cat "$FIX/rest.out")"
 contains "the ESC-styled Compacted output confirms the compaction" "$rest" '✓ "Rest" compacted'
@@ -348,9 +375,86 @@ reader="$(cat "$FIX/reader.out")"
 contains "the compaction is still confirmed" "$reader" '✓ "Reader" compacted'
 check "the premise: a tool_result names SessionStart and compact" "1" \
   "$(grep -c '"tool_result".*SessionStart.*compact' "$PROJ/sid-rd.jsonl" | awk '{print ($1>0)}')"
-contains "the mid-task prompt is shown" "$reader" '"Reader" looks mid-task'
+contains "it is asked about, because it was never seen at rest" "$reader" '"Reader": it was not seen at rest after it compacted'
 check "…declined unattended, so the session is left running" "1" "$(rtmux list-sessions 2>/dev/null | grep -c '^Reader')"
 check "…and the stop says so by exiting non-zero" "1" "$(cat "$FIX/reader.out.rc")"
+reset
+
+echo "…and a QUIET one doing that work is asked about too, not handed to the busy check"
+# Nothing about it looks busy, so only the missing idle proof can save it.
+mk_agent QuietReader sid-qr busy-reader
+sleep 0.5
+stop_run "$FIX/qreader.out"
+qreader="$(cat "$FIX/qreader.out")"
+contains "the compaction is confirmed" "$qreader" '✓ "QuietReader" compacted'
+check "the premise: tool work follows the compaction" "1" \
+  "$(grep -c '"tool_result"' "$PROJ/sid-qr.jsonl" | awk '{print ($1>0)}')"
+contains "it is asked about, with the reason" "$qreader" '"QuietReader": it was not seen at rest after it compacted'
+check "…declined unattended, so it is left running" "1" "$(rtmux list-sessions 2>/dev/null | grep -c '^QuietReader')"
+check "…and the stop exits non-zero" "1" "$(cat "$FIX/qreader.out.rc")"
+reset
+
+echo "the stop kills a tmux session only when it is bound to this session"
+# A session stamped for another agent is someone else's: left, unasked.
+MK_STAMP=codex mk_agent Foreign sid-fg ok
+sleep 0.5
+stop_run "$FIX/foreign.out"
+contains "a session stamped for another agent is left alone" "$(cat "$FIX/foreign.out")" \
+  'leaving Foreign — the tmux session at Foreign is stamped as a codex session'
+check "…and it is still running" "1" "$(rtmux list-sessions 2>/dev/null | grep -c '^Foreign')"
+reset
+# Unstamped, with nothing tying its process to the session: asked, not killed.
+MK_TIE=0 MK_STAMP=none mk_agent Loose sid-ls ok
+sleep 0.5
+stop_run "$FIX/loose.out"
+contains "an unstamped, untied session is asked about" "$(cat "$FIX/loose.out")" \
+  '"Loose": cl cannot tie the tmux session at Loose to this session'
+check "…declined unattended, so it is left running" "1" "$(rtmux list-sessions 2>/dev/null | grep -c '^Loose')"
+check "…and the stop exits non-zero" "1" "$(cat "$FIX/loose.out.rc")"
+reset
+# Stamped with this exact SID, but nothing of the session is running in it
+# (Claude exited, its window stayed): a stamp alone does not bind.
+MK_TIE=0 mk_agent Stale sid-st ok
+sleep 0.5
+stop_run "$FIX/stale.out"
+contains "an exact stamp with no live process is asked about" "$(cat "$FIX/stale.out")" \
+  '"Stale": cl cannot tie the tmux session at Stale to this session'
+check "…declined unattended, so it is left running" "1" "$(rtmux list-sessions 2>/dev/null | grep -c '^Stale')"
+reset
+# Unstamped (every session from before stamps were readable), but Claude's own
+# registry places this session's process in the pane: that is the binding.
+TIED_SID=0f6b1c2e-4d5a-4b7c-9e8f-1a2b3c4d5e6f
+MK_STAMP=none mk_agent Tied "$TIED_SID" ok
+sleep 0.5
+tied_pane=$(rtmux list-panes -t =Tied -F '#{pane_pid}' 2>/dev/null | head -1)
+mkdir -p "$HOME/.claude/sessions"
+jq -n --arg s "$TIED_SID" --argjson p "$tied_pane" --arg ps "$(TZ=UTC ps -p "$tied_pane" -o lstart= | tr -s ' ' | sed 's/^ //; s/ $//')" \
+  '{pid: $p, sessionId: $s, procStart: $ps}' > "$HOME/.claude/sessions/$tied_pane.json"
+stop_run "$FIX/tied.out"
+not_contains "an unstamped session tied by Claude's registry is not asked about" "$(cat "$FIX/tied.out")" 'cannot tie'
+check "…and it is stopped" "0" "$(rtmux list-sessions 2>/dev/null | grep -c '^Tied')"
+rm -rf "$HOME/.claude/sessions"
+reset
+
+echo "…and one written to after its idle proof is asked about, busy-looking or not"
+# The proof is taken in the compact phase; the kill comes later. A lane note
+# delivered in between starts a turn the skipped prompt would kill unasked —
+# and a quiet turn has no wake-lock or CPU, so the busy check must not decide.
+for case_ in "Woken:1:wakes" "QuietWoken:0:wakes" "UserOnly:0:wakes-user" "Queued:0:queued"; do
+  cname=${case_%%:*}; rest=${case_#*:}; cbusy=${rest%%:*}; cmode=${rest#*:}
+  reset
+  AGENT_BUSY=$cbusy AGENT_WAKE=2.5 mk_agent "$cname" "sid-$cname" "$cmode"
+  sleep 0.5
+  stop_run "$FIX/$cname.out" CL_COMPACT_IDLE_POLL=0.3 CL_COMPACT_SETTLE=5
+  cout="$(cat "$FIX/$cname.out")"
+  contains "$cname: the compaction is confirmed" "$cout" "✓ \"$cname\" compacted"
+  contains "$cname: it is asked about, with the reason" "$cout" "\"$cname\": it was written to after it compacted"
+  check "$cname: …declined unattended, so it is left running" "1" "$(rtmux list-sessions 2>/dev/null | grep -c "^$cname")"
+  check "$cname: …and the stop exits non-zero" "1" "$(cat "$FIX/$cname.out.rc")"
+  check "$cname: …and the log counts it as kept" "1" "$(log_field kept)"
+done
+check "the premise: Queued's enqueue is inside its proof, not after it" "queue-operation" \
+  "$(jq -r 'select(.type == "user" or .type == "assistant" or .type == "queue-operation") | .type' "$PROJ/sid-Queued.jsonl" | tail -1)"
 reset
 
 echo "retire_session skips its prompt only on the idle-proven argument"
@@ -365,6 +469,8 @@ rs() { # <idle-proven> -> the retire_session status
     tmux() { case "$1" in has-session) return 0 ;; kill-session) return 0 ;; esac; return 1; }
     session_busy() { return 0; }
     close_iterm_tab() { :; }
+    tmux_claude_binding() { printf '%s\n' "${RS_BIND:-bound}"; }
+    _rs_recheck() { :; }
     # The prompt reads /dev/tty, which a harness cannot feed; a function named
     # `read` answers "no" in its place (it sets the caller's local `ans`).
     read() { ans=n; return 0; }
@@ -373,6 +479,8 @@ rs() { # <idle-proven> -> the retire_session status
 }
 check "without proof of rest, a busy-looking session is asked about (and kept)" "1" "$(rs 0)"
 check "with it, the prompt is skipped and the session stopped" "0" "$(rs 1)"
+check "an unbound session is asked about even with the proof (and kept)" "1" "$(RS_BIND=unbound rs 1)"
+check "a foreign-stamped one is not cl's to stop, whatever the proof" "4" "$(RS_BIND=foreign:codex rs 1)"
 
 echo "the token counts only once the transcript has stopped growing"
 reset
@@ -439,8 +547,14 @@ check "the premise: an auto boundary really did land after it" "1" "$(boundaries
 not_contains "…and it is NOT reported as this compaction" "$autopost" '✓ "AutoPost" compacted'
 contains "the session resumes as-is when no manual boundary comes" "$autopost" '"AutoPost" did not confirm a compaction'
 check "…recorded as resume, not compact-resume" "resume" "$(row_field AutoPost mode)"
-check "…with the reason" "no-boundary" "$(log_field reasons)"
+check "…with the reason, and that it was left running" "no-boundary+left-running" "$(log_field reasons)"
 not_contains "…and no handoff is asked for (it would queue behind the compaction)" "$autopost" "handoff request"
+# /compact was typed and never confirmed, so it may be compacting quietly —
+# no wake-lock, no CPU. The busy check cannot see that; the stop must ask.
+contains "it is asked about, though nothing about it looks busy" "$autopost" '"AutoPost": it may still be compacting'
+check "…declined unattended, so it is left running" "1" "$(rtmux list-sessions 2>/dev/null | grep -c '^AutoPost')"
+check "…and the stop exits non-zero" "1" "$(cat "$FIX/autopost.out.rc")"
+check "…and the log counts it as kept" "1" "$(log_field kept)"
 
 # ── the token in the wrong place ────────────────────────────────────────────
 echo "the token inside a tool_result is not the end of the turn"
@@ -501,7 +615,7 @@ stop_run "$FIX/autotool.out" CL_COMPACT_TIMEOUT=4
 autotool="$(cat "$FIX/autotool.out")"
 contains "the auto compaction is noticed" "$autotool" '"AutoTool" compacted on its own before /compact'
 check "/compact is never typed" "0" "$(typed_compact AutoTool)"
-contains "the mid-task prompt is shown" "$autotool" '"AutoTool" looks mid-task'
+contains "it is asked about, never seen at rest since" "$autotool" '"AutoTool": it was not seen at rest after it compacted'
 check "…declined unattended, so the session is left running" "1" "$(rtmux list-sessions 2>/dev/null | grep -c '^AutoTool')"
 reset
 
