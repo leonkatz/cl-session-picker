@@ -78,12 +78,23 @@ touch -t "$(date -v-1H +%Y%m%d%H%M 2>/dev/null || date -d '-1 hour' +%Y%m%d%H%M)
 # gone. Detached stdio, because a child holding a $( ) pipe hangs the caller;
 # pids go to a file because $! set inside $( ) is lost with the subshell.
 LIVE_PIDS="$FIX/live.pids"
+# A Claude stand-in is a process whose real image is named claude, with real
+# argv (lib-fake-claude.sh): cl reads identity from the kernel, so an exec -a
+# sleeper is not Claude. Codex stand-ins keep the exec -a shape their own
+# checks read. Each slot's pid is kept, so a live one is not started twice.
+. "$(dirname "$CL")/../tests/lib-fake-claude.sh"
+need_fake_claude "$FIX/fakeclaude/claude"
 live_up() {
-  local argv
+  local argv i=0 pf
   for argv in "${LIVE_ARGV[@]}"; do
-    pgrep -f "^${argv} 600\$" >/dev/null 2>&1 && continue
-    /bin/sh -c "exec -a \"$argv\" sleep 600" </dev/null >/dev/null 2>&1 &
-    echo $! >> "$LIVE_PIDS"
+    i=$((i+1)); pf="$LIVE_PIDS.$i"
+    [ -f "$pf" ] && kill -0 "$(cat "$pf")" 2>/dev/null && continue
+    case "$argv" in
+      claude\ *) # shellcheck disable=SC2086
+                 "$FIX/fakeclaude/claude" ${argv#claude } </dev/null >/dev/null 2>&1 & ;;
+      *)         /bin/sh -c "exec -a \"$argv\" sleep 600" </dev/null >/dev/null 2>&1 & ;;
+    esac
+    echo $! > "$pf"; echo $! >> "$LIVE_PIDS"
   done
   sleep 0.3
 }

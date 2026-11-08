@@ -32,21 +32,22 @@ check() { if [ "$2" = "$3" ]; then pass=$((pass+1)); printf '  ok   %s\n' "$1"; 
 setup_failed() { printf 'FIXTURE SETUP FAILED: %s\n' "$1" >&2; exit 2; }
 
 LIB="$FIX/lib.sh"
-awk '!inf && /^(session_pid|claude_registry_pid|argv_resume_pid|registered_pid|reg_file|start_token|unbound_owner_pid|sid_shape_ok)\(\)/ {
+awk '!inf && /^(session_pid|claude_registry_pid|argv_resume_pid|argv_resume_pids|_claude_argv_session|proc_identity|registered_pid|reg_file|start_token|unbound_owner_pid|sid_shape_ok)\(\)/ {
        print; if ($0 ~ /}[[:space:]]*$/) next; inf=1; next }
      inf { print; if ($0 ~ /^}$/) inf=0 }' "$CL" > "$LIB"
-for fn in session_pid claude_registry_pid argv_resume_pid registered_pid reg_file start_token unbound_owner_pid sid_shape_ok; do
+# The identity reader's Python, which proc_identity runs, is a variable.
+awk '/^_CL_PROC_IDENTITY_PY=/{f=1} f{print} f && /^out.write\(exe/{getline; print; getline; print; exit}' "$CL" >> "$LIB"
+for fn in session_pid claude_registry_pid argv_resume_pid argv_resume_pids _claude_argv_session proc_identity registered_pid reg_file start_token unbound_owner_pid sid_shape_ok; do
   grep -q "^${fn}()" "$LIB" || setup_failed "could not extract ${fn}"
 done
 
 # A stand-in agent. NOT `exec sleep`: the process must keep its own argv, since
-# argv is precisely what the old lookup read and what the fork lies about.
+# argv is precisely what the old lookup read and what the fork lies about. And
+# its real image must be named claude (lib-fake-claude.sh): cl reads identity
+# from the kernel, so a shell script named claude is, correctly, sh.
 mkdir -p "$FIX/bin" "$FIX/reg" "$FIX/pids" || setup_failed "mkdir"
-cat > "$FIX/bin/claude" <<'SH'
-#!/bin/sh
-while :; do sleep 1; done
-SH
-chmod +x "$FIX/bin/claude"
+. "$HERE/lib-fake-claude.sh"
+need_fake_claude "$FIX/bin/claude"
 
 P="11111111-1111-4111-8111-111111111111"   # the parent's session id
 F="22222222-2222-4222-8222-222222222222"   # the fork's OWN, new id

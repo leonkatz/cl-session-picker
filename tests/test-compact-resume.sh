@@ -151,12 +151,27 @@ try:
             text = follow(pre.group(1))
             tok = re.search(r'(cl-done:[A-Za-z0-9-]+)', text).group(1)
             time.sleep(delay)
-            if mode == "auto-before":
+            if mode in ("auto-before", "auto-silent", "auto-text-tool"):
                 # A ~1M-token turn tipping over into an AUTO compaction mid-turn.
                 boundary("auto", 990000, 21000)
                 rec({"type": "user", "isCompactSummary": True,
                      "message": {"role": "user", "content": "summary of the conversation so far"}})
-            if mode == "toolresult-only":
+            if mode == "auto-silent":
+                # Compacted on its own, and the turn never ends with the token.
+                continue
+            if mode == "token-midline":
+                # The token, but not as the last line: the turn is still talking.
+                assistant([{"type": "text", "text": "I will end with " + tok + "\nStill working, not finished."}])
+            elif mode == "tool-then-text":
+                # A tool call with no result yet, then the token, in ONE record.
+                assistant([{"type": "tool_use", "id": "t2", "name": "Bash", "input": {"command": "sleep 60"}},
+                           {"type": "text", "text": tok}])
+            elif mode == "auto-text-tool":
+                # The token in text, then a tool call, in ONE record, after an
+                # AUTO compaction: neither finished nor at rest.
+                assistant([{"type": "text", "text": tok},
+                           {"type": "tool_use", "id": "t2", "name": "Bash", "input": {"command": "sleep 60"}}])
+            elif mode == "toolresult-only":
                 assistant([{"type": "text", "text": "Read it; doing the workflow now."}])
             elif mode == "text-then-tool":
                 # The token in text, but the turn goes on with a tool call.
@@ -266,6 +281,9 @@ register_pane() { # <tmux-session> <sid>: Claude's registry entry for its pane p
 # (or have them killed): every reset pkills the tag.
 BUSY_TAG=$((7000 + $$ % 2000))
 reset() { rtmux kill-server >/dev/null 2>&1; pkill -f "^caffeinate $BUSY_TAG\$" 2>/dev/null; rm -rf "$HOME/.claude/sessions"; rm -f "$PROJ"/*.jsonl "$FIX"/recv-*.txt "$STATEDIR/state.json" "$STATEDIR/rotation-log.tsv"; }
+stamp() { rtmux set-option -t "=$1:" @cl_agent "$2" >/dev/null && rtmux set-option -t "=$1:" @cl_sid "$3" >/dev/null \
+  || setup_failed "could not stamp $1"; }
+. "$HERE/lib-fake-claude.sh"
 stop_run() { # <out-file> [extra env...] -- [stop flags...]
   local out="$1"; shift
   local -a envs=() flags=()
@@ -569,6 +587,49 @@ contains "the fallback is announced" "$silent" 'no cl-done reply from "Silent" w
 contains "…a handoff is asked for" "$silent" 'asked "Silent" for'
 contains "…and with none arriving either, it stops and resumes as-is" "$silent" 'no handoff from "Silent"'
 check "the row says resume" "resume" "$(row_field Silent mode)"
+
+echo "a token that is not the last line is not the end of the turn (stop)"
+reset
+mk_agent MidLine sid-ml token-midline
+stop_run "$FIX/midline.out" CL_COMPACT_TIMEOUT=4 CL_HANDOFF_TIMEOUT=3
+check "the premise: the token IS in an assistant text block" "1" \
+  "$(grep '"assistant"' "$PROJ/sid-ml.jsonl" | grep -c 'I will end with cl-done:' | awk '{print ($1>0)}')"
+check "/compact is never typed" "0" "$(typed_compact MidLine)"
+contains "…it falls back to a handoff" "$(cat "$FIX/midline.out")" 'no cl-done reply from "MidLine"'
+
+echo "…nor is a token after a tool call in the same record (stop)"
+reset
+mk_agent ToolText sid-tx tool-then-text
+stop_run "$FIX/tooltext.out" CL_COMPACT_TIMEOUT=4 CL_HANDOFF_TIMEOUT=3
+check "/compact is never typed" "0" "$(typed_compact ToolText)"
+contains "…it falls back to a handoff" "$(cat "$FIX/tooltext.out")" 'no cl-done reply from "ToolText"'
+
+echo "after an auto compaction, a token beside a tool call is not 'at rest'"
+# The idle check's token arm uses the token rule itself: text then tool_use in
+# ONE record is a turn still running, so a busy-looking session is asked about
+# (declined unattended, left running) rather than retired unprompted.
+reset
+AGENT_BUSY=1 mk_agent AutoTool sid-at auto-text-tool
+sleep 0.5
+stop_run "$FIX/autotool.out" CL_COMPACT_TIMEOUT=4
+autotool="$(cat "$FIX/autotool.out")"
+contains "the auto compaction is noticed" "$autotool" '"AutoTool" compacted on its own before /compact'
+check "/compact is never typed" "0" "$(typed_compact AutoTool)"
+contains "it is asked about, never seen at rest since" "$autotool" '"AutoTool": it was not seen at rest after it compacted'
+check "…declined unattended, so the session is left running" "1" "$(rtmux list-sessions 2>/dev/null | grep -c '^AutoTool')"
+reset
+
+echo "a pane stamped as another agent's gets nothing typed (stop)"
+reset
+mk_agent Foreign sid-fo ok
+stamp Foreign codex "0a1b2c3d-1111-2222-3333-444455556666"
+stop_run "$FIX/foreign.out"
+foreign="$(cat "$FIX/foreign.out")"
+check "nothing is typed into it" "0" "$(nlines "$FIX/recv-Foreign.txt")"
+contains "…and it says why" "$foreign" '"Foreign": the tmux session at Foreign is stamped as a codex session — not typing into it; it will resume as-is'
+not_contains "no handoff is asked of it either" "$foreign" 'asked "Foreign" for'
+check "the row says resume" "resume" "$(row_field Foreign mode)"
+check "…with the reason logged" "foreign-pane" "$(log_field reasons)"
 
 # ── --no-handoff is the fast stop ───────────────────────────────────────────
 echo "--no-handoff skips compaction as well"
