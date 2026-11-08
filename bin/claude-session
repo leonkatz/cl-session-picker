@@ -2405,12 +2405,6 @@ codex_fresh_advance() {
   printf '%s' "$new"; return 0
 }
 
-# codex_launch_verified <name> <new> -> 0 when the process running is codex on
-# <new>, by the ownership rules retire_session trusts: a tmux session cl
-# stamped for that SID with a `codex … resume <new>` process inside its pane,
-# or cl's launch record for that name and SID (bare shape; exec keeps the pid
-# and start time the record names). tmux has-session alone proves a pane, not
-# an agent.
 # _codex_argv_resumes <pid> <id>: the process IS Codex resuming <id>, by its
 # real identity (proc_identity): the executable is named codex, or it is node
 # whose argv[1] — the entry script, with no node options before it — resolves
@@ -2418,12 +2412,14 @@ codex_fresh_advance() {
 # and, as real argv elements after that, the first word past the options is
 # `resume`, immediately followed by <id>. No python3, no identity: not Codex.
 _codex_argv_resumes() {
-  local pid="$1" new="$2" x exe base i n prev="" tok real j
+  local pid="$1" new="$2" x exe base i n tok real j
   local -a f=() av=()
   local idf
   # No id, no match: an empty target would compare equal to an empty argv
-  # element.
+  # element. Nor one starting with `-`: in argv it would read as an option
+  # (`--last` among them), never as the id. cl's ids are UUIDs.
   [ -n "$new" ] || return 1
+  case "$new" in -*) return 1 ;; esac
   # Through a file, so the read's exit status is honoured: an answer printed
   # by a read that then failed is no answer.
   idf=$(mktemp "${TMPDIR:-/tmp}/clid.XXXXXX" 2>/dev/null) || return 1
@@ -2457,8 +2453,30 @@ _codex_argv_resumes() {
       i=2 ;;
     *) return 1 ;;
   esac
+  # Codex's top-level options, from `codex --help` (0.163): those that take a
+  # value consume the next word, so a `resume` right after one is that VALUE
+  # and Codex starts a new session (`codex -c resume <id>`). Every other
+  # option is a flag and consumes nothing — assuming otherwise would read
+  # `--search x resume <id>` as Codex resuming, when x is the subcommand.
+  # -i/--image takes several values, so where it stops cannot be told; any
+  # -i before `resume` refuses. cl's own launch puts only CL_CODEX_ARGS before
+  # `resume`, and `codex -m gpt-5 resume <id>` still passes.
+  local takes_value=""
   while [ "$i" -lt "$n" ]; do
     tok="${av[$i]}"; i=$((i+1))
+    # The value of the option before it: consumed, whatever it says. A
+    # `resume` here is that value, so the id after it is then a bare word,
+    # which refuses below — `codex -c resume <id>` is a new session.
+    if [ -n "$takes_value" ]; then
+      takes_value=""
+      continue
+    fi
+    case "$tok" in
+      -i|--image|-i?*|--image=*) return 1 ;;
+      -c|--config|-m|--model|-p|--profile|-s|--sandbox|-C|--cd|-a|--ask-for-approval|\
+      --enable|--disable|--remote|--remote-auth-token-env|--local-provider|--add-dir)
+        takes_value=1; continue ;;
+    esac
     case "$tok" in
       resume)
         [ "$i" -lt "$n" ] && [ "${av[$i]}" = "$new" ] || return 1
@@ -2476,18 +2494,22 @@ _codex_argv_resumes() {
       # Before the subcommand, `--` ends the options: what follows is the
       # top-level prompt, so a `resume` there is text, not the subcommand.
       --) return 1 ;;
-      --*=*) prev="" ;;
-      -*) prev="$tok" ;;
-      *)
-        # A bare word is only allowed as the value of the option before it
-        # (`-m gpt-5`, `-c key=value`); any other word is a subcommand that
-        # is not `resume`.
-        case "$prev" in -*) prev="" ;; *) return 1 ;; esac ;;
+      # `--opt=value`, an attached short value (`-mgpt-5`), or a flag:
+      # nothing further is consumed.
+      -*) : ;;
+      # Any other bare word is a subcommand that is not `resume`.
+      *) return 1 ;;
     esac
   done
   return 1
 }
 
+# codex_launch_verified <name> <new> -> 0 when the process running is codex on
+# <new>, by the ownership rules retire_session trusts: a tmux session cl
+# stamped for that SID with a `codex … resume <new>` process inside its pane,
+# or cl's launch record for that name and SID (bare shape; exec keeps the pid
+# and start time the record names). tmux has-session alone proves a pane, not
+# an agent.
 codex_launch_verified() {
   local name="$1" new="$2" t
   t=$(tmux_name "$name" codex)

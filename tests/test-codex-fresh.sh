@@ -937,10 +937,30 @@ check "not a pid at all: no evidence" "1" \
   "$(env -i HOME="$HOME" PATH="/usr/bin:/bin" bash -c ". '$lib'; _codex_argv_resumes 'x;y' $NEW; echo \$?")"
 echo "the Codex predicate's argv rules, one control each (real executables, kernel identity)"
 # idcase <expect> <label> <id> <command…>: start it, ask the predicate, kill it.
+# The process is asked about only once it has become what it stands in for:
+# until the exec lands it is still bash, and every expect-1 case would pass
+# for the wrong reason. So it is polled (up to ~5s) until its kernel identity
+# names codex or node, and a case that never gets there FAILS. IDCASE_NOPOLL
+# is for the one case whose identity cannot be read by design (an empty
+# argv[0]); its revert check shows it is not vacuous.
 idcase() {
-  local want="$1" label="$2" id="$3"; shift 3
+  local want="$1" label="$2" id="$3" w=0 ex=""; shift 3
   ( exec "$@" ) </dev/null >/dev/null 2>&1 & local ip=$!
-  echo "$ip" >> "$FIX/procs"; sleep 0.4
+  echo "$ip" >> "$FIX/procs"
+  if [ -n "${IDCASE_NOPOLL:-}" ]; then
+    sleep 0.4
+  else
+    while [ "$w" -lt 50 ]; do
+      ex=$(env -i HOME="$HOME" PATH="/usr/bin:/bin" bash -c ". '$lib'; proc_identity $ip | tr '\\0' '\\n' | head -1")
+      case "${ex##*/}" in codex|node|nodejs) break ;; esac
+      sleep 0.1; w=$((w+1))
+    done
+    case "${ex##*/}" in
+      codex|node|nodejs) : ;;
+      *) bad "$label" "the stand-in never became codex or node (identity: [$ex])"
+         kill "$ip" 2>/dev/null; wait "$ip" 2>/dev/null; return ;;
+    esac
+  fi
   check "$label" "$want" \
     "$(env -i HOME="$HOME" PATH="/usr/bin:/bin" bash -c ". '$lib'; _codex_argv_resumes $ip '$id'; echo \$?")"
   kill "$ip" 2>/dev/null; wait "$ip" 2>/dev/null
@@ -950,12 +970,26 @@ idcase 1 "an empty target id matches nothing, even an empty argv element" "" bas
 idcase 1 "--last after the id may pick another thread" "$NEW" bash -c "exec -a codex '$FIX/stub/codex' resume $NEW --last"
 idcase 0 "…but --last after \`--\` is prompt text" "$NEW" bash -c "exec -a codex '$FIX/stub/codex' resume $NEW -- --last"
 idcase 1 "\`--\` before the subcommand makes resume prompt text" "$NEW" bash -c "exec -a codex '$FIX/stub/codex' -- resume $NEW"
+# A value-taking option before the subcommand consumes the next word: Codex
+# reads `resume` as its value and starts a new session.
+stub="$FIX/stub/codex"
+idcase 1 "-c resume NEW: resume is -c's value" "$NEW" bash -c "exec -a codex '$stub' -c resume $NEW"
+idcase 1 "--model resume NEW: resume is --model's value" "$NEW" bash -c "exec -a codex '$stub' --model resume $NEW"
+idcase 1 "-c resume NEW resume x: the first resume is a value, NEW a subcommand" "$NEW" bash -c "exec -a codex '$stub' -c resume $NEW resume x"
+idcase 1 "--search x resume NEW: --search is a flag, so x is the subcommand" "$NEW" bash -c "exec -a codex '$stub' --search x resume $NEW"
+idcase 1 "-i a resume NEW: -i takes several values, so it cannot be told where they end" "$NEW" bash -c "exec -a codex '$stub' -i a resume $NEW"
+idcase 1 "an id of --last is never an id" "--last" bash -c "exec -a codex '$stub' resume --last"
+idcase 0 "control: -m gpt-5 resume NEW" "$NEW" bash -c "exec -a codex '$stub' -m gpt-5 resume $NEW"
+idcase 0 "control: --oss resume NEW (a flag consumes nothing)" "$NEW" bash -c "exec -a codex '$stub' --oss resume $NEW"
+idcase 0 "control: --model=x resume NEW (the = form consumes nothing)" "$NEW" bash -c "exec -a codex '$stub' --model=x resume $NEW"
+idcase 0 "control: cl's own launch shape (CL_CODEX_ARGS, resume, id, -m, prompt)" "$NEW" \
+  bash -c "exec -a codex '$stub' --approve-for-me resume $NEW -m some-model 'cl started you as a new thread'"
 if command -v node >/dev/null 2>&1; then
   mkdir -p "$FIX/dirnm/@openai/codex/bin/codex.js"
   printf 'setTimeout(function(){}, 59000);\n' > "$FIX/dirnm/@openai/codex/bin/codex.js/index.js"
   idcase 1 "node on a DIRECTORY named codex.js (it runs index.js) is not the launcher" "$NEW" \
     node "$FIX/dirnm/@openai/codex/bin/codex.js" resume "$NEW"
-  idcase 1 "an empty argv[0] cannot shift node's entry script into place" "$NEW" \
+  IDCASE_NOPOLL=1 idcase 1 "an empty argv[0] cannot shift node's entry script into place" "$NEW" \
     bash -c "exec -a '' node '$FIX/nm/hold.js' '$FIX/nm/@openai/codex/bin/codex.js' resume $NEW"
   idcase 0 "control: node on the launcher itself" "$NEW" node "$FIX/nm/@openai/codex/bin/codex.js" resume "$NEW"
 else
