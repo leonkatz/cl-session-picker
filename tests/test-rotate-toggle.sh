@@ -69,17 +69,29 @@ BASEPATH="$FIX/bin:/usr/bin:/bin"
 # `cl stop` plans only for sessions that are RUNNING (session_is_live), so a
 # fixture of bare transcripts is a fleet of closed sessions with nothing to ask.
 # These stand-ins make each fixture session live the way a real one is found
-# here — argv `claude --resume <sid>`, with no Claude registry under this HOME.
+# here — a Claude client whose argv resumes <sid>, with no Claude registry
+# under this HOME.
 # A real stop kills them, so live_up runs before every stop and respawns what is
 # gone. Detached stdio, because a child holding a $( ) pipe hangs the caller;
 # pids go to a file because $! set inside $( ) is lost with the subshell.
 LIVE_PIDS="$FIX/live.pids"
+# A Claude stand-in is a process whose real image is named claude, with real
+# argv (lib-fake-claude.sh): cl reads identity from the kernel, so an exec -a
+# sleeper is not Claude. Codex stand-ins keep the exec -a shape their own
+# checks read. Each slot's pid is kept, so a live one is not started twice.
+. "$(dirname "$CL")/../tests/lib-fake-claude.sh"
+need_fake_claude "$FIX/fakeclaude/claude"
 live_up() {
-  local argv
+  local argv i=0 pf
   for argv in "${LIVE_ARGV[@]}"; do
-    pgrep -f "^${argv} 600\$" >/dev/null 2>&1 && continue
-    /bin/sh -c "exec -a \"$argv\" sleep 600" </dev/null >/dev/null 2>&1 &
-    echo $! >> "$LIVE_PIDS"
+    i=$((i+1)); pf="$LIVE_PIDS.$i"
+    [ -f "$pf" ] && kill -0 "$(cat "$pf")" 2>/dev/null && continue
+    case "$argv" in
+      claude\ *) # shellcheck disable=SC2086
+                 "$FIX/fakeclaude/claude" ${argv#claude } </dev/null >/dev/null 2>&1 & ;;
+      *)         /bin/sh -c "exec -a \"$argv\" sleep 600" </dev/null >/dev/null 2>&1 & ;;
+    esac
+    echo $! > "$pf"; echo $! >> "$LIVE_PIDS"
   done
   sleep 0.3
 }
@@ -542,14 +554,16 @@ has "the default stop compacts (dry run)" "$out" 'would ask "Alpha" to finish it
 has "…and says so per session" "$out" "rotation compact-resume"
 
 printf 'a compact-resume stop whose panes cannot be reached falls back, and logs why\n'
-# These stand-in sessions have no pane cl can type into. The pre-compact ask
-# cannot be sent, so each falls back to a handoff, which cannot be sent either,
-# and each is stopped and resumed as-is. The mode logged is still the one ASKED.
+# These stand-in sessions have no pane cl can type into: no tmux session, and
+# their processes are on no terminal, so cl cannot prove which window runs
+# them. Nothing is typed — not the pre-compact ask, and not a handoff ask,
+# which would go to the same unproven place — and each is stopped and resumed
+# as-is. The mode logged is still the one ASKED.
 rm -f "$LOG" "$ROT"
 cl stop --keep-tabs >/dev/null 2>&1
 check "the row's mode is the mode asked" "compact-resume" "$(awk -F'\t' 'NR==2{print $2}' "$LOG")"
 check "…the paths taken are in their own column" "resume,resume" "$(awk -F'\t' 'NR==2{print $11}' "$LOG")"
-check "…with why" "unreachable+unreachable,unreachable+unreachable" "$(awk -F'\t' 'NR==2{print $12}' "$LOG")"
+check "…with why" "unverified-pane,unverified-pane" "$(awk -F'\t' 'NR==2{print $12}' "$LOG")"
 check "…and the saved rows record what was carried out" "resume" \
   "$(jq -r '.[] | select(.name=="Alpha" and (.agent // "claude")=="claude") | .mode' "$STATE")"
 check "…by agent AND name: the Codex row gets no mode" "" \

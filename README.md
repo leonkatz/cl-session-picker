@@ -89,6 +89,7 @@ session state. Open a new terminal afterward so the `cl` alias stops resolving.
 - `cl --codex "Name"` — resume a Codex session when the same name exists for both agents
 - `cl stop` — prepare each Claude session by its **restart mode** (by default: compact it), then snapshot live sessions, kill them, and close their iTerm tabs. A session whose compaction or handoff does not land is stopped anyway and comes back by resuming (`--require-handoff` to ask everyone for a handoff and fail closed, `--keep-tabs` to leave tabs open, `--no-handoff` for the fast stop — no compaction, no handoff, clears any pending handoff — `--dry-run` to preview)
 - `cl start` — relaunch every session from the last `stop`, the way its stop recorded: resumed after its compaction with a first prompt, started **fresh** from a **complete** handoff, started as a new session, or resumed as-is (see [Restart modes](#restart-modes) and [Handoff and rotation](docs/handoff.md))
+- `cl compact "Name" ["Name"...]` / `cl compact --all` — compact running Claude sessions **without stopping them**: the same pre-compact request, single `/compact` and confirmed compaction as a compact-resume stop, in one shared `CL_COMPACT_TIMEOUT` window. The session keeps running; nothing is saved, stopped or re-moded. Codex sessions are skipped; `--dry-run` to preview. Exits non-zero if any target was not confirmed compacted
 - `cl mode "Name" <compact-resume|handoff|fresh|resume>` — choose how that session is stopped and started again (`cl mode "Name"` shows it; `cl mode --codex "Name" fresh|resume` for a Codex session)
 - `cl handoff` — run inside a session to write its handoff by hand (stamped with that session's id, so a late write is never adopted by its replacement)
 - `cl start --fresh "Name" [--dry-run]` — rotate one **live** session now, without stopping anything else
@@ -441,6 +442,19 @@ handoff instead; if a session compacts on its own before `/compact`, it is not
 compacted twice; if no compaction is confirmed after `/compact`, it resumes
 as-is. A handoff written by hand with `cl handoff` is not used by a
 compact-resume session — set it to `handoff` first if you want it to rotate.
+
+**`cl compact`** runs the same steps on running sessions without stopping them
+(`cl compact "Name"`, or `--all` for every running Claude session). Its
+fallbacks lead nowhere: no token in time means `/compact` is never typed ("did
+not finish its turn; not compacted"), and no confirmed compaction after it is
+reported ("compaction not confirmed") without typing `/compact` again. Each
+session is reported with the path it took and the boundary's `preTokens` →
+`postTokens`. It writes nothing to the rotation log, which counts stops.
+Like a stop, it types only where it can prove the session runs: the exact
+tmux pane holding the session's own process (by pane id, whatever has focus),
+or a tagged iTerm window on that process's tty. It refuses anything else. An
+interrupted run removes its own pending requests, though a request already
+typed cannot be recalled.
 
 **Codex sessions** can be `resume` (their default, whatever the Claude default
 is) or `fresh`; the other two need a Claude session acting on itself, and are

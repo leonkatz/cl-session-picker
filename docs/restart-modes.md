@@ -1,8 +1,9 @@
 # Restart modes — design
 
 Status: phases 1 and 2 implemented — the four modes for Claude, mode storage
-and migration, compact-resume end to end, and Codex `fresh` (below). The design
-review's findings are folded in and marked **(R)**.
+and migration, compact-resume end to end, and Codex `fresh` (below) — and
+`cl compact` (steps 2-5 without a stop, below). The design review's findings
+are folded in and marked **(R)**.
 
 Where phase 1 settles something this page leaves open:
 
@@ -89,11 +90,25 @@ second sender is written.
    so it cannot depend on there being a workflow. The optional workflow text
    comes from `~/.config/claude-session/precompact-prompt.txt` (for example
    "update your session board"); by default there is none.
-3. **Wait for the token**, in parallel. It counts only in an **assistant text
-   block** after the baseline, in the last record, with no later `tool_use`,
+3. **Wait for the token**, in parallel. It counts only as the exact **last
+   line of the last text block** of the session's final reply (the assistant
+   records after the last user record, the last conversation record among
+   them), with **no `tool_use` anywhere in that reply** in any block order,
    and with the file size stable across two polls **(R)**. Reading the request
    file puts the nonce in a `tool_result`, which is a `user` record, so the
-   delivery check's matcher must not be reused for this.
+   delivery check's matcher must not be reused for this. The idle check of
+   step 6 uses the same rule for its token arm.
+
+   This is **cooperation, not a runtime signal**. Claude Code writes no
+   "turn ended" record, so the evidence is that the session did what it was
+   asked (the token last, no call outstanding) and then went quiet for two
+   polls. A session that writes the token early, or new input that starts a
+   turn between the check and the `/compact`, is outside what cl can see. The
+   gap is short — the pane re-check and the send — but nothing bounds it;
+   typed input queues behind a running turn rather than interrupting it.
+   **Before anything is typed** (the request, a retype of it, and again
+   before `/compact`) the pane is checked to be this session; see "Which pane
+   is this session" below. A pane that is not is given nothing.
 4. **Type `/compact`**, once, as soon as the token arrives. There is no busy
    check **(R)**: `claude_busy` stays true for minutes after a turn (the
    lingering helper child), so a gate would starve every session. The token is
@@ -127,6 +142,65 @@ case `mark_resume_only` guards against. Before resuming, a preflight checks
 that the transcript exists and that its last boundary is the one the stop
 recorded on the row. On tmux, `has-session` is polled about 5s after launch. A
 failure resumes plainly and is reported.
+
+### Which pane is this session
+
+A tmux session at the right name is not proof: names collide, and a name
+match is all liveness checks. A cl stamp (`@cl_agent`/`@cl_sid`) is not proof
+either: it is session-scoped, while typing to `=<session>:` reaches whichever
+pane has focus. So the evidence is always a **process tied to this session's
+id** — cl's launch record bound to name and id, Claude Code's registry entry
+(pid, session id and start time all matching), or a verified Claude client
+whose argv resumes exactly that id — running in the place cl types into.
+`compact_target_bound` returns that place, and only it is typed into.
+
+"A verified Claude client" is read from the kernel, never from `ps`
+(`proc_identity`: libproc's `proc_pidpath` for the image actually executing,
+`sysctl KERN_PROCARGS2` for argv with its real boundaries; `/proc` on Linux;
+through `python3 -I`). The image must be Claude Code's:
+`…/claude/versions/<version>`, or named `claude`, or node whose **entry
+script** is Claude Code's — `argv[1]` exactly, with no node option before it,
+an absolute path (a relative one was resolved in the launch directory, which
+cl cannot see, so it fails closed), resolving (through the npm bin symlink if
+need be) to
+`…/@anthropic-ai/claude-code/cli.js`. A launcher-shaped string anywhere else
+(`node -e … -- …/cli.js`) is data, not what node runs. Then `--resume <id>` or
+`--session-id <id>` must be two adjacent argv elements after it and before
+any `--` (the rest is prompt text), every such option must name this id (given
+two, the client may run the other), any other session selector (`-r`,
+`--resume=…`, `--session-id=…`, `-c`/`--continue`) disqualifies — failing
+closed even on a genuine `--resume=<id>`, a form cl never launches — and so
+does `--fork-session`. The
+entry must resolve to a FILE (node runs a directory's `index.js`). On macOS the
+argv is read past the exec path's padding exactly — `roundup(len + 1, 8)`
+bytes, measured across path lengths — so an empty `argv[0]`, which a parser
+that skips "all the NULs" would swallow and shift every argument by one, is
+seen, and gives no answer. A Python sleeper with `--resume <id>`, or
+`exec -a 'claude --resume <id>' /bin/sleep`, is not Claude. An identity that
+cannot be read — no python3, the kernel refuses, or the read fails after
+printing — is no evidence. What this cannot stop is a program deliberately
+installed under one of those names; it stops anything that merely mentions
+one. The same check is what `session_pid`, and so every kill path, reads.
+
+| what sits at the name | result |
+
+| what sits at the name | result |
+|---|---|
+| a tmux session one of whose panes runs (or is an ancestor of) the tied process | typed into **that pane, by its id** (`send-keys -t %N`), whichever window has focus |
+| …and stamped as another agent, or another session's id | **refused**: an explicit mismatch, reported |
+| …stamped Claude with no id yet (`cl new`), or unstamped, with no tied process in any pane | **refused**: a stamp proves a launch, not this transcript |
+| no tmux session: the tied process on a terminal (the tagged-iTerm route) | typed into the tagged iTerm session **only if it is on that process's tty**, checked by the same script that types |
+| no tmux session, and no tied process on a terminal | **refused**: cannot tell |
+
+The first proof fixes the destination for the whole run. It is proven again
+before a retype of the request and before `/compact`; a session found
+anywhere else then, or not at all, is refused, so neither a focus switch nor a
+new pane at the name can redirect what is typed.
+
+A refused session in a stop **resumes as-is**: not a handoff, whose ask would
+go into the same pane. Under `cl compact` it is not compacted. Either way the
+reason (`foreign-pane`, `unverified-pane`) is logged or reported. The check
+covers typing only; what the stop later retires is retire_session's own rule.
 
 ### Timing
 
@@ -234,10 +308,56 @@ are re-offered to the new thread by the watcher's own re-send.
   mode `resume`), records the old id in `fresh-history.json` and prints its
   recovery command, as the other failure paths do.
 
+## `cl compact`: steps 2-5 without a stop
+
+`cl compact "Name" ["Name"...]` or `cl compact --all` (every running Claude
+session cl knows). It runs the same code as the stop's compact phase
+(`compact_phase`, which `do_stop` calls as `compact_phase stop`): the
+pre-compact request with its `cl-done` token, the token wait, one `/compact`,
+and the boundary or `Compacted` confirmation, for every target in one shared
+`CL_COMPACT_TIMEOUT` window. A boundary before `/compact` means it is already
+compacted and `/compact` is skipped, as in a stop.
+
+What is different:
+
+- **No stop.** Nothing is saved, retired, killed or rotated; no row and no mode
+  changes. The session keeps running.
+- **The request says so.** The pointer reads `cl compact: …`, and the request
+  says the session will keep running rather than that it is about to be
+  restarted. The optional workflow file applies as for a stop.
+- **Fallbacks lead nowhere.** No token in time: nothing more is done ("did not
+  finish its turn; not compacted"). No boundary after `/compact`: "compaction
+  not confirmed", and `/compact` is not typed again — a slow compaction
+  retyped would compact its own summary. No pane or no transcript: not
+  compacted. Any of these makes the exit non-zero.
+- **Targets.** A named session that is not running, or is not known, is
+  reported and skipped (non-zero). A Codex session is skipped with a note —
+  named, that is non-zero; under `--all` it is only noted. `--all` with no
+  running Claude session exits 0. Naming no target, or names and `--all`
+  together, is refused.
+- **Interrupted** (INT, TERM, HUP), it removes the pre-compact requests this
+  run wrote, restores the traps it replaced, and exits 130/143/129, saying how
+  many it removed and naming any it could not. A pointer already typed cannot
+  be recalled: a session that has read it will still finish its turn and
+  reply; it just gets no `/compact`.
+- **Which request is "this run's".** Only a file holding a token this run
+  issued. A session refused or skipped before a token was issued has no
+  request of this run, so nothing is removed for it. Removal renames the file
+  to a name only that call knows, checks the token, then deletes it — or puts
+  it back if it is not ours (a link, or a no-clobber move), so a newer request
+  written in between is never the one deleted. If it cannot be put back, it is
+  KEPT under that name, said, and the call fails — unless what is now at the
+  path is established to supersede it: a different `cl-done` token, or a
+  byte-identical copy. A removal or put-back that fails is reported, and under
+  `cl compact` makes the exit non-zero.
+- **The report** is one line per target: the path taken and the boundary
+  record's `preTokens → postTokens`.
+- **No rotation log line.** The log is one row per stop and `cl rotate stats`
+  counts its rows as stops; a compaction that stopped nothing does not fit
+  that schema, so it is not logged.
+
 ## Out of scope here
 
-- `cl compact [<session>|--all]`: steps 2-5 without a stop. It reuses
-  everything above and comes next.
 - Clearing leftover text in an input box before typing. A line appended to
   leftover text shows up as "not arrived whole" and is retyped once; clearing
   it belongs inside the senders if it is ever needed.
