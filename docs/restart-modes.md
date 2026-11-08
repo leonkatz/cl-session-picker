@@ -165,8 +165,14 @@ cl cannot see, so it fails closed), resolving (through the npm bin symlink if
 need be) to
 `…/@anthropic-ai/claude-code/cli.js`. A launcher-shaped string anywhere else
 (`node -e … -- …/cli.js`) is data, not what node runs. Then `--resume <id>` or
-`--session-id <id>` must be two adjacent argv elements after it, and
-`--fork-session` disqualifies. A Python sleeper with `--resume <id>`, or
+`--session-id <id>` must be two adjacent argv elements after it and before
+any `--` (the rest is prompt text), every such option must name this id (given
+two, the client may run the other), and `--fork-session` disqualifies. The
+entry must resolve to a FILE (node runs a directory's `index.js`). On macOS the
+argv is read past the exec path's padding exactly — `roundup(len + 1, 8)`
+bytes, measured across path lengths — so an empty `argv[0]`, which a parser
+that skips "all the NULs" would swallow and shift every argument by one, is
+seen, and gives no answer. A Python sleeper with `--resume <id>`, or
 `exec -a 'claude --resume <id>' /bin/sleep`, is not Claude. An identity that
 cannot be read — no python3, the kernel refuses, or the read fails after
 printing — is no evidence. What this cannot stop is a program deliberately

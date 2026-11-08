@@ -2689,7 +2689,16 @@ else:
     raw = raw.raw[:size.value]
     argc = struct.unpack("i", raw[:4])[0]
     rest = raw[4:]
-    rest = rest[rest.index(b"\0"):].lstrip(b"\0")
+    # The exec path, its NUL and padding fill roundup(len + 1, 8) bytes from
+    # where the path starts (measured on XNU across path lengths: 1 to 8
+    # NULs). Exactly that is skipped, never "all NULs", which would also eat
+    # an EMPTY argv[0] and shift every argument down one. Another NUL there
+    # is an empty argv[0], or a layout this does not know: no answer.
+    end = rest.index(b"\0")
+    start = (end + 1 + 7) // 8 * 8
+    if len(rest) <= start or rest[end:start] != b"\0" * (start - end) or rest[start:start + 1] == b"\0":
+        sys.exit(1)
+    rest = rest[start:]
     args = rest.split(b"\0")[:argc]
     if len(args) != argc:
         sys.exit(1)
@@ -2715,7 +2724,9 @@ proc_identity() {
 #     it covers the npm bin symlink. A launcher-shaped string anywhere else in
 #     argv is data, not what node runs;
 #   * this session: `--resume <sid>` or `--session-id <sid>` as two ADJACENT
-#     argv elements, after the executable (after the entry script for node);
+#     argv elements, after the executable (after the entry script for node)
+#     and before any `--` (what follows is the prompt), and EVERY such option
+#     naming <sid>;
 #   * not a fork: no `--fork-session` element — a fork's argv names the session
 #     it forked FROM, not the one it is.
 # The read's exit status is honoured (through a file, not a process
@@ -2745,6 +2756,9 @@ _claude_argv_session() {
       # and the raw text is exactly what a symlink to another script shows.
       local real
       real=$(realpath "$entry" 2>/dev/null) || return 1
+      # A FILE: node runs a directory's index.js, and a GNU realpath without
+      # -e resolves a path whose last part does not exist.
+      [ -f "$real" ] || return 1
       case "$real" in
         */@anthropic-ai/claude-code/cli.js|*/@anthropic-ai/claude-code/cli.mjs) from=2 ;;
         *) return 1 ;;
@@ -2754,12 +2768,19 @@ _claude_argv_session() {
   for (( i=from; i<n; i++ )); do
     [ "${av[$i]}" = "--fork-session" ] && return 1
   done
-  for (( i=from; i<n-1; i++ )); do
+  # The session pair, among the OPTIONS only: after `--` the rest is the
+  # prompt, text that may say anything. And every --resume/--session-id must
+  # name this session: given two, the process may run the other one.
+  local seen=0
+  for (( i=from; i<n; i++ )); do
     case "${av[$i]}" in
-      --resume|--session-id) [ "${av[$((i+1))]}" = "$sid" ] && return 0 ;;
+      --) break ;;
+      --resume|--session-id)
+        [ "${av[$((i+1))]:-}" = "$sid" ] || return 1
+        seen=1; i=$((i+1)) ;;
     esac
   done
-  return 1
+  [ "$seen" = 1 ]
 }
 
 # argv_resume_pids <sid>: every live Claude Code client whose argv resumes this

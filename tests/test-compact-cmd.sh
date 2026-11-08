@@ -521,6 +521,32 @@ printf '#!/bin/sh\nprintf "%%s\\n" "%s"\nexit 1\n' "$CLI" > "$FIX/rpfail/realpat
 printf '#!/bin/sh\nexit 1\n' > "$FIX/rpfailquiet/realpath"
 chmod +x "$FIX/rpfail/realpath" "$FIX/rpfailquiet/realpath"
 argv_ok_path() { ( . "$LIBALL" 2>/dev/null; PATH="$1"; _claude_argv_session "$2" "$3"; echo $? ) }
+# An EMPTY argv[0]: a parser that strips "all the NULs" after the exec path
+# eats it, every argument shifts down one, and node seems to run cli.js when
+# it runs other.js.
+( exec -a '' "$NODE" "$FIX/other.js" "$CLI" --resume sid-x ) </dev/null >/dev/null 2>&1 & p_argv0e=$!
+( exec -a 'node' "$NODE" "$FIX/other.js" "$CLI" --resume sid-x ) </dev/null >/dev/null 2>&1 & p_argv0n=$!
+p_realargv0=""
+if command -v node >/dev/null 2>&1; then
+  ( exec -a '' node "$FIX/other.js" "$CLI" --resume sid-x ) </dev/null >/dev/null 2>&1 & p_realargv0=$!
+fi
+"$FIX/fake/claude" -p -- --resume sid-x </dev/null >/dev/null 2>&1 & p_dd_prompt=$!
+"$FIX/fake/claude" --resume sid-x --resume sid-other </dev/null >/dev/null 2>&1 & p_two=$!
+"$FIX/fake/claude" --session-id sid-x --resume sid-other </dev/null >/dev/null 2>&1 & p_two_mixed=$!
+"$FIX/fake/claude" --resume sid-x -- --resume sid-other </dev/null >/dev/null 2>&1 & p_after_dd=$!
+# A DIRECTORY named cli.js: node would run its index.js.
+DIRCLI="$FIX/dircli/@anthropic-ai/claude-code/cli.js"
+mkdir -p "$DIRCLI"; printf '// index\n' > "$DIRCLI/index.js"
+"$NODE" "$DIRCLI" --resume sid-x </dev/null >/dev/null 2>&1 & p_dircli=$!
+# The exec path's padding, at every length mod 8: a stand-in claude in
+# directories whose paths are 8 consecutive lengths long.
+p_pad=""; pad_paths=""
+for k in 1 2 3 4 5 6 7 8; do
+  pd="$FIX/pad$(printf '%*s' "$k" '' | tr ' ' p)/claude"
+  need_fake_claude "$pd"
+  "$pd" --resume "sid-pad-$k" </dev/null >/dev/null 2>&1 &
+  p_pad="$p_pad $!"; pad_paths="$pad_paths $pd"
+done
 "$FIX/fake/claude" --resume sid-x --fork-session </dev/null >/dev/null 2>&1 & p_fork=$!
 "$FIX/fake/claude" "words --resume sid-x" </dev/null >/dev/null 2>&1 & p_oneword=$!
 python3 -c 'import time; time.sleep(120)' --resume sid-x </dev/null >/dev/null 2>&1 & p_python=$!
@@ -537,6 +563,26 @@ check "positive: Claude Code's versions/<version> image, --session-id <sid>" "0"
 check "positive: node whose entry script (argv[1]) is Claude Code's cli.js" "0" "$(argv_ok "$p_node" sid-x)"
 check "positive: …reached through the npm bin symlink" "0" "$(argv_ok "$p_nodebin" sid-x)"
 check "negative: a launcher-shaped symlink to another script (realpath present)" "1" "$(argv_ok "$p_node_look" sid-x)"
+check "negative: a DIRECTORY named …/claude-code/cli.js (node runs its index.js)" "1" "$(argv_ok "$p_dircli" sid-x)"
+check "negative: an EMPTY argv[0] (node runs other.js; a shifted parse would see cli.js)" "1" "$(argv_ok "$p_argv0e" sid-x)"
+check "…and its identity read gives no answer at all" "1" "$( ( . "$LIBALL" 2>/dev/null; proc_identity "$p_argv0e" >/dev/null; echo $? ) )"
+check "…control: the same command with argv[0]=node reads as other.js, rejected" "1" "$(argv_ok "$p_argv0n" sid-x)"
+check "…control: …and its identity IS read, entry other.js" "$FIX/other.js" \
+  "$( ( . "$LIBALL" 2>/dev/null; proc_identity "$p_argv0n" | tr '\0' '\n' | sed -n 3p ) )"
+if [ -n "$p_realargv0" ]; then
+  check "negative: the reviewers' repro, a real node with an empty argv[0]" "1" "$(argv_ok "$p_realargv0" sid-x)"
+fi
+check "negative: --resume <sid> after -- (it is prompt text)" "1" "$(argv_ok "$p_dd_prompt" sid-x)"
+check "negative: --resume <sid> --resume <other>" "1" "$(argv_ok "$p_two" sid-x)"
+check "negative: --session-id <sid> --resume <other>" "1" "$(argv_ok "$p_two_mixed" sid-x)"
+check "positive: --resume <sid>, then -- and prompt text naming another" "0" "$(argv_ok "$p_after_dd" sid-x)"
+pad_ok=""; pad_argv0=""; k=0
+for pp in $p_pad; do
+  k=$((k+1)); pad_ok="$pad_ok$(argv_ok "$pp" "sid-pad-$k")"
+  pad_argv0="$pad_argv0 $( ( . "$LIBALL" 2>/dev/null; proc_identity "$pp" | tr '\0' '\n' | sed -n 2p ) )"
+done
+check "the exec path's padding is skipped exactly, at all 8 lengths mod 8" "00000000" "$pad_ok"
+check "…argv[0] reads back as given at every one" "$pad_paths" "$pad_argv0"
 check "negative: …the same with no realpath on PATH (no fallback to the raw text)" "1" \
   "$(argv_ok_path "$FIX/norp" "$p_node_look" sid-x)"
 check "negative: a resolver that prints the launcher path but fails" "1" \
@@ -566,8 +612,8 @@ check "negative: '--resume <sid>' inside ONE argv element" "1" "$(argv_ok "$p_on
 check "negative: Codex's probe, a Python sleeper with --resume <sid>" "1" "$(argv_ok "$p_python" sid-x)"
 check "negative: exec -a 'claude --resume <sid>' /bin/sleep" "1" "$(argv_ok "$p_execa" sid-x)"
 check "negative: exec -a claude /bin/sleep … --resume <sid>" "1" "$(argv_ok "$p_execa2" sid-x)"
-check "argv_resume_pids finds exactly the four real clients" \
-  "$(printf '%s\n' "$p_native" "$p_versions" "$p_node" "$p_nodebin" | sort | tr '\n' ' ')" \
+check "argv_resume_pids finds exactly the five real clients" \
+  "$(printf '%s\n' "$p_native" "$p_versions" "$p_node" "$p_nodebin" "$p_after_dd" | sort | tr '\n' ' ')" \
   "$( ( . "$LIBALL" 2>/dev/null; argv_resume_pids sid-x ) | sort | tr '\n' ' ')"
 echo "an identity that cannot be read is no evidence"
 check "python3 missing: no evidence, even for a real client" "1" \
@@ -582,7 +628,8 @@ check "…control: the same answer from a read that succeeds is accepted" "0" \
         _claude_argv_session "$p_native" sid-x; echo $? ) )"
 kill "$p_execa" 2>/dev/null; wait "$p_execa" 2>/dev/null
 check "a process that is gone" "1" "$(argv_ok "$p_execa" sid-x)"
-kill "$p_native" "$p_versions" "$p_node" "$p_nodebin" "$p_node_e" "$p_node_p" "$p_node_req" "$p_node_other" "$p_node_flag" "$p_node_dd" "$p_node_rel" "$p_node_look" \
+kill "$p_native" "$p_versions" "$p_node" "$p_nodebin" "$p_node_e" "$p_node_p" "$p_node_req" "$p_node_other" "$p_node_flag" "$p_node_dd" "$p_node_rel" "$p_node_look" "$p_argv0e" "$p_argv0n" ${p_realargv0:+"$p_realargv0"} \
+  "$p_dd_prompt" "$p_two" "$p_two_mixed" "$p_after_dd" "$p_dircli" $p_pad \
   "$p_fork" "$p_oneword" "$p_python" "$p_execa2" ${p_realnode:+"$p_realnode"} 2>/dev/null
 wait 2>/dev/null
 
