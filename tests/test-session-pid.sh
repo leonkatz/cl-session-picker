@@ -47,7 +47,7 @@ done
 # from the kernel, so a shell script named claude is, correctly, sh.
 mkdir -p "$FIX/bin" "$FIX/reg" "$FIX/pids" || setup_failed "mkdir"
 . "$HERE/lib-fake-claude.sh"
-fake_claude_image "$FIX/bin/claude" || setup_failed "no Claude stand-in image on this machine"
+need_fake_claude "$FIX/bin/claude"
 
 P="11111111-1111-4111-8111-111111111111"   # the parent's session id
 F="22222222-2222-4222-8222-222222222222"   # the fork's OWN, new id
@@ -64,7 +64,7 @@ F="22222222-2222-4222-8222-222222222222"   # the fork's OWN, new id
 reap() { local p; for p in "$@"; do kill "$p" 2>/dev/null; wait "$p" 2>/dev/null; done; }
 
 spawn() {
-  "$FIX/bin/claude" -c "$FAKE_CLAUDE_IDLE" "$@" </dev/null >/dev/null 2>&1 &
+  "$FIX/bin/claude" "$@" </dev/null >/dev/null 2>&1 &
   SPAWNED=$!; PIDS="$PIDS $SPAWNED"
 }
 # Write the registry entry exactly as Claude Code does: its pid, its session id,

@@ -51,11 +51,11 @@ grep -q 'compact_boundary' "$AGENT" || setup_failed "could not read the simulate
 # its argv. It is tied the way a real Claude session also is: Claude Code's own
 # registry entry for its pid ($HOME/.claude/sessions/<pid>.json), which cl's
 # production check validates field by field. Where argv identity itself is
-# under test, the agent runs under an interpreter image NAMED claude
-# (lib-fake-claude.sh).
+# under test, a cc-built stand-in executable named claude (lib-fake-claude.sh)
+# runs in the pane as a child of the pane's process, beside the agent.
 SESSDIR="$HOME/.claude/sessions"
 . "$HERE/lib-fake-claude.sh"
-fake_claude_image "$FIX/fake/claude" || setup_failed "no Claude stand-in image on this machine"
+need_fake_claude "$FIX/fake/claude"
 mk_agent() { # <name> <sid> <mode> [delay]
   # Bound as cl's own sessions are: Claude's registry places the session's
   # process in the pane, and the session is stamped as tmux_claim does.
@@ -64,10 +64,12 @@ mk_agent() { # <name> <sid> <mode> [delay]
   stamp "$1" claude "$2"
 }
 mk_pane() { # <name> <sid> <mode> [delay] [extra agent argv]: an UNSTAMPED, UNTIED pane
-  # MK_EXE / MK_SCRIPT run the agent under another image or script path.
+  # MK_CHILD: a command started in the pane first, as a child of the pane's
+  # process (which then becomes the agent) — how a stand-in Claude executable
+  # sits in the pane the agent's input goes to.
   printf '{"cwd":"%s"}\n{"customTitle":"%s"}\n' "$FIX/work" "$1" > "$PROJ/$2.jsonl"
   rtmux new-session -d -s "$1" -c "$FIX" \
-    "AGENT_MODE='$3' AGENT_DELAY='${4:-0.5}' AGENT_TRANSCRIPT='$PROJ/$2.jsonl' AGENT_RECV='$FIX/recv-$1.txt' exec '${MK_EXE:-python3}' '${MK_SCRIPT:-$AGENT}' ${5:-}" 2>/dev/null \
+    "${MK_CHILD:+$MK_CHILD </dev/null >/dev/null 2>&1 & }AGENT_MODE='$3' AGENT_DELAY='${4:-0.5}' AGENT_TRANSCRIPT='$PROJ/$2.jsonl' AGENT_RECV='$FIX/recv-$1.txt' exec python3 '$AGENT' ${5:-}" 2>/dev/null \
     || setup_failed "could not start the agent for $1"
 }
 stamp() { rtmux set-option -t "=$1:" @cl_agent "$2" >/dev/null && rtmux set-option -t "=$1:" @cl_sid "$3" >/dev/null \
@@ -91,6 +93,7 @@ mk_codex() { # <name>
 }
 reset() {
   rtmux kill-server >/dev/null 2>&1
+  pkill -f "^$FIX/(fake|fakenode|share)/" 2>/dev/null
   rm -f "$PROJ"/*.jsonl "$FIX"/recv-*.txt "$FIX/codex-tr.jsonl" "$STATEDIR"/*.json "$STATEDIR"/*.tsv
   rm -rf "$CODEXDIR" "$FIX/store" "$SESSDIR"
 }
@@ -480,40 +483,80 @@ LIBALL="$FIX/lib-all.sh"
 sed '/^# Optional agent filter for direct launch/,$d' "$CL" > "$LIBALL"
 grep -q '^proc_identity()' "$LIBALL" || setup_failed "could not read the script's functions"
 argv_ok() { ( . "$LIBALL" 2>/dev/null; _claude_argv_session "$1" "$2"; echo $? ) }
-IDLE="$FAKE_CLAUDE_IDLE"
-mkdir -p "$FIX/share/claude/versions" "$FIX/fakenode" "$FIX/nm/@anthropic-ai/claude-code"
-cp "$FIX/fake/claude" "$FIX/share/claude/versions/2.1.319"; cp "$FIX/fake/claude" "$FIX/fakenode/node"
-printf '%s\n' "$IDLE" > "$FIX/nm/@anthropic-ai/claude-code/cli.js"
-"$FIX/fake/claude" -c "$IDLE" --resume sid-x </dev/null >/dev/null 2>&1 & p_native=$!
-"$FIX/share/claude/versions/2.1.319" -c "$IDLE" --session-id sid-x </dev/null >/dev/null 2>&1 & p_versions=$!
-"$FIX/fakenode/node" "$FIX/nm/@anthropic-ai/claude-code/cli.js" --resume sid-x </dev/null >/dev/null 2>&1 & p_node=$!
-"$FIX/fake/claude" -c "$IDLE" --resume sid-x --fork-session </dev/null >/dev/null 2>&1 & p_fork=$!
-"$FIX/fake/claude" -c "$IDLE" "words --resume sid-x" </dev/null >/dev/null 2>&1 & p_oneword=$!
-python3 -c "$IDLE" --resume sid-x </dev/null >/dev/null 2>&1 & p_python=$!
+CLI="$FIX/nm/@anthropic-ai/claude-code/cli.js"
+mkdir -p "$(dirname "$CLI")" "$FIX/npmbin"
+printf '// stand-in\n' > "$CLI"; printf '// not claude\n' > "$FIX/other.js"
+ln -sf "$CLI" "$FIX/npmbin/claude"
+need_fake_claude "$FIX/share/claude/versions/2.1.319"
+need_fake_claude "$FIX/fakenode/node"
+NODE="$FIX/fakenode/node"
+"$FIX/fake/claude" --resume sid-x </dev/null >/dev/null 2>&1 & p_native=$!
+"$FIX/share/claude/versions/2.1.319" --session-id sid-x </dev/null >/dev/null 2>&1 & p_versions=$!
+"$NODE" "$CLI" --resume sid-x </dev/null >/dev/null 2>&1 & p_node=$!
+"$NODE" "$FIX/npmbin/claude" --resume sid-x </dev/null >/dev/null 2>&1 & p_nodebin=$!
+"$NODE" -e 'x' -- "$CLI" --resume sid-x </dev/null >/dev/null 2>&1 & p_node_e=$!
+"$NODE" -p 'x' "$CLI" --resume sid-x </dev/null >/dev/null 2>&1 & p_node_p=$!
+"$NODE" --require "$FIX/other.js" "$CLI" --resume sid-x </dev/null >/dev/null 2>&1 & p_node_req=$!
+"$NODE" "$FIX/other.js" "$CLI" --resume sid-x </dev/null >/dev/null 2>&1 & p_node_other=$!
+"$NODE" --no-warnings "$CLI" --resume sid-x </dev/null >/dev/null 2>&1 & p_node_flag=$!
+"$NODE" -- "$CLI" --resume sid-x </dev/null >/dev/null 2>&1 & p_node_dd=$!
+# Two directories, one relative entry name: launched in A, where ./entry is
+# some other script; verified from B, where ./entry is Claude Code's cli.js.
+mkdir -p "$FIX/relA" "$FIX/relB"
+ln -sf "$FIX/other.js" "$FIX/relA/entry"; ln -sf "$CLI" "$FIX/relB/entry"
+( cd "$FIX/relA" && exec "$NODE" ./entry --resume sid-x ) </dev/null >/dev/null 2>&1 & p_node_rel=$!
+"$FIX/fake/claude" --resume sid-x --fork-session </dev/null >/dev/null 2>&1 & p_fork=$!
+"$FIX/fake/claude" "words --resume sid-x" </dev/null >/dev/null 2>&1 & p_oneword=$!
+python3 -c 'import time; time.sleep(120)' --resume sid-x </dev/null >/dev/null 2>&1 & p_python=$!
 /bin/sh -c 'exec -a "claude --resume sid-x" /bin/sleep 120' </dev/null >/dev/null 2>&1 & p_execa=$!
 /bin/sh -c 'exec -a claude /bin/sleep 120 --resume sid-x' </dev/null >/dev/null 2>&1 & p_execa2=$!
+p_realnode=""
+if command -v node >/dev/null 2>&1; then
+  node -e 'setTimeout(()=>{},120000)' -- /fixture/@anthropic-ai/claude-code/cli.js --resume sid-x </dev/null >/dev/null 2>&1 & p_realnode=$!
+fi
 sleep 1
 echo "argv identity: the real image and real argv, never the ps text"
-check "positive: an image named claude, --resume <sid> as two elements" "0" "$(argv_ok "$p_native" sid-x)"
+check "positive: an executable named claude, --resume <sid> as two elements" "0" "$(argv_ok "$p_native" sid-x)"
 check "positive: Claude Code's versions/<version> image, --session-id <sid>" "0" "$(argv_ok "$p_versions" sid-x)"
-check "positive: node running @anthropic-ai/claude-code/cli.js" "0" "$(argv_ok "$p_node" sid-x)"
+check "positive: node whose entry script (argv[1]) is Claude Code's cli.js" "0" "$(argv_ok "$p_node" sid-x)"
+check "positive: …reached through the npm bin symlink" "0" "$(argv_ok "$p_nodebin" sid-x)"
 check "…but not for another id" "1" "$(argv_ok "$p_native" sid-y)"
+check "negative: node -e … -- cli.js --resume <sid> (cli.js is data)" "1" "$(argv_ok "$p_node_e" sid-x)"
+check "negative: node -p … cli.js --resume <sid>" "1" "$(argv_ok "$p_node_p" sid-x)"
+check "negative: node --require x cli.js --resume <sid>" "1" "$(argv_ok "$p_node_req" sid-x)"
+check "negative: node other.js cli.js --resume <sid>" "1" "$(argv_ok "$p_node_other" sid-x)"
+check "negative: ANY node option before the script (node --no-warnings cli.js)" "1" "$(argv_ok "$p_node_flag" sid-x)"
+check "negative: node -- cli.js" "1" "$(argv_ok "$p_node_dd" sid-x)"
+check "negative: a RELATIVE entry, verified from a directory where it would name cli.js" "1" \
+  "$( cd "$FIX/relB" && argv_ok "$p_node_rel" sid-x )"
+if [ -n "$p_realnode" ]; then
+  check "negative: Codex's probe, a real node -e with cli.js as data" "1" "$(argv_ok "$p_realnode" sid-x)"
+else
+  printf '  skip Codex'"'"'s real-node probe: node is not installed (the stand-in node covers the shape)\n'
+fi
 check "negative: a fork of the session" "1" "$(argv_ok "$p_fork" sid-x)"
 check "negative: '--resume <sid>' inside ONE argv element" "1" "$(argv_ok "$p_oneword" sid-x)"
 check "negative: Codex's probe, a Python sleeper with --resume <sid>" "1" "$(argv_ok "$p_python" sid-x)"
 check "negative: exec -a 'claude --resume <sid>' /bin/sleep" "1" "$(argv_ok "$p_execa" sid-x)"
 check "negative: exec -a claude /bin/sleep … --resume <sid>" "1" "$(argv_ok "$p_execa2" sid-x)"
-check "argv_resume_pids finds exactly the three real clients" \
-  "$(printf '%s\n' "$p_native" "$p_versions" "$p_node" | sort | tr '\n' ' ')" \
+check "argv_resume_pids finds exactly the four real clients" \
+  "$(printf '%s\n' "$p_native" "$p_versions" "$p_node" "$p_nodebin" | sort | tr '\n' ' ')" \
   "$( ( . "$LIBALL" 2>/dev/null; argv_resume_pids sid-x ) | sort | tr '\n' ' ')"
 echo "an identity that cannot be read is no evidence"
 check "python3 missing: no evidence, even for a real client" "1" \
   "$( ( . "$LIBALL" 2>/dev/null; PATH=/nonexistent; _claude_argv_session "$p_native" sid-x; echo $? ) )"
 check "…and proc_identity says it failed" "1" "$( ( . "$LIBALL" 2>/dev/null; PATH=/nonexistent; proc_identity "$p_native" >/dev/null; echo $? ) )"
 check "the kernel refuses the read (pid 1, another user's process)" "1" "$( ( . "$LIBALL" 2>/dev/null; proc_identity 1 >/dev/null; echo $? ) )"
+check "a read that prints a matching identity and then FAILS is no evidence" "1" \
+  "$( ( . "$LIBALL" 2>/dev/null; proc_identity() { printf '%s\0' "$FIX/fake/claude" claude --resume sid-x; return 1; }
+        _claude_argv_session "$p_native" sid-x; echo $? ) )"
+check "…control: the same answer from a read that succeeds is accepted" "0" \
+  "$( ( . "$LIBALL" 2>/dev/null; proc_identity() { printf '%s\0' "$FIX/fake/claude" claude --resume sid-x; return 0; }
+        _claude_argv_session "$p_native" sid-x; echo $? ) )"
 kill "$p_execa" 2>/dev/null; wait "$p_execa" 2>/dev/null
 check "a process that is gone" "1" "$(argv_ok "$p_execa" sid-x)"
-kill "$p_native" "$p_versions" "$p_node" "$p_fork" "$p_oneword" "$p_python" "$p_execa2" 2>/dev/null
+kill "$p_native" "$p_versions" "$p_node" "$p_nodebin" "$p_node_e" "$p_node_p" "$p_node_req" "$p_node_other" "$p_node_flag" "$p_node_dd" "$p_node_rel" \
+  "$p_fork" "$p_oneword" "$p_python" "$p_execa2" ${p_realnode:+"$p_realnode"} 2>/dev/null
 wait 2>/dev/null
 
 echo "Codex's impostor probe: a Python sleeper's pane is not bound (registries empty)"
@@ -535,16 +578,20 @@ rtmux new-session -d -s Spoof "exec -a 'claude --resume sid-spoof' /bin/sleep 12
 sleep 0.3
 compact_run "$FIX/spoof.out" -- Spoof
 contains "an exec -a 'claude --resume <sid>' sleeper is refused" "$(cat "$FIX/spoof.out")" "✗ Spoof: its pane could not be verified"
-echo "…while a real Claude image with that argv, unstamped and unregistered, is bound"
+echo "…while a real Claude client of that id in the pane, unstamped and unregistered, binds it"
 reset
-MK_EXE="$FIX/fake/claude" mk_pane ArgvCl sid-argv ok 0.5 "--resume sid-argv"
+MK_CHILD="'$FIX/fake/claude' --resume sid-argv" mk_pane ArgvCl sid-argv ok
 compact_run "$FIX/argvcl.out" -- ArgvCl
-contains "the native-image shape is compacted" "$(cat "$FIX/argvcl.out")" "✓ ArgvCl: compacted by /compact"
+contains "the native shape: compacted" "$(cat "$FIX/argvcl.out")" "✓ ArgvCl: compacted by /compact"
 reset
-cp "$AGENT" "$FIX/nm/@anthropic-ai/claude-code/cli.js"
-MK_EXE="$FIX/fakenode/node" MK_SCRIPT="$FIX/nm/@anthropic-ai/claude-code/cli.js" mk_pane NodeCl sid-node ok 0.5 "--resume sid-node"
+MK_CHILD="'$NODE' '$CLI' --resume sid-node" mk_pane NodeCl sid-node ok
 compact_run "$FIX/nodecl.out" -- NodeCl
-contains "the node-wrapper shape is compacted" "$(cat "$FIX/nodecl.out")" "✓ NodeCl: compacted by /compact"
+contains "the node-wrapper shape: compacted" "$(cat "$FIX/nodecl.out")" "✓ NodeCl: compacted by /compact"
+reset
+MK_CHILD="'$NODE' -e x -- '$CLI' --resume sid-nodee" mk_pane NodeE sid-nodee ok
+compact_run "$FIX/nodee.out" -- NodeE
+check "node -e with cli.js as data, in the pane: nothing typed" "0" "$(nlines "$FIX/recv-NodeE.txt")"
+contains "…refused as unverified" "$(cat "$FIX/nodee.out")" "✗ NodeE: its pane could not be verified"
 
 # ── cleanup when the put-back fails ──────────────────────────────────────────
 echo "a request that is not ours and cannot be put back is kept, and the call fails"

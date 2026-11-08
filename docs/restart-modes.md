@@ -157,13 +157,19 @@ whose argv resumes exactly that id — running in the place cl types into.
 "A verified Claude client" is read from the kernel, never from `ps`
 (`proc_identity`: libproc's `proc_pidpath` for the image actually executing,
 `sysctl KERN_PROCARGS2` for argv with its real boundaries; `/proc` on Linux;
-through `python3 -I`). The image must be Claude Code's
-(`…/claude/versions/<version>`, or named `claude`, or node running
-`…/@anthropic-ai/claude-code/cli.js`); `--resume <id>` or `--session-id <id>`
-must be two adjacent argv elements; `--fork-session` disqualifies. A Python
-sleeper with `--resume <id>`, or `exec -a 'claude --resume <id>' /bin/sleep`,
-is not Claude. An identity that cannot be read (no python3, or the kernel
-refuses) is no evidence. What this cannot stop is a program deliberately
+through `python3 -I`). The image must be Claude Code's:
+`…/claude/versions/<version>`, or named `claude`, or node whose **entry
+script** is Claude Code's — `argv[1]` exactly, with no node option before it,
+an absolute path (a relative one was resolved in the launch directory, which
+cl cannot see, so it fails closed), resolving (through the npm bin symlink if
+need be) to
+`…/@anthropic-ai/claude-code/cli.js`. A launcher-shaped string anywhere else
+(`node -e … -- …/cli.js`) is data, not what node runs. Then `--resume <id>` or
+`--session-id <id>` must be two adjacent argv elements after it, and
+`--fork-session` disqualifies. A Python sleeper with `--resume <id>`, or
+`exec -a 'claude --resume <id>' /bin/sleep`, is not Claude. An identity that
+cannot be read — no python3, the kernel refuses, or the read fails after
+printing — is no evidence. What this cannot stop is a program deliberately
 installed under one of those names; it stops anything that merely mentions
 one. The same check is what `session_pid`, and so every kill path, reads.
 

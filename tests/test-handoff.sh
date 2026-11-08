@@ -83,7 +83,7 @@ LIVE_PIDS="$FIX/live.pids"
 # sleeper is not Claude. Codex stand-ins keep the exec -a shape their own
 # checks read. Each slot's pid is kept, so a live one is not started twice.
 . "$(dirname "$CL")/../tests/lib-fake-claude.sh"
-fake_claude_image "$FIX/fakeclaude/claude" || { printf 'FIXTURE SETUP FAILED: no Claude stand-in image on this machine\n' >&2; exit 2; }
+need_fake_claude "$FIX/fakeclaude/claude"
 live_up() {
   local argv i=0 pf
   for argv in "${LIVE_ARGV[@]}"; do
@@ -91,7 +91,7 @@ live_up() {
     [ -f "$pf" ] && kill -0 "$(cat "$pf")" 2>/dev/null && continue
     case "$argv" in
       claude\ *) # shellcheck disable=SC2086
-                 "$FIX/fakeclaude/claude" -c "$FAKE_CLAUDE_IDLE" ${argv#claude } </dev/null >/dev/null 2>&1 & ;;
+                 "$FIX/fakeclaude/claude" ${argv#claude } </dev/null >/dev/null 2>&1 & ;;
       *)         /bin/sh -c "exec -a \"$argv\" sleep 600" </dev/null >/dev/null 2>&1 & ;;
     esac
     echo $! > "$pf"; echo $! >> "$LIVE_PIDS"

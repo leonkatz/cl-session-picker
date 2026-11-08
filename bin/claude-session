@@ -2706,40 +2706,55 @@ proc_identity() {
 # running this session, judged from proc_identity — the real image and real
 # argv, never the `ps` text:
 #   * Claude: the image is .../claude/versions/<version> (how Claude Code
-#     ships: the file is named by its version), or named `claude`, or node
-#     with an argv element that is Claude Code's .../@anthropic-ai/claude-code/
-#     cli.js (or .mjs);
+#     ships: the file is named by its version), or named `claude`; or the
+#     image is node and its ENTRY SCRIPT is Claude Code's — argv[1] exactly,
+#     not an option (so nothing like -e, -p or --require before it), an
+#     ABSOLUTE path, whose real path is .../@anthropic-ai/claude-code/cli.js
+#     (or .mjs). Resolving
+#     it covers the npm bin symlink. A launcher-shaped string anywhere else in
+#     argv is data, not what node runs;
 #   * this session: `--resume <sid>` or `--session-id <sid>` as two ADJACENT
-#     argv elements;
+#     argv elements, after the executable (after the entry script for node);
 #   * not a fork: no `--fork-session` element — a fork's argv names the session
 #     it forked FROM, not the one it is.
-# What this does not stop is a binary deliberately installed under one of
-# those names; it stops everything that merely mentions one.
+# The read's exit status is honoured (through a file, not a process
+# substitution, which loses it): an answer from a read that then failed is no
+# answer. What this does not stop is a binary deliberately installed under one
+# of those names; it stops everything that merely mentions one.
 _claude_argv_session() {
-  local pid="$1" sid="$2" exe="" a first=1 is_claude=0 found=1 i
-  local -a av=()
-  while IFS= read -r -d '' a; do
-    if [ "$first" = 1 ]; then exe="$a"; first=0; else av+=("$a"); fi
-  done < <(proc_identity "$pid")
-  [ -n "$exe" ] && [ "${#av[@]}" -gt 0 ] || return 1
-  case "$exe" in
-    */claude/versions/*) is_claude=1 ;;
-  esac
+  local pid="$1" sid="$2" exe a i n from entry idf
+  local -a f=() av=()
+  idf=$(mktemp "${TMPDIR:-/tmp}/clid.XXXXXX" 2>/dev/null) || return 1
+  if ! proc_identity "$pid" > "$idf"; then rm -f "$idf"; return 1; fi
+  while IFS= read -r -d '' a; do f+=("$a"); done < "$idf"
+  rm -f "$idf"
+  [ "${#f[@]}" -ge 2 ] || return 1
+  exe="${f[0]}"; av=("${f[@]:1}"); n=${#av[@]}
+  from=0
+  case "$exe" in */claude/versions/*) from=1 ;; esac
   case "${exe##*/}" in
-    claude) is_claude=1 ;;
+    claude) from=1 ;;
     node|nodejs)
-      for a in "${av[@]}"; do
-        case "$a" in */@anthropic-ai/claude-code/cli.js|*/@anthropic-ai/claude-code/cli.mjs) is_claude=1 ;; esac
-      done ;;
+      entry="${av[1]:-}"
+      # Absolute only: a relative entry was resolved in the LAUNCH directory,
+      # and resolving it here, in whatever directory cl runs from, can name a
+      # different file — so it proves nothing, and fails closed.
+      case "$entry" in /*) : ;; *) return 1 ;; esac
+      case "$(realpath "$entry" 2>/dev/null || printf '%s' "$entry")" in
+        */@anthropic-ai/claude-code/cli.js|*/@anthropic-ai/claude-code/cli.mjs) from=2 ;;
+        *) return 1 ;;
+      esac ;;
   esac
-  [ "$is_claude" = 1 ] || return 1
-  for (( i=1; i<${#av[@]}; i++ )); do
+  [ "$from" -gt 0 ] || return 1
+  for (( i=from; i<n; i++ )); do
+    [ "${av[$i]}" = "--fork-session" ] && return 1
+  done
+  for (( i=from; i<n-1; i++ )); do
     case "${av[$i]}" in
-      --fork-session) return 1 ;;
-      --resume|--session-id) [ "${av[$((i+1))]:-}" = "$sid" ] && found=0 ;;
+      --resume|--session-id) [ "${av[$((i+1))]}" = "$sid" ] && return 0 ;;
     esac
   done
-  return "$found"
+  return 1
 }
 
 # argv_resume_pids <sid>: every live Claude Code client whose argv resumes this

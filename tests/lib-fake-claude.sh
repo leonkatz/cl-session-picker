@@ -1,37 +1,54 @@
-# Sourced by the suites: a Claude stand-in that cl's process-identity check
-# (proc_identity / _claude_argv_session) accepts for the honest reason.
+# Sourced by the suites: Claude stand-ins that cl's process-identity check
+# (proc_identity / _claude_argv_session) accepts for the honest reason, and the
+# registry entry that ties a process to a session the way Claude Code does.
 #
 # cl reads a process's REAL executable image and REAL argv from the kernel, so
 # the old stand-ins — `exec -a "claude --resume <sid>" sleep 600`, or a shell
 # script named claude — are, correctly, not Claude: their image is sleep or sh.
-# This makes a file that IS named claude: a copy of this machine's Python
-# interpreter image. Not the launcher on PATH (a framework build's python3
-# re-executes a different binary), but the image libproc reports for a running
-# interpreter, which then runs as itself under the new name. Nothing in cl is
-# told about it: no environment override, no allow-list.
 #
-#   fake_claude_image <path>      make it; 1 when this machine cannot
-#   "<path>" -c "$FAKE_CLAUDE_IDLE" --resume <sid> [more claude args…]
-#                                 an idle client of <sid>, by its real argv
-#   …-c "$FAKE_CLAUDE_IDLE" --ignore-term …
-#                                 the same, ignoring SIGTERM
-FAKE_CLAUDE_IDLE='import signal, sys, time
-if "--ignore-term" in sys.argv:
-    signal.signal(signal.SIGTERM, signal.SIG_IGN)
-time.sleep(600)'
+#   fake_claude_bin <path>    compile a stand-in executable at <path> (name it
+#                             claude, or put it at …/claude/versions/<ver>, or
+#                             name it node). It ignores its arguments and
+#                             sleeps; with an --ignore-term argument it also
+#                             ignores SIGTERM. Built with cc, because a copied
+#                             system or framework binary can be killed on
+#                             launch by code signing. Returns 1 without cc.
+#   "<path>" --resume <sid> [more claude args…]
+#                             an idle client of <sid>, by its real argv
+#   reg_claude <dir> <pid> <sid>
+#                             Claude Code's registry entry for a process
+#
+# Nothing in cl is told about any of this: no environment override, no
+# allow-list. A process the suites need to BEHAVE (the Python simulated agent)
+# is tied through the registry instead, which cl validates in production.
 
-fake_claude_image() {
-  local dest="$1" img
-  img=$(python3 -I -c 'import ctypes, os
-if os.path.exists("/proc/self/exe"):
-    print(os.path.realpath("/proc/self/exe"))
-else:
-    b = ctypes.create_string_buffer(4096)
-    n = ctypes.CDLL("/usr/lib/libproc.dylib").proc_pidpath(os.getpid(), b, 4096)
-    print(b.value.decode() if n > 0 else "")' 2>/dev/null)
-  [ -n "$img" ] && [ -x "$img" ] || return 1
-  mkdir -p "$(dirname "$dest")" && cp "$img" "$dest" && chmod +x "$dest" || return 1
-  "$dest" -c 'pass' >/dev/null 2>&1
+fake_claude_bin() {
+  local dest="$1" src
+  command -v cc >/dev/null 2>&1 || return 1
+  mkdir -p "$(dirname "$dest")" || return 1
+  src="$dest.c"
+  cat > "$src" <<'CEOF'
+#include <signal.h>
+#include <string.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+  int i;
+  for (i = 1; i < argc; i++)
+    if (strcmp(argv[i], "--ignore-term") == 0) signal(SIGTERM, SIG_IGN);
+  sleep(600);
+  return 0;
+}
+CEOF
+  cc -o "$dest" "$src" 2>/dev/null || { rm -f "$src"; return 1; }
+  rm -f "$src"
+}
+
+# need_fake_claude <path>: fake_claude_bin, or refuse the whole suite clearly.
+need_fake_claude() {
+  fake_claude_bin "$1" && return 0
+  printf 'FIXTURE SETUP FAILED: a Claude stand-in executable is built with cc (Xcode command line tools); %s\n' \
+    "$(command -v cc >/dev/null 2>&1 && echo 'cc could not build it' || echo 'cc is not installed')" >&2
+  exit 2
 }
 
 # reg_claude <sessions-dir> <pid> <sid>: Claude Code's own registry entry for a
