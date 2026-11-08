@@ -2709,7 +2709,8 @@ proc_identity() {
 #     ships: the file is named by its version), or named `claude`; or the
 #     image is node and its ENTRY SCRIPT is Claude Code's — argv[1] exactly,
 #     not an option (so nothing like -e, -p or --require before it), an
-#     ABSOLUTE path, whose real path is .../@anthropic-ai/claude-code/cli.js
+#     ABSOLUTE path, whose real path — as realpath resolves it; a missing
+#     or failing resolver rejects — is .../@anthropic-ai/claude-code/cli.js
 #     (or .mjs). Resolving
 #     it covers the npm bin symlink. A launcher-shaped string anywhere else in
 #     argv is data, not what node runs;
@@ -2740,7 +2741,11 @@ _claude_argv_session() {
       # and resolving it here, in whatever directory cl runs from, can name a
       # different file — so it proves nothing, and fails closed.
       case "$entry" in /*) : ;; *) return 1 ;; esac
-      case "$(realpath "$entry" 2>/dev/null || printf '%s' "$entry")" in
+      # Resolved, or rejected: a missing or failing realpath proves nothing,
+      # and the raw text is exactly what a symlink to another script shows.
+      local real
+      real=$(realpath "$entry" 2>/dev/null) || return 1
+      case "$real" in
         */@anthropic-ai/claude-code/cli.js|*/@anthropic-ai/claude-code/cli.mjs) from=2 ;;
         *) return 1 ;;
       esac ;;

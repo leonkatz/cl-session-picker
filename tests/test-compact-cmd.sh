@@ -505,6 +505,22 @@ NODE="$FIX/fakenode/node"
 mkdir -p "$FIX/relA" "$FIX/relB"
 ln -sf "$FIX/other.js" "$FIX/relA/entry"; ln -sf "$CLI" "$FIX/relB/entry"
 ( cd "$FIX/relA" && exec "$NODE" ./entry --resume sid-x ) </dev/null >/dev/null 2>&1 & p_node_rel=$!
+# An absolute, launcher-SHAPED path that is a symlink to some other script:
+# only a successful resolution can tell it from the real thing.
+FAKECLI="$FIX/lookalike/@anthropic-ai/claude-code/cli.js"
+mkdir -p "$(dirname "$FAKECLI")"; ln -sf "$FIX/other.js" "$FAKECLI"
+"$NODE" "$FAKECLI" --resume sid-x </dev/null >/dev/null 2>&1 & p_node_look=$!
+# PATHs for the resolver cases: everything the check needs except a working
+# realpath — none at all, or one that fails (with or without printing the
+# launcher path).
+for d in norp rpfail rpfailquiet; do
+  mkdir -p "$FIX/$d"
+  for tool in python3 mktemp rm; do ln -sf "$(command -v "$tool")" "$FIX/$d/$tool"; done
+done
+printf '#!/bin/sh\nprintf "%%s\\n" "%s"\nexit 1\n' "$CLI" > "$FIX/rpfail/realpath"
+printf '#!/bin/sh\nexit 1\n' > "$FIX/rpfailquiet/realpath"
+chmod +x "$FIX/rpfail/realpath" "$FIX/rpfailquiet/realpath"
+argv_ok_path() { ( . "$LIBALL" 2>/dev/null; PATH="$1"; _claude_argv_session "$2" "$3"; echo $? ) }
 "$FIX/fake/claude" --resume sid-x --fork-session </dev/null >/dev/null 2>&1 & p_fork=$!
 "$FIX/fake/claude" "words --resume sid-x" </dev/null >/dev/null 2>&1 & p_oneword=$!
 python3 -c 'import time; time.sleep(120)' --resume sid-x </dev/null >/dev/null 2>&1 & p_python=$!
@@ -520,6 +536,17 @@ check "positive: an executable named claude, --resume <sid> as two elements" "0"
 check "positive: Claude Code's versions/<version> image, --session-id <sid>" "0" "$(argv_ok "$p_versions" sid-x)"
 check "positive: node whose entry script (argv[1]) is Claude Code's cli.js" "0" "$(argv_ok "$p_node" sid-x)"
 check "positive: …reached through the npm bin symlink" "0" "$(argv_ok "$p_nodebin" sid-x)"
+check "negative: a launcher-shaped symlink to another script (realpath present)" "1" "$(argv_ok "$p_node_look" sid-x)"
+check "negative: …the same with no realpath on PATH (no fallback to the raw text)" "1" \
+  "$(argv_ok_path "$FIX/norp" "$p_node_look" sid-x)"
+check "negative: a resolver that prints the launcher path but fails" "1" \
+  "$(argv_ok_path "$FIX/rpfail" "$p_node_look" sid-x)"
+check "negative: …even for the genuine entry: a failed resolution is no evidence" "1" \
+  "$(argv_ok_path "$FIX/rpfail" "$p_node" sid-x)"
+check "negative: a resolver that prints nothing and fails" "1" \
+  "$(argv_ok_path "$FIX/rpfailquiet" "$p_node" sid-x)"
+check "…control: the native client needs no resolver, on the same PATH" "0" \
+  "$(argv_ok_path "$FIX/norp" "$p_native" sid-x)"
 check "…but not for another id" "1" "$(argv_ok "$p_native" sid-y)"
 check "negative: node -e … -- cli.js --resume <sid> (cli.js is data)" "1" "$(argv_ok "$p_node_e" sid-x)"
 check "negative: node -p … cli.js --resume <sid>" "1" "$(argv_ok "$p_node_p" sid-x)"
@@ -555,7 +582,7 @@ check "…control: the same answer from a read that succeeds is accepted" "0" \
         _claude_argv_session "$p_native" sid-x; echo $? ) )"
 kill "$p_execa" 2>/dev/null; wait "$p_execa" 2>/dev/null
 check "a process that is gone" "1" "$(argv_ok "$p_execa" sid-x)"
-kill "$p_native" "$p_versions" "$p_node" "$p_nodebin" "$p_node_e" "$p_node_p" "$p_node_req" "$p_node_other" "$p_node_flag" "$p_node_dd" "$p_node_rel" \
+kill "$p_native" "$p_versions" "$p_node" "$p_nodebin" "$p_node_e" "$p_node_p" "$p_node_req" "$p_node_other" "$p_node_flag" "$p_node_dd" "$p_node_rel" "$p_node_look" \
   "$p_fork" "$p_oneword" "$p_python" "$p_execa2" ${p_realnode:+"$p_realnode"} 2>/dev/null
 wait 2>/dev/null
 
