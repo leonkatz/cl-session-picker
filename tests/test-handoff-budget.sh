@@ -456,6 +456,17 @@ mk_agent() { # <name> <mtime> <delay> <answer 0|1> [chars lost from first arriva
   touch -t "$2" "$HOME/.claude/projects/p1/sid-$1.jsonl"
   rtmux new-session -d -s "$1" -c "$FIX" \
     "AGENT_RECV='$FIX/recv-$1.txt' AGENT_DELAY='$3' AGENT_ANSWER='$4' AGENT_DROP='${5:-0}' AGENT_TRANSCRIPT='${6-$HOME/.claude/projects/p1/sid-$1.jsonl}' python3 '$AGENT'" 2>/dev/null
+  # Stamped the way cl stamps its own sessions: the stop kills a tmux session
+  # only when it is bound to the session being stopped.
+  rtmux set-option -t "=$1:" @cl_agent claude >/dev/null 2>&1
+  rtmux set-option -t "=$1:" @cl_sid "sid-$1" >/dev/null 2>&1
+  # A stamp alone never binds: tie the pane process through Claude's registry.
+  local pp lst
+  pp=$(rtmux list-panes -t "=$1" -F '#{pane_pid}' 2>/dev/null | head -1)
+  [ -n "$pp" ] || return 0
+  lst=$(TZ=UTC ps -p "$pp" -o lstart= 2>/dev/null | tr -s ' ' | sed 's/^ //; s/ $//')
+  mkdir -p "$HOME/.claude/sessions"
+  jq -n --arg s "sid-$1" --argjson p "$pp" --arg ps "$lst" '{pid: $p, sessionId: $s, procStart: $ps}' > "$HOME/.claude/sessions/$pp.json"
 }
 reset_sessions() { rm -f "$HOME/.claude/projects/p1/"*.jsonl "$FIX"/recv-*.txt; }
 

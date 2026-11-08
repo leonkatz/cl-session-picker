@@ -220,7 +220,9 @@ check "…and is not deleted either" "1" "$([ -e "$(reg_file Junk)" ] && echo 1 
 rm -rf "$HOME/.config/claude-session/pids"
 
 printf 'a live session is never launched twice\n'
-/bin/sh -c "exec -a 'claude --resume $SID --dangerously-skip-permissions' sleep 45" & LIVE=$!
+. "$HERE/lib-fake-claude.sh"
+need_fake_claude "$FIX/agentbin/claude"
+"$FIX/agentbin/claude" --resume "$SID" --dangerously-skip-permissions </dev/null >/dev/null 2>&1 & LIVE=$!
 sleep 0.6
 kill -0 "$LIVE" 2>/dev/null || setup_failed "the fixture agent process did not start"
 pgrep -f -- "-resume $SID" >/dev/null 2>&1 || setup_failed "fixture agent invisible to pgrep -f — the test would prove nothing"

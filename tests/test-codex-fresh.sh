@@ -935,6 +935,32 @@ check "a pid that is gone: no evidence" "1" \
   "$(env -i HOME="$HOME" PATH="/usr/bin:/bin" bash -c ". '$lib'; _codex_argv_resumes $idp $NEW; echo \$?")"
 check "not a pid at all: no evidence" "1" \
   "$(env -i HOME="$HOME" PATH="/usr/bin:/bin" bash -c ". '$lib'; _codex_argv_resumes 'x;y' $NEW; echo \$?")"
+echo "the Codex predicate's argv rules, one control each (real executables, kernel identity)"
+# idcase <expect> <label> <id> <command…>: start it, ask the predicate, kill it.
+idcase() {
+  local want="$1" label="$2" id="$3"; shift 3
+  ( exec "$@" ) </dev/null >/dev/null 2>&1 & local ip=$!
+  echo "$ip" >> "$FIX/procs"; sleep 0.4
+  check "$label" "$want" \
+    "$(env -i HOME="$HOME" PATH="/usr/bin:/bin" bash -c ". '$lib'; _codex_argv_resumes $ip '$id'; echo \$?")"
+  kill "$ip" 2>/dev/null; wait "$ip" 2>/dev/null
+}
+idcase 0 "control: codex resume NEW -m model" "$NEW" bash -c "exec -a codex '$FIX/stub/codex' resume $NEW -m some-model"
+idcase 1 "an empty target id matches nothing, even an empty argv element" "" bash -c "exec -a codex '$FIX/stub/codex' resume ''"
+idcase 1 "--last after the id may pick another thread" "$NEW" bash -c "exec -a codex '$FIX/stub/codex' resume $NEW --last"
+idcase 0 "…but --last after \`--\` is prompt text" "$NEW" bash -c "exec -a codex '$FIX/stub/codex' resume $NEW -- --last"
+idcase 1 "\`--\` before the subcommand makes resume prompt text" "$NEW" bash -c "exec -a codex '$FIX/stub/codex' -- resume $NEW"
+if command -v node >/dev/null 2>&1; then
+  mkdir -p "$FIX/dirnm/@openai/codex/bin/codex.js"
+  printf 'setTimeout(function(){}, 59000);\n' > "$FIX/dirnm/@openai/codex/bin/codex.js/index.js"
+  idcase 1 "node on a DIRECTORY named codex.js (it runs index.js) is not the launcher" "$NEW" \
+    node "$FIX/dirnm/@openai/codex/bin/codex.js" resume "$NEW"
+  idcase 1 "an empty argv[0] cannot shift node's entry script into place" "$NEW" \
+    bash -c "exec -a '' node '$FIX/nm/hold.js' '$FIX/nm/@openai/codex/bin/codex.js' resume $NEW"
+  idcase 0 "control: node on the launcher itself" "$NEW" node "$FIX/nm/@openai/codex/bin/codex.js" resume "$NEW"
+else
+  echo "  (skipped the node controls: no node)"
+fi
 echo "…nor adopted when unstamped"
 rtmux kill-server >/dev/null 2>&1
 impostor_pane nostamp
